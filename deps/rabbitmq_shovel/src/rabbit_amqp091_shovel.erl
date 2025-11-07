@@ -229,6 +229,10 @@ handle_source({#'basic.deliver'{delivery_tag = Tag,
     % forward to destination
     rabbit_shovel_behaviour:forward(Tag, Msg, State);
 
+handle_source(#'basic.cancel'{}, #{name := Name}) ->
+    ?LOG_WARNING("Shovel ~tp received a 'basic.cancel' from the server", [Name]),
+    {stop, {shutdown, restart}};
+
 handle_source({'EXIT', Conn, Reason},
               #{source := #{current := {Conn, _, _}}}) ->
     {stop, {inbound_conn_died, Reason}};
@@ -250,10 +254,6 @@ handle_dest(#'basic.nack'{delivery_tag = Seq, multiple = Multiple},
     confirm_to_inbound(fun (Tag, Multi, StateX) ->
                                rabbit_shovel_behaviour:nack(Tag, Multi, StateX)
                        end, Seq, Multiple, State);
-
-handle_dest(#'basic.cancel'{}, #{name := Name}) ->
-    ?LOG_WARNING("Shovel ~tp received a 'basic.cancel' from the server", [Name]),
-    {stop, {shutdown, restart}};
 
 handle_dest({'EXIT', Conn, Reason}, #{dest := #{current := {Conn, _, _}}}) ->
     {stop, {outbound_conn_died, Reason}};
@@ -362,16 +362,16 @@ status(_) ->
     running.
 
 pending_count(#{dest := Dest}) ->
-    Pending = maps:get(pending, Dest, queue:new()),
-    queue:len(Pending).
+    Pending = maps:get(pending, Dest, lqueue:new()),
+    lqueue:len(Pending).
 
 add_pending(Elem, State = #{dest := Dest}) ->
-    Pending = maps:get(pending, Dest, queue:new()),
-    State#{dest => Dest#{pending => queue:in(Elem, Pending)}}.
+    Pending = maps:get(pending, Dest, lqueue:new()),
+    State#{dest => Dest#{pending => lqueue:in(Elem, Pending)}}.
 
 pop_pending(State = #{dest := Dest}) ->
-    Pending = maps:get(pending, Dest, queue:new()),
-    case queue:out(Pending) of
+    Pending = maps:get(pending, Dest, lqueue:new()),
+    case lqueue:out(Pending) of
         {empty, _} ->
             empty;
         {{value, Elem}, Pending2} ->
