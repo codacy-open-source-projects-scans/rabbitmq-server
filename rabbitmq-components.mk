@@ -1,3 +1,7 @@
+# Force enable Elixir in all projects since
+# running dialyzer on any of them requires it
+ELIXIR = system
+
 ifeq ($(.DEFAULT_GOAL),)
 # Define default goal to `all` because this file defines some targets
 # before the inclusion of erlang.mk leading to the wrong target becoming
@@ -45,7 +49,7 @@ dep_credentials_obfuscation = hex 3.5.0
 dep_cuttlefish = hex 3.6.0
 dep_gen_batch_server = hex 0.8.8
 dep_jose = hex 1.11.10
-dep_khepri = hex 0.17.2
+dep_khepri = hex 0.17.3
 dep_khepri_mnesia_migration = hex 0.8.0
 dep_meck = hex 1.0.0
 dep_osiris = git https://github.com/rabbitmq/osiris v1.10.2
