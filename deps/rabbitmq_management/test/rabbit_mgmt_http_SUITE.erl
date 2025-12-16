@@ -174,6 +174,7 @@ all_tests() -> [
     queue_pagination_test,
     queue_pagination_columns_test,
     queues_pagination_permissions_test,
+    user_queues_test,
     samples_range_test,
     sorting_test,
     format_output_test,
@@ -201,8 +202,6 @@ all_tests() -> [
     rates_test,
     single_active_consumer_cq_test,
     single_active_consumer_qq_test,
-    %% This test needs the OAuth 2 plugin to be enabled
-    %% oauth_test,
     disable_basic_auth_test,
     login_test,
     csp_headers_test,
@@ -2948,6 +2947,39 @@ queues_pagination_permissions_test(Config) ->
     http_delete(Config, "/users/non-admin", {group, '2xx'}),
     passed.
 
+user_queues_test(Config) ->
+    %% "alice" has no access, "bob" and "carlos" have access.
+    http_put(Config, "/users/alice", [{password, <<"alice">>},
+                                      {tags, <<>>}], {group, '2xx'}),
+    http_put(Config, "/users/bob", [{password, <<"bob">>},
+                                    {tags, <<"management">>}], {group, '2xx'}),
+    http_put(Config, "/users/carlos", [{password, <<"carlos">>},
+                                       {tags, <<"management">>}], {group, '2xx'}),
+
+    Perms = [{configure, <<".*">>},
+             {write,     <<".*">>},
+             {read,      <<".*">>}],
+    http_put(Config, "/permissions/%2F/bob", Perms, {group, '2xx'}),
+    http_put(Config, "/permissions/%2F/carlos", Perms, {group, '2xx'}),
+
+    QArgs = #{},
+    http_put(Config, "/queues/%2F/bobq", QArgs, "bob","bob", {group, '2xx'}),
+    http_put(Config, "/queues/%2F/carlosq", QArgs, "carlos","carlos", {group, '2xx'}),
+
+    http_get(Config, "/users/bob/queues", "alice", "alice", ?NOT_AUTHORISED),
+    http_get(Config, "/users/carlos/queues", "alice", "alice", ?NOT_AUTHORISED),
+    [#{name := <<"bobq">>}] = http_get(Config, "/users/bob/queues", "bob", "bob", ?OK),
+    [#{name := <<"carlosq">>}] = http_get(Config, "/users/carlos/queues", "bob", "bob", ?OK),
+    [#{name := <<"bobq">>}] = http_get(Config, "/users/bob/queues", "carlos", "carlos", ?OK),
+    [#{name := <<"carlosq">>}] = http_get(Config, "/users/carlos/queues", "carlos", "carlos", ?OK),
+
+    http_delete(Config, "/queues/%2F/bobq","bob","bob", {group, '2xx'}),
+    http_delete(Config, "/queues/%2F/carlosq","carlos","carlos", {group, '2xx'}),
+    http_delete(Config, "/users/alice", {group, '2xx'}),
+    http_delete(Config, "/users/bob", {group, '2xx'}),
+    http_delete(Config, "/users/carlos", {group, '2xx'}),
+    passed.
+
 samples_range_test(Config) ->
     {Conn, Ch} = open_connection_and_channel(Config),
 
@@ -4002,34 +4034,6 @@ api_redirect_test(Config) ->
 stats_redirect_test(Config) ->
     assert_permanent_redirect(Config, "doc/stats.html", "/api/index.html"),
     passed.
-
-oauth_test(Config) ->
-    ok = rabbit_ct_broker_helpers:enable_plugin(Config, 0, "rabbitmq_auth_backend_oauth2"),
-
-    Map1 = http_get(Config, "/auth", ?OK),
-    %% Defaults
-    ?assertEqual(false, maps:get(oauth_enabled, Map1)),
-
-    %% Misconfiguration
-    rpc(Config, application, set_env, [rabbitmq_management, oauth_enabled, true]),
-    Map2 = http_get(Config, "/auth", ?OK),
-    ?assertEqual(false, maps:get(oauth_enabled, Map2)),
-    ?assertEqual(<<>>, maps:get(oauth_client_id, Map2)),
-    ?assertEqual(<<>>, maps:get(oauth_provider_url, Map2)),
-    %% Valid config requires non empty OAuthClientId, OAuthClientSecret, OAuthResourceId, OAuthProviderUrl
-    rpc(Config, application, set_env, [rabbitmq_management, oauth_client_id, "rabbit_user"]),
-    rpc(Config, application, set_env, [rabbitmq_management, oauth_client_secret, "rabbit_secret"]),
-    rpc(Config, application, set_env, [rabbitmq_management, oauth_provider_url, "http://localhost:8080/uaa"]),
-    rpc(Config, application, set_env, [rabbitmq_auth_backend_oauth2, resource_server_id, "rabbitmq"]),
-    Map3 = http_get(Config, "/auth", ?OK),
-    println(Map3),
-    ?assertEqual(true, maps:get(oauth_enabled, Map3)),
-    ?assertEqual(<<"rabbit_user">>, maps:get(oauth_client_id, Map3)),
-    ?assertEqual(<<"rabbit_secret">>, maps:get(oauth_client_secret, Map3)),
-    ?assertEqual(<<"rabbitmq">>, maps:get(resource_server_id, Map3)),
-    ?assertEqual(<<"http://localhost:8080/uaa">>, maps:get(oauth_provider_url, Map3)),
-    %% cleanup
-    rpc(Config, application, unset_env, [rabbitmq_management, oauth_enabled]).
 
 version_test(Config) ->
     ActualVersion = http_get(Config, "/version"),
