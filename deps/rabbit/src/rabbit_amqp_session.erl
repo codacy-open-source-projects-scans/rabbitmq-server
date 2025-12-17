@@ -2754,7 +2754,9 @@ ensure_source(Source0 = #'v1_0.source'{address = Address,
             end;
         _ ->
             {error, {bad_address, Address}}
-    end.
+    end;
+ensure_source(undefined, _, _, _, _, _, _, _, _) ->
+    {error, source_required}.
 
 ensure_source_v1(Address,
                  Vhost,
