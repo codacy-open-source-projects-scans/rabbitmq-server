@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2025 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 
 -module(quorum_queue_SUITE).
 
@@ -1343,6 +1343,21 @@ force_all_queues_shrink_member_to_current_member(Config) ->
                    Config, Server0, <<"/">>, Q, 3)
              end || Q <- QQs],
 
+            %% match QQ only in shrink
+            QQSpec = <<QQ/binary, "$">>,
+            rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_quorum_queue,
+                                         force_all_queues_shrink_member_to_current_member, [QQSpec]),
+
+            wait_for_messages_ready([Server0], ra_name(QQ), 3),
+            queue_utils:assert_number_of_replicas(
+                Config, Server0, <<"/">>, QQ, 1),
+
+            wait_for_messages_ready([Server0], ra_name(AQ), 3),
+            queue_utils:assert_number_of_replicas(
+                Config, Server0, <<"/">>, AQ, 3),
+
+            %% match all queues on shrink
+
             rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_quorum_queue,
                                          force_all_queues_shrink_member_to_current_member, []),
 
@@ -1406,6 +1421,34 @@ force_vhost_queues_shrink_member_to_current_member(Config) ->
                    Config, Server0, VHost, Q, 3)
             end || Q <- QQs, VHost <- VHosts],
 
+            % match QQ only in VHost2 on shrink
+            QQSpec = <<QQ/binary, "$">>,
+            rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_quorum_queue,
+                force_vhost_queues_shrink_member_to_current_member, [VHost2, QQSpec]),
+
+            [begin
+                QQRes = rabbit_misc:r(VHost2, queue, Q),
+                {ok, RaName} = rpc:call(Server0, rabbit_queue_type_util, qname_to_internal_name, [QQRes]),
+                wait_for_messages_ready([Server0], RaName, 3),
+                case Q of
+                    QQ ->
+                        queue_utils:assert_number_of_replicas(
+                          Config, Server0, VHost2, Q, 1);
+                    AQ ->
+                        queue_utils:assert_number_of_replicas(
+                          Config, Server0, VHost2, Q, 3)
+                end
+            end || Q <- QQs],
+
+            [begin
+                QQRes = rabbit_misc:r(VHost1, queue, Q),
+                {ok, RaName} = rpc:call(Server0, rabbit_queue_type_util, qname_to_internal_name, [QQRes]),
+                wait_for_messages_ready([Server0], RaName, 3),
+                 queue_utils:assert_number_of_replicas(
+                   Config, Server0, VHost1, Q, 3)
+            end || Q <- QQs],
+
+            % match all queues in VHost2 on shrink
             rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_quorum_queue,
                 force_vhost_queues_shrink_member_to_current_member, [VHost2]),
 
@@ -5385,22 +5428,21 @@ queue_names(Records) ->
          Name
      end || Q <- Records].
 
-
 validate_queue(Ch, Queue, ExpectedMsgs) ->
     qos(Ch, length(ExpectedMsgs), false),
     subscribe(Ch, Queue, false),
-    [begin
-         receive
-             {#'basic.deliver'{delivery_tag = DeliveryTag1,
-                               redelivered = false},
-              #amqp_msg{payload = M}} ->
-                 amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag1,
-                                                    multiple = false})
-         after ?TIMEOUT ->
-                   flush(10),
-                   exit({validate_queue_timeout, M})
-         end
-     end || M <- ExpectedMsgs],
+    [receive
+         {#'basic.deliver'{delivery_tag = DeliveryTag1,
+                           redelivered = false},
+          #amqp_msg{payload = ActualMsg}} ->
+             ?assertEqual(Msg, ActualMsg),
+             amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag1,
+                                                multiple = false})
+     after ?TIMEOUT ->
+               flush(10),
+               exit({validate_queue_timeout, Msg})
+     end
+     || Msg <- ExpectedMsgs],
     ok.
 
 basic_get(_, _, _, 0) ->
