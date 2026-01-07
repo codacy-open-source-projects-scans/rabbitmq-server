@@ -44,7 +44,6 @@
          add_member/4,
          add_member/5]).
 -export([delete_member/3, delete_member/2]).
--export([requeue/3]).
 -export([policy_changed/1]).
 -export([format_ra_event/3]).
 -export([cleanup_data_dir/0]).
@@ -1188,9 +1187,6 @@ purge(Q) when ?is_amqqueue(Q) ->
     Server = amqqueue:get_pid(Q),
     rabbit_fifo_client:purge(Server).
 
-requeue(ConsumerTag, MsgIds, QState) ->
-    rabbit_fifo_client:return(quorum_ctag(ConsumerTag), MsgIds, QState).
-
 cleanup_data_dir() ->
     Names = [begin
                  {Name, _} = amqqueue:get_pid(Q),
@@ -2140,7 +2136,7 @@ force_shrink_member_to_current_member(VHost, Name) ->
             Fun = fun (Q0) ->
                           TS0 = amqqueue:get_type_state(Q0),
                           TS = TS0#{nodes => [Node]},
-                          amqqueue:set_type_state(Q, TS)
+                          amqqueue:set_type_state(Q0, TS)
                   end,
             _ = rabbit_amqqueue:update(QName, Fun),
             _ = [ra:force_delete_server(?RA_SYSTEM, {RaName, N}) || N <- OtherNodes],
@@ -2395,7 +2391,8 @@ transfer_leadership(_CandidateNodes) ->
                   ok ->
                       ?LOG_DEBUG("Successfully stopped Ra server ~tp", [RaLeader]);
                   {error, nodedown} ->
-                      ?LOG_ERROR("Failed to stop Ra server ~tp: target node was reported as down")
+                      ?LOG_ERROR("Failed to stop Ra server ~tp: target node was reported as down",
+                                 [RaLeader])
               end,
               ok
           end || Q <- Queues],
@@ -2442,7 +2439,8 @@ stop_local_quorum_queue_followers() ->
             ok     ->
                 ?LOG_DEBUG("Successfully stopped Ra server ~tp", [RaNode]);
             {error, nodedown} ->
-                ?LOG_ERROR("Failed to stop Ra server ~tp: target node was reported as down")
+                ?LOG_ERROR("Failed to stop Ra server ~tp: target node was reported as down",
+                           [RaNode])
         end
      end || Q <- Queues],
     ?LOG_INFO("Stopped all local replicas of quorum queues hosted on this node").
