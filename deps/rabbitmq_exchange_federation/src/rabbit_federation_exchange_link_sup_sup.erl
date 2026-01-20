@@ -31,13 +31,14 @@ start_link() ->
     %% and other places, so we have to start it very early outside of the supervision tree.
     %% The scope is stopped in stop/1.
     _ = rabbit_federation_pg:start_scope(?FEDERATION_PG_SCOPE),
+    rabbit_federation_app_state:reset_shutting_down_marker(),
     mirrored_supervisor:start_link({local, ?SUPERVISOR}, ?SUPERVISOR,
                                    ?MODULE, []).
 
 %% Note that the next supervisor down, rabbit_federation_link_sup, is common
 %% between exchanges and queues.
 start_child(X) ->
-    case mirrored_supervisor:start_child(
+    try mirrored_supervisor:start_child(
            ?SUPERVISOR,
            {id(X), {rabbit_federation_link_sup, start_link,
                     [rabbit_federation_exchange_link, X]},
@@ -51,30 +52,54 @@ start_child(X) ->
           ok;
         %% A link returned {stop, gone}, the link_sup shut down, that's OK.
         {error, {shutdown, _}} -> ok
+    catch
+        exit:{noproc, _} -> ok;
+        exit:{shutdown, _} -> ok;
+        exit:shutdown -> ok
     end.
 
 adjust({clear_upstream, VHost, UpstreamName}) ->
     _ = [rabbit_federation_link_sup:adjust(Pid, rabbit_federation_exchange_link, X,
                                            {clear_upstream, UpstreamName}) ||
-            {#exchange{name = Name} = X, Pid, _, _} <- mirrored_supervisor:which_children(?SUPERVISOR),
+            {#exchange{name = Name} = X, Pid, _, _} <- which_children(),
             Name#resource.virtual_host == VHost],
     ok;
 adjust(Reason) ->
     _ = [rabbit_federation_link_sup:adjust(Pid, rabbit_federation_exchange_link,
                                            X, Reason) ||
-            {X, Pid, _, _} <- mirrored_supervisor:which_children(?SUPERVISOR)],
+            {X, Pid, _, _} <- which_children()],
     ok.
 
+which_children() ->
+    try
+        mirrored_supervisor:which_children(?SUPERVISOR)
+    catch
+        exit:{noproc, _} -> [];
+        exit:{shutdown, _} -> [];
+        exit:shutdown -> []
+    end.
+
 stop_child(X) ->
-    case mirrored_supervisor:terminate_child(?SUPERVISOR, id(X)) of
+    try mirrored_supervisor:terminate_child(?SUPERVISOR, id(X)) of
       ok -> ok;
       {error, Err} ->
         #exchange{name = ExchangeName} = X,
         ?LOG_WARNING("Attempt to stop a federation link for exchange ~tp failed: ~tp",
                      [rabbit_misc:rs(ExchangeName), Err]),
         ok
+    catch
+        exit:{noproc, _} -> ok;
+        exit:{shutdown, _} -> ok;
+        exit:shutdown -> ok
     end,
-    ok = mirrored_supervisor:delete_child(?SUPERVISOR, id(X)).
+    try
+        _ = mirrored_supervisor:delete_child(?SUPERVISOR, id(X)),
+        ok
+    catch
+        exit:{noproc, _} -> ok;
+        exit:{shutdown, _} -> ok;
+        exit:shutdown -> ok
+    end.
 
 %%----------------------------------------------------------------------------
 

@@ -17,6 +17,7 @@
 -behaviour(gen_server2).
 
 -export([start_link/1, go/0, run/1, pause/1]).
+-export([all_local/0, disconnect_all/0, reconnect_all/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -26,7 +27,7 @@
 
 -record(not_started, {queue, run, upstream, upstream_params}).
 -record(state, {queue, run, conn, ch, dconn, dch, upstream, upstream_params,
-                unacked}).
+                unacked, link_state = starting}).
 
 start_link(Args) ->
     gen_server2:start_link(?MODULE, Args, [{timeout, infinity}]).
@@ -48,12 +49,50 @@ join(Name) ->
 all() ->
     pg:get_members(?FEDERATION_PG_SCOPE, pgname(rabbit_federation_queues)).
 
+all_local() ->
+    try
+        pg:get_local_members(?FEDERATION_PG_SCOPE, pgname(rabbit_federation_queues))
+    catch
+        error:badarg -> []
+    end.
+
 q(QName) ->
     pg:get_members(?FEDERATION_PG_SCOPE, pgname({rabbit_federation_queue, QName})).
+
+-spec disconnect_all() -> ok.
+disconnect_all() ->
+    Pids = all_local(),
+    case Pids of
+        [] -> ok;
+        _  -> ?LOG_INFO("Queue federation: disconnecting ~b local link(s) for shutdown",
+                        [length(Pids)])
+    end,
+    [gen_server2:cast(Pid, disconnect_for_shutdown) || Pid <- Pids],
+    ok.
+
+-spec reconnect_all() -> ok.
+reconnect_all() ->
+    Pids = all_local(),
+    case Pids of
+        [] -> ok;
+        _  -> ?LOG_INFO("Queue federation: reconnecting ~b local link(s)",
+                        [length(Pids)])
+    end,
+    [gen_server2:cast(Pid, reconnect) || Pid <- Pids],
+    ok.
 
 %%----------------------------------------------------------------------------
 
 init({Upstream, Queue}) when ?is_amqqueue(Queue) ->
+    case rabbit_federation_app_state:is_shutting_down() of
+        true ->
+            ?LOG_DEBUG("Queue federation link: voluntarily stopping, the node (or plugin) is stopping"),
+            ignore;
+        false ->
+            init_link({Upstream, Queue})
+    end.
+
+init_link({Upstream, Queue}) when ?is_amqqueue(Queue) ->
     QName = amqqueue:get_name(Queue),
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_FEDERATION,
                                   queue => QName}),
@@ -112,6 +151,24 @@ handle_cast(pause, State = #not_started{}) ->
 handle_cast(pause, State = #state{ch = Ch, upstream = Upstream}) ->
     cancel(Ch, Upstream),
     {noreply, State#state{run = false}};
+
+handle_cast(disconnect_for_shutdown, State = #state{dconn = DConn, conn = Conn}) ->
+    Timeout = connection_close_timeout(),
+    rabbit_federation_link_util:ensure_connection_closed_async(DConn, Timeout),
+    rabbit_federation_link_util:ensure_connection_closed_async(Conn, Timeout),
+    {noreply, State#state{dconn = undefined, conn = undefined, link_state = closing}};
+
+handle_cast(disconnect_for_shutdown, State = #not_started{}) ->
+    {noreply, State};
+
+handle_cast(reconnect, State = #not_started{}) ->
+    {noreply, State};
+
+handle_cast(reconnect, State = #state{link_state = closing}) ->
+    {stop, {shutdown, restart}, State};
+
+handle_cast(reconnect, State = #state{}) ->
+    {noreply, State};
 
 handle_cast(Msg, State) ->
     {stop, {unexpected_cast, Msg}, State}.
@@ -185,9 +242,16 @@ terminate(Reason, #state{dconn           = DConn,
                          upstream        = Upstream,
                          upstream_params = UParams,
                          queue           = Q}) when ?is_amqqueue(Q) ->
+    Timeout = connection_close_timeout(),
     QName = amqqueue:get_name(Q),
-    rabbit_federation_link_util:ensure_connection_closed(DConn),
-    rabbit_federation_link_util:ensure_connection_closed(Conn),
+    case DConn of
+        undefined -> ok;
+        _         -> rabbit_federation_link_util:ensure_connection_closed(DConn, Timeout)
+    end,
+    case Conn of
+        undefined -> ok;
+        _         -> rabbit_federation_link_util:ensure_connection_closed(Conn, Timeout)
+    end,
     rabbit_federation_link_util:log_terminate(Reason, Upstream, UParams, QName),
     _ = pg:leave(?FEDERATION_PG_SCOPE, pgname({rabbit_federation_queue, QName}), self()),
     ok.
@@ -238,7 +302,8 @@ go(S0 = #not_started{run             = Run,
                                dch             = DCh,
                                upstream        = Upstream,
                                upstream_params = UParams,
-                               unacked         = Unacked}}
+                               unacked         = Unacked,
+                               link_state      = running}}
       end, Upstream, UParams, QName, S0).
 
 check_upstream_suitable(Conn) ->
@@ -332,3 +397,10 @@ handle_down(DCh, Reason, _Ch, DCh, Args, State) ->
     rabbit_federation_link_util:handle_downstream_down(Reason, Args, State);
 handle_down(Ch, Reason, Ch, _DCh, Args, State) ->
     rabbit_federation_link_util:handle_upstream_down(Reason, Args, State).
+
+connection_close_timeout() ->
+    Default = rabbit_federation_link_util:connection_close_timeout(),
+    Configured = application:get_env(rabbitmq_queue_federation,
+                                     connection_close_timeout,
+                                     Default),
+    erlang:min(Configured, Default).

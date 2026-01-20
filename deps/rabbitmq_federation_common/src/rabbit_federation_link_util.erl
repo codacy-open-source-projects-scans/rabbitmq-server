@@ -14,17 +14,21 @@
 
 %% real
 -export([start_conn_ch/5, disposable_channel_call/2, disposable_channel_call/3,
-         disposable_connection_call/3, ensure_connection_closed/1,
+         disposable_connection_call/3,
+         ensure_connection_closed/1, ensure_connection_closed/2,
+         ensure_connection_closed_async/1, ensure_connection_closed_async/2,
          log_terminate/4, unacked_new/0, ack/3, nack/3, forward/9,
          handle_downstream_down/3, handle_upstream_down/3,
-         get_connection_name/2]).
+         get_connection_name/2,
+         connection_close_timeout/0]).
 
 %% temp
 -export([connection_error/6]).
 
 -import(rabbit_misc, [pget/2]).
 
--define(MAX_CONNECTION_CLOSE_TIMEOUT, 10000).
+-define(CONNECTION_OPEN_TIMEOUT, 10000).
+-define(MAX_CONNECTION_CLOSE_TIMEOUT, 5000).
 
 %%----------------------------------------------------------------------------
 
@@ -123,7 +127,30 @@ open(Params, Name) ->
 ensure_channel_closed(Ch) -> catch amqp_channel:close(Ch).
 
 ensure_connection_closed(Conn) ->
-    catch amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT).
+    ensure_connection_closed(Conn, ?CONNECTION_OPEN_TIMEOUT).
+
+ensure_connection_closed(Conn, Timeout) ->
+    catch amqp_connection:close(Conn, Timeout).
+
+-spec ensure_connection_closed_async(pid() | undefined) -> ok.
+ensure_connection_closed_async(Conn) ->
+    ensure_connection_closed_async(Conn, connection_close_timeout()).
+
+-spec ensure_connection_closed_async(pid() | undefined, timeout()) -> ok.
+ensure_connection_closed_async(undefined, _Timeout) ->
+    ok;
+ensure_connection_closed_async(Conn, Timeout) ->
+    spawn(fun() ->
+        try
+            amqp_connection:close(Conn, Timeout)
+        catch
+            _:_ -> ok
+        end
+    end),
+    ok.
+
+connection_close_timeout() ->
+    ?MAX_CONNECTION_CLOSE_TIMEOUT.
 
 connection_error(remote_start, {{shutdown, {server_initiated_close, Code, Message}}, _} = E,
                                Upstream, UParams, XorQName, State) ->
@@ -252,6 +279,8 @@ update_headers(Headers, Msg = #amqp_msg{props = Props}) ->
 
 %% If the downstream channel shuts down cleanly, we can just ignore it
 %% - we're the same node, we're presumably about to go down too.
+handle_downstream_down(normal, _Args, State) ->
+    {noreply, State};
 handle_downstream_down(shutdown, _Args, State) ->
     {noreply, State};
 
@@ -260,6 +289,9 @@ handle_downstream_down(Reason, _Args, State) ->
 
 %% If the upstream channel goes down for an intelligible reason, just
 %% log it and die quietly.
+handle_upstream_down(normal, {Upstream, UParams, XName}, State) ->
+    connection_error(
+      remote, {upstream_channel_down, normal}, Upstream, UParams, XName, State);
 handle_upstream_down(shutdown, {Upstream, UParams, XName}, State) ->
     connection_error(
       remote, {upstream_channel_down, shutdown}, Upstream, UParams, XName, State);
@@ -315,6 +347,9 @@ disposable_channel_call(Conn, Method, ErrFun) ->
     end.
 
 disposable_connection_call(Params, Method, ErrFun) ->
+    disposable_connection_call(Params, Method, ErrFun, connection_close_timeout()).
+
+disposable_connection_call(Params, Method, ErrFun, Timeout) ->
     try
         ?LOG_DEBUG("Disposable connection parameters: ~tp", [Params]),
         case open(Params, <<"Disposable exchange federation link connection">>) of
@@ -326,7 +361,7 @@ disposable_connection_call(Params, Method, ErrFun) ->
                       exit:{{shutdown, {server_initiated_close, Code, Message}}, _} ->
                           ErrFun(Code, Message)
                 after
-                    ensure_connection_closed(Conn)
+                    ensure_connection_closed(Conn, Timeout)
                 end;
             {error, {auth_failure, Message}} ->
                 ?LOG_ERROR("Federation link could not open a disposable (one-off) connection "

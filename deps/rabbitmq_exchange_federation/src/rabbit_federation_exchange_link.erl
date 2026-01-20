@@ -17,6 +17,7 @@
 
 -export([go/0, add_binding/3, remove_bindings/3]).
 -export([list_routing_keys/1]). %% For testing
+-export([all_local/0, disconnect_all/0, reconnect_all/0]).
 
 -export([start_link/1]).
 
@@ -43,7 +44,8 @@
                 downstream_exchange,
                 unacked,
                 internal_exchange_timer,
-                internal_exchange_interval}).
+                internal_exchange_interval,
+                link_state = starting}).
 
 %%----------------------------------------------------------------------------
 
@@ -66,6 +68,15 @@ start_link(Args) ->
     gen_server2:start_link(?MODULE, Args, [{timeout, infinity}]).
 
 init({Upstream, XName}) ->
+    case rabbit_federation_app_state:is_shutting_down() of
+        true ->
+            ?LOG_DEBUG("Exchange federation link: voluntarily stopping, the node (or plugin) is stopping"),
+            ignore;
+        false ->
+            init_link({Upstream, XName})
+    end.
+
+init_link({Upstream, XName}) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_FEDERATION,
                                   exchange => XName}),
     %% If we are starting up due to a policy change then it's possible
@@ -116,6 +127,50 @@ handle_cast({enqueue, Serial, Cmd},
             ?LOG_WARNING("detected upstream changes, restarting link: ~tp", [Text]),
             {stop, {shutdown, restart}, State}
     end;
+
+handle_cast(disconnect_for_shutdown, State = #state{
+        downstream_connection = DConn,
+        connection = Conn,
+        upstream = Upstream,
+        internal_exchange = IntExchange,
+        internal_exchange_timer = TRef,
+        queue = Queue}) ->
+    _ = timer:cancel(TRef),
+    Timeout = connection_close_timeout(),
+    rabbit_federation_link_util:ensure_connection_closed_async(DConn, Timeout),
+    case Conn of
+        undefined ->
+            ok;
+        _ ->
+            case Upstream#upstream.resource_cleanup_mode of
+                never ->
+                    ok;
+                _ ->
+                    try
+                        {ok, Ch} = amqp_connection:open_channel(Conn),
+                        catch amqp_channel:call(Ch, #'queue.delete'{queue = Queue}),
+                        catch amqp_channel:call(Ch, #'exchange.delete'{exchange = IntExchange})
+                    catch
+                        _:_ -> ok
+                    end
+            end,
+            rabbit_federation_link_util:ensure_connection_closed_async(Conn, Timeout)
+    end,
+    {noreply, State#state{downstream_connection = undefined,
+                          connection = undefined,
+                          link_state = closing}};
+
+handle_cast(disconnect_for_shutdown, State = {not_started, _}) ->
+    {noreply, State};
+
+handle_cast(reconnect, State = {not_started, _}) ->
+    {noreply, State};
+
+handle_cast(reconnect, State = #state{link_state = closing}) ->
+    {stop, {shutdown, restart}, State};
+
+handle_cast(reconnect, State = #state{}) ->
+    {noreply, State};
 
 handle_cast(Msg, State) ->
     {stop, {unexpected_cast, Msg}, State}.
@@ -204,21 +259,27 @@ terminate(Reason, #state{downstream_connection = DConn,
                          queue                 = Queue}) when Reason =:= shutdown;
                                                               Reason =:= {shutdown, restart};
                                                               Reason =:= gone ->
+    Timeout = connection_close_timeout(),
     _ = timer:cancel(TRef),
-    rabbit_federation_link_util:ensure_connection_closed(DConn),
-
-    ?LOG_DEBUG("Exchange federation: link is shutting down, resource cleanup mode: ~tp", [Upstream#upstream.resource_cleanup_mode]),
-    case Upstream#upstream.resource_cleanup_mode of
-        never -> ok;
-        _     ->
-            %% This is a normal shutdown and we are allowed to clean up the internally used queue and exchange
-            ?LOG_DEBUG("Federated exchange '~ts' link will delete its internal queue '~ts'", [Upstream#upstream.exchange_name, Queue]),
-            delete_upstream_queue(Conn, Queue),
-            ?LOG_DEBUG("Federated exchange '~ts' link will delete its upstream exchange", [Upstream#upstream.exchange_name]),
-            delete_upstream_exchange(Conn, IntExchange)
+    case DConn of
+        undefined -> ok;
+        _         -> rabbit_federation_link_util:ensure_connection_closed(DConn, Timeout)
     end,
-
-    rabbit_federation_link_util:ensure_connection_closed(Conn),
+    case Conn of
+        undefined ->
+            ok;
+        _ ->
+            ?LOG_DEBUG("Exchange federation: link is shutting down, resource cleanup mode: ~tp", [Upstream#upstream.resource_cleanup_mode]),
+            case Upstream#upstream.resource_cleanup_mode of
+                never -> ok;
+                _     ->
+                    ?LOG_DEBUG("Federated exchange '~ts' link will delete its internal queue '~ts'", [Upstream#upstream.exchange_name, Queue]),
+                    delete_upstream_queue(Conn, Queue),
+                    ?LOG_DEBUG("Federated exchange '~ts' link will delete its upstream exchange", [Upstream#upstream.exchange_name]),
+                    delete_upstream_exchange(Conn, IntExchange)
+            end,
+            rabbit_federation_link_util:ensure_connection_closed(Conn, Timeout)
+    end,
     rabbit_federation_link_util:log_terminate(Reason, Upstream, UParams, XName),
     ok;
 %% unexpected shutdown
@@ -228,14 +289,17 @@ terminate(Reason, #state{downstream_connection = DConn,
                          upstream_params       = UParams,
                          downstream_exchange   = XName,
                          internal_exchange_timer = TRef}) ->
+    Timeout = connection_close_timeout(),
     _ = timer:cancel(TRef),
-
-    rabbit_federation_link_util:ensure_connection_closed(DConn),
-
-    %% unlike in the clean shutdown case above, we keep the queue
-    %% and exchange around
-
-    rabbit_federation_link_util:ensure_connection_closed(Conn),
+    case DConn of
+        undefined -> ok;
+        _         -> rabbit_federation_link_util:ensure_connection_closed(DConn, Timeout)
+    end,
+    %% Unlike in the clean shutdown case above, we keep the queue and exchange around
+    case Conn of
+        undefined -> ok;
+        _         -> rabbit_federation_link_util:ensure_connection_closed(Conn, Timeout)
+    end,
     rabbit_federation_link_util:log_terminate(Reason, Upstream, UParams, XName),
     ok.
 
@@ -254,8 +318,37 @@ join(Name) ->
 all() ->
     pg:get_members(?FEDERATION_PG_SCOPE, pgname(rabbit_federation_exchanges)).
 
+all_local() ->
+    try
+        pg:get_local_members(?FEDERATION_PG_SCOPE, pgname(rabbit_federation_exchanges))
+    catch
+        error:badarg -> []
+    end.
+
 x(XName) ->
     pg:get_members(?FEDERATION_PG_SCOPE, pgname({rabbit_federation_exchange, XName})).
+
+-spec disconnect_all() -> ok.
+disconnect_all() ->
+    Pids = all_local(),
+    case Pids of
+        [] -> ok;
+        _  -> ?LOG_INFO("Exchange federation: disconnecting ~b local link(s) for shutdown",
+                        [length(Pids)])
+    end,
+    [gen_server2:cast(Pid, disconnect_for_shutdown) || Pid <- Pids],
+    ok.
+
+-spec reconnect_all() -> ok.
+reconnect_all() ->
+    Pids = all_local(),
+    case Pids of
+        [] -> ok;
+        _  -> ?LOG_INFO("Exchange federation: reconnecting ~b local link(s)",
+                        [length(Pids)])
+    end,
+    [gen_server2:cast(Pid, reconnect) || Pid <- Pids],
+    ok.
 
 %%----------------------------------------------------------------------------
 
@@ -302,14 +395,20 @@ record_binding(B = #binding{destination = Dest},
                   end,
     {DoIt, State#state{bindings = maps:put(key(B), Set, Bs)}}.
 
+-spec forget_binding(rabbit_types:binding(), #state{}) -> {boolean(), #state{}}.
 forget_binding(B = #binding{destination = Dest},
                State = #state{bindings = Bs}) ->
-    Dests = sets:del_element(Dest, maps:get(key(B), Bs)),
-    {DoIt, Bs1} = case sets:size(Dests) of
-                      0 -> {true,  maps:remove(key(B), Bs)};
-                      _ -> {false, maps:put(key(B), Dests, Bs)}
-                  end,
-    {DoIt, State#state{bindings = Bs1}}.
+    case maps:find(key(B), Bs) of
+        error ->
+            {false, State};
+        {ok, Dests0} ->
+            Dests = sets:del_element(Dest, Dests0),
+            {DoIt, Bs1} = case sets:size(Dests) of
+                              0 -> {true,  maps:remove(key(B), Bs)};
+                              _ -> {false, maps:put(key(B), Dests, Bs)}
+                          end,
+            {DoIt, State#state{bindings = Bs1}}
+    end.
 
 binding_op(UpdateFun, Cmd, B = #binding{args = Args},
            State = #state{cmd_channel = Ch}) ->
@@ -474,7 +573,8 @@ go(S0 = {not_started, {Upstream, UParams, DownXName}}) ->
               ?LOG_INFO("Federation link for ~ts (upstream: ~ts) will perform internal exchange checks "
                                          "every ~b seconds", [rabbit_misc:rs(DownXName), UName, round(Interval / 1000)]),
               TRef = erlang:send_after(Interval, self(), check_internal_exchange),
-              {noreply, State#state{internal_exchange_timer = TRef}}
+              {noreply, State#state{internal_exchange_timer = TRef,
+                                    link_state = running}}
       end, Upstream, UParams, DownXName, S0).
 
 log_link_startup_attempt(#upstream{name = Name, channel_use_mode = ChMode}, DownXName) ->
@@ -496,7 +596,7 @@ open_command_channel(Conn, Upstream = #upstream{name = UName}, UParams, DownXNam
             erlang:monitor(process, CCh),
             {ok, CCh};
         E ->
-            rabbit_federation_link_util:ensure_connection_closed(Conn),
+            rabbit_federation_link_util:ensure_connection_closed(Conn, connection_close_timeout()),
             _ = rabbit_federation_link_util:connection_error(command_channel, E,
                                                              Upstream, UParams, DownXName, S0),
             E
@@ -697,3 +797,10 @@ handle_down(DCh, Reason, _Ch, _CmdCh, DCh, Args, State) ->
 handle_down(ChPid, Reason, Ch, CmdCh, _DCh, Args, State)
   when ChPid =:= Ch; ChPid =:= CmdCh ->
     rabbit_federation_link_util:handle_upstream_down(Reason, Args, State).
+
+connection_close_timeout() ->
+    Default = rabbit_federation_link_util:connection_close_timeout(),
+    Configured = application:get_env(rabbitmq_exchange_federation,
+                                     connection_close_timeout,
+                                     Default),
+    erlang:min(Configured, Default).
