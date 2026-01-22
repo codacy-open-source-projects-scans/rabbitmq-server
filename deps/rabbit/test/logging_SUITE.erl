@@ -154,44 +154,7 @@ init_per_testcase(Testcase, Config) ->
         %% The exchange output requires RabbitMQ to run. All testcases in this
         %% group will run in the context of that RabbitMQ node.
         exchange_output ->
-            Config1 = rabbit_ct_helpers:set_config(
-                        Config,
-                        [{rmq_nodename_suffix, Testcase}]),
-            Config2 = (
-              case Testcase of
-                  use_exchange_logger_when_enabling_khepri_db ->
-                      rabbit_ct_helpers:set_config(
-                        Config1,
-                        [{rmq_nodes_count, 3},
-                         {metadata_store, mnesia}]);
-                  use_exchange_logger_when_enabling_all_feature_flags ->
-                      rabbit_ct_helpers:set_config(
-                        Config1,
-                        [{rmq_nodes_count, 3}]);
-                  _ ->
-                      rabbit_ct_helpers:set_config(
-                        Config1,
-                        [{rmq_nodes_count, 1}])
-              end),
-            LogCfg = {log, [
-                            {exchange, [{enabled, true}, {level, debug}]},
-                            {file, [{level, debug}]}
-                           ]},
-            Config3 = (
-              case Testcase of
-                  use_exchange_logger_when_enabling_all_feature_flags ->
-                      rabbit_ct_helpers:merge_app_env(
-                        Config2, {rabbit, [LogCfg,
-                                           {forced_feature_flags_on_init, []}
-                                          ]});
-                  _ ->
-                      rabbit_ct_helpers:merge_app_env(
-                        Config2, {rabbit, [LogCfg]})
-              end),
-            rabbit_ct_helpers:run_steps(
-              Config3,
-              rabbit_ct_broker_helpers:setup_steps() ++
-              rabbit_ct_client_helpers:setup_steps());
+            init_per_testcase_exchange_output(Testcase, Config);
 
         %% Other groups and testcases run the tested code directly without a
         %% RabbitMQ node running.
@@ -204,6 +167,46 @@ init_per_testcase(Testcase, Config) ->
             rabbit_ct_helpers:set_config(
               Config, {log_base_dir, LogBaseDir})
     end.
+
+init_per_testcase_exchange_output(Testcase, Config) ->
+    Config1 = rabbit_ct_helpers:set_config(
+                Config,
+                [{rmq_nodename_suffix, Testcase}]),
+    Config2 = (
+      case Testcase of
+          use_exchange_logger_when_enabling_khepri_db ->
+              rabbit_ct_helpers:set_config(
+                Config1,
+                [{rmq_nodes_count, 3},
+                 {metadata_store, mnesia}]);
+          use_exchange_logger_when_enabling_all_feature_flags ->
+              rabbit_ct_helpers:set_config(
+                Config1,
+                [{rmq_nodes_count, 3}]);
+          _ ->
+              rabbit_ct_helpers:set_config(
+                Config1,
+                [{rmq_nodes_count, 1}])
+      end),
+    LogCfg = {log, [
+                    {exchange, [{enabled, true}, {level, debug}]},
+                    {file, [{level, debug}]}
+                   ]},
+    Config3 = (
+      case Testcase of
+          use_exchange_logger_when_enabling_all_feature_flags ->
+              rabbit_ct_helpers:merge_app_env(
+                Config2, {rabbit, [LogCfg,
+                                   {forced_feature_flags_on_init, []}
+                                  ]});
+          _ ->
+              rabbit_ct_helpers:merge_app_env(
+                Config2, {rabbit, [LogCfg]})
+      end),
+    rabbit_ct_helpers:run_steps(
+      Config3,
+      rabbit_ct_broker_helpers:setup_steps() ++
+      rabbit_ct_client_helpers:setup_steps()).
 
 end_per_testcase(Testcase, Config) ->
     Config1 = case rabbit_ct_helpers:get_config(Config, rmq_nodes_count) of
@@ -1141,6 +1144,20 @@ update_log_exchange_config(Config) ->
     ok.
 
 use_exchange_logger_when_enabling_khepri_db(Config) ->
+    case rabbit_ct_helpers:is_mixed_versions() of
+        true ->
+            case rabbit_ct_broker_helpers:enable_feature_flag(
+                   Config, 'rabbitmq_4.0.0') of
+                ok ->
+                    use_exchange_logger_when_enabling_khepri_db1(Config);
+                {skip, _} = Skip ->
+                    Skip
+            end;
+        false ->
+            use_exchange_logger_when_enabling_khepri_db1(Config)
+    end.
+
+use_exchange_logger_when_enabling_khepri_db1(Config) ->
     ?assertNot(rabbit_ct_broker_helpers:rpc(
                  Config, 0,
                  rabbit_feature_flags, is_enabled, [khepri_db])),
