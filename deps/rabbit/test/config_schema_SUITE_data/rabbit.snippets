@@ -583,23 +583,6 @@ tcp_listen_options.exit_on_close = false",
   "ssl_handshake_timeout = 10000",
   [{rabbit,[{ssl_handshake_timeout,10000}]}],
   []},
- {cluster_partition_handling_pause_if_all_down,
-  "cluster_partition_handling = pause_if_all_down
-
-   ## Recover strategy. Can be either 'autoheal' or 'ignore'
-   cluster_partition_handling.pause_if_all_down.recover = ignore
-
-   ## Node names to check
-   cluster_partition_handling.pause_if_all_down.nodes.1 = rabbit@myhost1
-   cluster_partition_handling.pause_if_all_down.nodes.2 = rabbit@myhost2",
-  [{rabbit,
-       [{cluster_partition_handling,
-            {pause_if_all_down,[rabbit@myhost2,rabbit@myhost1],ignore}}]}],
-  []},
- {cluster_partition_handling_autoheal,
-  "cluster_partition_handling = autoheal",
-  [{rabbit,[{cluster_partition_handling,autoheal}]}],
-  []},
  {password_hashing,
   "password_hashing_module = rabbit_password_hashing_sha512",
   [{rabbit,[{password_hashing_module,rabbit_password_hashing_sha512}]}],
@@ -1108,6 +1091,27 @@ credential_validator.regexp = ^abc\\d+",
    "raft.adaptive_failure_detector.poll_interval = 10000",
    [{aten, [
       {poll_interval, 10000}
+     ]}],
+   []},
+
+   {raft_adaptive_failure_detector_scaling_factor,
+   "raft.adaptive_failure_detector.scaling_factor = 1.5",
+   [{aten, [
+      {scaling_factor, 1.5}
+     ]}],
+   []},
+
+   {raft_adaptive_failure_detector_heartbeat_interval,
+   "raft.adaptive_failure_detector.heartbeat_interval = 100",
+   [{aten, [
+      {heartbeat_interval, 100}
+     ]}],
+   []},
+
+   {raft_adaptive_failure_detector_detection_threshold,
+   "raft.adaptive_failure_detector.detection_threshold = 0.99",
+   [{aten, [
+      {detection_threshold, 0.99}
      ]}],
    []},
 

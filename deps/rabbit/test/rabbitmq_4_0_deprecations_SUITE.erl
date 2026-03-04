@@ -22,8 +22,8 @@
          init_per_testcase/2,
          end_per_testcase/2,
 
-         when_global_qos_is_permitted_by_default/1,
-         when_global_qos_is_not_permitted_from_conf/1,
+         when_global_qos_is_permitted_from_conf/1,
+         when_global_qos_is_not_permitted/1,
 
          set_policy_when_cmq_is_permitted_by_default/1,
          set_policy_when_cmq_is_not_permitted_from_conf/1,
@@ -31,8 +31,8 @@
          when_transient_nonexcl_is_permitted_by_default/1,
          when_transient_nonexcl_is_not_permitted_from_conf/1,
 
-         when_queue_master_locator_is_permitted_by_default/1,
-         when_queue_master_locator_is_not_permitted_from_conf/1
+         when_queue_master_locator_is_permitted_from_conf/1,
+         when_queue_master_locator_is_not_permitted_by_default/1
         ]).
 
 suite() ->
@@ -49,8 +49,8 @@ all() ->
 groups() ->
     [
      {global_qos, [],
-      [when_global_qos_is_permitted_by_default,
-       when_global_qos_is_not_permitted_from_conf]},
+      [when_global_qos_is_permitted_from_conf,
+       when_global_qos_is_not_permitted]},
      {classic_queue_mirroring, [],
       [set_policy_when_cmq_is_permitted_by_default,
        set_policy_when_cmq_is_not_permitted_from_conf]},
@@ -58,8 +58,8 @@ groups() ->
       [when_transient_nonexcl_is_permitted_by_default,
        when_transient_nonexcl_is_not_permitted_from_conf]},
      {queue_master_locator, [],
-      [when_queue_master_locator_is_permitted_by_default,
-       when_queue_master_locator_is_not_permitted_from_conf]}
+      [when_queue_master_locator_is_permitted_from_conf,
+       when_queue_master_locator_is_not_permitted_by_default]}
     ].
 
 %% -------------------------------------------------------------------
@@ -87,11 +87,11 @@ end_per_group(_Group, Config) ->
     Config.
 
 init_per_testcase(
-  when_global_qos_is_not_permitted_from_conf = Testcase, Config) ->
+  when_global_qos_is_permitted_from_conf = Testcase, Config) ->
     Config1 = rabbit_ct_helpers:merge_app_env(
                 Config,
                 {rabbit,
-                 [{permit_deprecated_features, #{global_qos => false}}]}),
+                 [{permit_deprecated_features, #{global_qos => true}}]}),
     init_per_testcase1(Testcase, Config1);
 init_per_testcase(
   set_policy_when_cmq_is_not_permitted_from_conf = Testcase, Config) ->
@@ -110,12 +110,12 @@ init_per_testcase(
                    #{transient_nonexcl_queues => false}}]}),
     init_per_testcase1(Testcase, Config1);
 init_per_testcase(
-    when_queue_master_locator_is_not_permitted_from_conf = Testcase, Config) ->
+    when_queue_master_locator_is_permitted_from_conf = Testcase, Config) ->
     Config1 = rabbit_ct_helpers:merge_app_env(
                 Config,
                 {rabbit,
                  [{permit_deprecated_features,
-                   #{queue_master_locator => false}}]}),
+                   #{queue_master_locator => true}}]}),
     init_per_testcase1(Testcase, Config1);
 init_per_testcase(Testcase, Config) ->
     init_per_testcase1(Testcase, Config).
@@ -143,7 +143,7 @@ end_per_testcase(Testcase, Config) ->
 %% Global QoS.
 %% -------------------------------------------------------------------
 
-when_global_qos_is_permitted_by_default(Config) ->
+when_global_qos_is_permitted_from_conf(Config) ->
     [NodeA] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
     ExistingServerChs = list_server_channels(Config, NodeA),
@@ -164,9 +164,9 @@ when_global_qos_is_permitted_by_default(Config) ->
        log_file_contains_message(
          Config, NodeA,
          ["Deprecated features: `global_qos`: Feature `global_qos` is deprecated",
-          "By default, this feature can still be used for now."])).
+          "Its use is permitted per the configuration"])).
 
-when_global_qos_is_not_permitted_from_conf(Config) ->
+when_global_qos_is_not_permitted(Config) ->
     [NodeA] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
     ExistingServerChs = list_server_channels(Config, NodeA),
@@ -187,7 +187,7 @@ when_global_qos_is_not_permitted_from_conf(Config) ->
        log_file_contains_message(
          Config, NodeA,
          ["Deprecated features: `global_qos`: Feature `global_qos` is deprecated",
-          "Its use is not permitted per the configuration"])).
+          "By default, this feature is not permitted anymore"])).
 
 list_server_channels(Config, Node) ->
     rabbit_ct_broker_helpers:rpc(Config, Node, rabbit_channel, list, []).
@@ -278,7 +278,7 @@ when_transient_nonexcl_is_not_permitted_from_conf(Config) ->
 %% (x-)queue-master-locator
 %% -------------------------------------------------------------------
 
-when_queue_master_locator_is_permitted_by_default(Config) ->
+when_queue_master_locator_is_permitted_from_conf(Config) ->
     [NodeA] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
     Ch = rabbit_ct_client_helpers:open_channel(Config, NodeA),
@@ -301,7 +301,7 @@ when_queue_master_locator_is_permitted_by_default(Config) ->
          Config, NodeA,
          ["Deprecated features: `queue_master_locator`: queue-master-locator is deprecated"])).
 
-when_queue_master_locator_is_not_permitted_from_conf(Config) ->
+when_queue_master_locator_is_not_permitted_by_default(Config) ->
     [NodeA] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
     Ch = rabbit_ct_client_helpers:open_channel(Config, NodeA),
@@ -329,7 +329,7 @@ when_queue_master_locator_is_not_permitted_from_conf(Config) ->
        log_file_contains_message(
          Config, NodeA,
          ["Deprecated features: `queue_master_locator`: Feature `queue_master_locator` is deprecated",
-          "Its use is not permitted per the configuration"])).
+          "By default, this feature is not permitted anymore"])).
 
 %% -------------------------------------------------------------------
 %% Helpers.

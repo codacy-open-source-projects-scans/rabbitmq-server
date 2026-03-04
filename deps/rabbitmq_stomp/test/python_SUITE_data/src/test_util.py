@@ -13,9 +13,6 @@ import os.path
 
 def ensure_ssl_auth_user():
     user = 'O=client,CN=%s' % socket.gethostname()
-    rabbitmqctl(['stop_app'])
-    rabbitmqctl(['reset'])
-    rabbitmqctl(['start_app'])
     rabbitmqctl(['add_user', user, 'foo'])
     rabbitmqctl(['clear_password', user])
     rabbitmqctl(['set_permissions', user, '.*', '.*', '.*'])
@@ -50,3 +47,11 @@ def rabbitmqctl(args):
     cmdline = [ctl, '-n', os.getenv('RABBITMQ_NODENAME')]
     cmdline.extend(args)
     subprocess.check_call(cmdline)
+
+def rabbitmqctl_output(args):
+    ctl = os.getenv('RABBITMQCTL')
+    cmdline = [ctl, '-n', os.getenv('RABBITMQ_NODENAME')]
+    cmdline.extend(args)
+    output = subprocess.check_output(cmdline).decode('utf-8')
+    print(output)
+    return output

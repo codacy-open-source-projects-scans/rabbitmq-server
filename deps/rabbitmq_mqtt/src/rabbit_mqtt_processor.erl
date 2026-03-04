@@ -40,6 +40,7 @@
 -define(CONSUMER_TAG, <<"mqtt">>).
 -define(QUEUE_TTL_KEY, <<"x-expires">>).
 -define(DEFAULT_EXCHANGE_NAME, <<>>).
+-define(FENCE_TIMEOUT, 30_000).
 
 -ifdef(TEST).
 -define(SILENT_CLOSE_DELAY, 10).
@@ -205,9 +206,10 @@ process_connect(
         ok ?= check_user_connection_limit(Username),
         {ok, AuthzCtx} ?= check_vhost_access(VHost, User, ClientId, PeerIp),
         ok ?= check_user_loopback(Username, PeerIp),
-        ok ?= ensure_credential_expiry_timer(User, PeerIp),
         rabbit_core_metrics:auth_attempt_succeeded(PeerIp, Username, mqtt),
         ok = register_client_id(VHost, ClientId, CleanStart, WillProps),
+        ok ?= fence(),
+        ok ?= ensure_credential_expiry_timer(User, PeerIp),
         {ok, WillMsg} ?= make_will_msg(Packet),
         {TraceState, ConnName} = init_trace(VHost, ConnName0),
         ok = rabbit_mqtt_keepalive:start(KeepaliveSecs, Socket),
@@ -286,6 +288,15 @@ process_connect(
             SessPresent = false,
             send_conn_ack(ConnectReasonCode, SessPresent, ProtoVer, SendFun, MaxPacketSize, #{}),
             Err
+    end.
+
+fence() ->
+    case rabbit_khepri:fence(?FENCE_TIMEOUT) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            ?LOG_ERROR("MQTT connection failed: rabbit_khepri:fence/1 failed: ~p", [Reason]),
+            {error, ?RC_SERVER_UNAVAILABLE}
     end.
 
 -spec prefetch(ConnectProperties :: properties()) -> pos_integer().
@@ -889,7 +900,7 @@ init_subscriptions(_SessionPresent = _SubscriptionsPresent = true,
         {ok, SubsQos1} ?= init_subscriptions0(?QOS_1, State),
         Subs = maps:merge(SubsQos0, SubsQos1),
         rabbit_global_counters:consumer_created(ProtoVer),
-        %% Cache subscriptions in process state to avoid future mnesia:match_object/3 queries.
+        %% Cache subscriptions in process state to perform fewer queries.
         {ok, State#state{subscriptions = Subs}}
     end;
 init_subscriptions(_, State) ->
@@ -1750,17 +1761,12 @@ process_routing_confirm(#{}, _, State) ->
 -spec send_puback(packet_id() | list(packet_id()), reason_code(), state()) -> ok.
 send_puback(PktIds0, ReasonCode, State)
   when is_list(PktIds0) ->
-    case rabbit_node_monitor:pause_partition_guard() of
-        ok ->
-            %% Classic queues confirm messages unordered.
-            %% Let's sort them here assuming most MQTT clients send with an increasing packet identifier.
-            PktIds = lists:usort(PktIds0),
-            lists:foreach(fun(Id) ->
-                                  send_puback(Id, ReasonCode, State)
-                          end, PktIds);
-        pausing ->
-            ok
-    end;
+    %% Classic queues confirm messages unordered.
+    %% Let's sort them here assuming most MQTT clients send with an increasing packet identifier.
+    PktIds = lists:usort(PktIds0),
+    lists:foreach(fun(Id) ->
+                          send_puback(Id, ReasonCode, State)
+                  end, PktIds);
 send_puback(PktId, ReasonCode, State = #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
     rabbit_global_counters:messages_confirmed(ProtoVer, 1),
     Packet = #mqtt_packet{fixed = #mqtt_packet_fixed{type = ?PUBACK},

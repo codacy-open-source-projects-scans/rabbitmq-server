@@ -10,12 +10,13 @@
 -include("amqqueue.hrl").
 -include_lib("kernel/include/logger.hrl").
 
--export([recover/0, recover/2, exists/1, add/2, add/3, remove/2, remove/3]).
+-export([exists/1, add/2, add/3, remove/2, remove/3]).
 -export([list/1, list_for_source/1, list_for_destination/1,
          list_for_source_and_destination/2, list_for_source_and_destination/3,
          list_explicit/0]).
 -export([new_deletions/0, combine_deletions/2, add_deletion/5,
-         process_deletions/1, notify_deletions/2, group_bindings_fold/3]).
+         process_deletions/1, notify_deletions/2, group_bindings_fold/3,
+         delete_for_destination/2]).
 -export([info_keys/0, info/1, info/2, info_all/1, info_all/2, info_all/4]).
 
 -export([reverse_binding/1]).
@@ -81,50 +82,6 @@ new(Src, RoutingKey, Dst, Arguments) ->
                     destination_name, destination_kind,
                     routing_key, arguments,
                     vhost]).
-
-%% Global table recovery
-
-recover() ->
-    rabbit_db_binding:recover().
-
-%% Virtual host-specific recovery
-
--spec recover([rabbit_exchange:name()], [rabbit_amqqueue:name()]) ->
-                        'ok'.
-recover(XNames, QNames) ->
-    XNameSet = sets:from_list(XNames),
-    QNameSet = sets:from_list(QNames),
-    SelectSet = fun (#resource{kind = exchange}) -> XNameSet;
-                    (#resource{kind = queue})    -> QNameSet
-                end,
-    {ok, Gatherer} = gatherer:start_link(),
-    rabbit_db_binding:recover(
-      fun(Binding, Src, Dst, Fun) ->
-              recover_semi_durable_route(Gatherer, Binding, Src, Dst, SelectSet(Dst), Fun)
-      end),
-    empty = gatherer:out(Gatherer),
-    ok = gatherer:stop(Gatherer),
-    ok.
-
-recover_semi_durable_route(Gatherer, Binding, Src, Dst, ToRecover, Fun) ->
-    case sets:is_element(Dst, ToRecover) of
-        true  ->
-            case rabbit_exchange:lookup(Src) of
-                {ok, X} ->
-                    ok = gatherer:fork(Gatherer),
-                    ok = worker_pool:submit_async(
-                           fun () ->
-                                   Fun(Binding, X),
-                                   gatherer:finish(Gatherer)
-                           end);
-                {error, not_found}=Error ->
-                    ?LOG_WARNING(
-                      "expected exchange ~tp to exist during recovery, "
-                      "error: ~tp", [Src, Error]),
-                    ok
-            end;
-        false -> ok
-    end.
 
 -spec exists(rabbit_types:binding()) -> boolean() | bind_errors().
 
@@ -531,4 +488,16 @@ fetch_deletion(XName, Deletions) ->
             {X, WasDeleted, Bindings1};
         error ->
             error
+    end.
+
+%% @doc This function is used to delete bindings before a quorum queue is deleted.
+%% It is to avoid bindings pointing to queues under deletion.
+-spec delete_for_destination(rabbit_types:binding_destination(), rabbit_types:username()) -> ok.
+delete_for_destination(QName, User) ->
+    case rabbit_db_binding:delete_for_destination(QName) of
+        Deletions when is_map(Deletions) ->
+            process_deletions(Deletions),
+            notify_deletions(Deletions, User);
+        {error, _} ->
+            ok
     end.

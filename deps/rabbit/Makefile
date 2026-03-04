@@ -55,9 +55,7 @@ define PROJECT_ENV
 	    {ssl_allow_poodle_attack, false},
 	    {handshake_timeout, 10000},
 	    {reverse_dns_lookups, false},
-	    {cluster_partition_handling, ignore},
 	    {cluster_keepalive_interval, 10000},
-	    {autoheal_state_transition_timeout, 60000},
 	    {tcp_listen_options, [{backlog,       128},
 	                          {nodelay,       true},
 	                          {linger,        {true, 0}},
@@ -262,14 +260,14 @@ PARALLEL_CT_SET_2_D = queue_length_limits queue_parallel quorum_queue_member_rec
 PARALLEL_CT_SET_3_A = definition_import per_user_connection_channel_limit_partitions per_vhost_connection_limit_partitions policy priority_queue_recovery rabbit_fifo_v0 rabbit_stream_sac_coordinator_v4 rabbit_stream_sac_coordinator unit_credit_flow unit_queue_consumers unit_queue_location unit_quorum_queue
 PARALLEL_CT_SET_3_B = list_consumers_sanity_check list_queues_online_and_offline logging lqueue rabbit_fifo_q
 PARALLEL_CT_SET_3_C = cli_forget_cluster_node mc_unit message_size_limit
-PARALLEL_CT_SET_3_D = metadata_store_phase1 metrics mirrored_supervisor peer_discovery_classic_config proxy_protocol runtime_parameters unit_rabbit_vm unit_stats_and_metrics unit_supervisor2 unit_vm_memory_monitor
+PARALLEL_CT_SET_3_D = metrics mirrored_supervisor proxy_protocol runtime_parameters unit_rabbit_vm unit_stats_and_metrics unit_supervisor2 unit_vm_memory_monitor
 
 PARALLEL_CT_SET_4_A = clustering_events rabbit_local_random_exchange rabbit_msg_interceptor rabbitmq_4_0_deprecations unit_pg_local unit_plugin_directories unit_plugin_versioning unit_policy_validators unit_priority_queue
 PARALLEL_CT_SET_4_B = per_user_connection_tracking per_vhost_connection_limit rabbit_fifo_int unit_default_queue_type
 PARALLEL_CT_SET_4_C = msg_size_metrics unit_msg_size_metrics per_vhost_msg_store per_vhost_queue_limit priority_queue upgrade_preparation vhost
 PARALLEL_CT_SET_4_D = per_user_connection_channel_tracking product_info queue_type rabbitmq_queues_cli_integration rabbitmq_streams_cli_integration rabbitmqctl_integration rabbitmqctl_shutdown routing rabbit_amqqueue
 
-PARALLEL_CT_SET_5_A = rabbit_direct_reply_to_prop direct_reply_to_amqpl direct_reply_to_amqp classic_queue
+PARALLEL_CT_SET_5_A = rabbit_direct_reply_to_prop rabbit_quorum_queue_prop direct_reply_to_amqpl direct_reply_to_amqp classic_queue
 PARALLEL_CT_SET_5_B = feature_flags_v2 backing_queue transactions
 PARALLEL_CT_SET_5_C = cluster_upgrade maintenance_mode
 PARALLEL_CT_SET_5_D = rabbit_fifo_dlx_integration publisher_confirms_parallel
@@ -280,7 +278,7 @@ PARALLEL_CT_SET_3 = $(sort $(PARALLEL_CT_SET_3_A) $(PARALLEL_CT_SET_3_B) $(PARAL
 PARALLEL_CT_SET_4 = $(sort $(PARALLEL_CT_SET_4_A) $(PARALLEL_CT_SET_4_B) $(PARALLEL_CT_SET_4_C) $(PARALLEL_CT_SET_4_D))
 PARALLEL_CT_SET_5 = $(sort $(PARALLEL_CT_SET_5_A) $(PARALLEL_CT_SET_5_B) $(PARALLEL_CT_SET_5_C) $(PARALLEL_CT_SET_5_D))
 
-SEQUENTIAL_CT_SUITES = amqp_client clustering_management clustering_recovery dead_lettering feature_flags metadata_store_clustering quorum_queue rabbit_stream_queue rabbit_fifo_prop
+SEQUENTIAL_CT_SUITES = amqp_client clustering_management clustering_recovery dead_lettering feature_flags metadata_store_clustering quorum_queue rabbit_stream_queue rabbit_fifo_prop peer_discovery_classic_config
 PARALLEL_CT_SUITES = $(PARALLEL_CT_SET_1) $(PARALLEL_CT_SET_2) $(PARALLEL_CT_SET_3) $(PARALLEL_CT_SET_4) $(PARALLEL_CT_SET_5)
 
 ifeq ($(filter-out $(SEQUENTIAL_CT_SUITES) $(PARALLEL_CT_SUITES),$(CT_SUITES)),)

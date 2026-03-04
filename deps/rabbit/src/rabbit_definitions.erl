@@ -426,8 +426,14 @@ normalize_backend_module(Other) ->
 decode(Keys, Body) ->
     case decode(Body) of
         {ok, J0} ->
-            J = maps:fold(fun(K, V, Acc) ->
-                  Acc#{rabbit_data_coercion:to_atom(K, utf8) => V}
+            J = maps:fold(fun(K, V, Acc) when is_atom(K) ->
+                      Acc#{K => V};
+                  (K, V, Acc) ->
+                      try binary_to_existing_atom(K, utf8) of
+                          Atom -> Acc#{Atom => V}
+                      catch
+                          error:badarg -> Acc
+                      end
                 end, J0, J0),
             Results = [get_or_missing(K, J) || K <- Keys],
             case [E || E = {key_missing, _} <- Results] of
@@ -439,7 +445,8 @@ decode(Keys, Body) ->
 
 decode(<<"">>) ->
     {ok, #{}};
-decode(Body) ->
+decode(Body0) ->
+    Body = rabbit_misc:strip_bom(Body0),
     try
       Decoded = rabbit_json:decode(Body),
       Normalised = atomise_map_keys(Decoded),
@@ -447,10 +454,15 @@ decode(Body) ->
     catch error:_ -> {error, not_json}
     end.
 
+%% Only atomize the atoms that already exist.
 atomise_map_keys(Decoded) ->
     maps:fold(fun(K, V, Acc) ->
-        Acc#{rabbit_data_coercion:to_atom(K, utf8) => V}
-              end, Decoded, Decoded).
+        try binary_to_existing_atom(K, utf8) of
+            Atom -> Acc#{Atom => V}
+        catch
+            error:badarg -> Acc
+        end
+    end, #{}, Decoded).
 
 -spec should_skip_if_unchanged() -> boolean().
 should_skip_if_unchanged() ->
@@ -682,9 +694,14 @@ do_concurrent_for_all(List, WorkPoolFun) ->
 
 -spec atomize_keys(#{any() => any()}) -> #{atom() => any()}.
 
+%% Only atomize the atoms that already exist.
 atomize_keys(M) ->
     maps:fold(fun(K, V, Acc) ->
-                maps:put(rabbit_data_coercion:to_atom(K), V, Acc)
+                try
+                    maps:put(rabbit_data_coercion:to_existing_atom(K), V, Acc)
+                catch
+                    error:badarg -> Acc
+                end
               end, #{}, M).
 
 -spec human_readable_category_name(definition_category()) -> string().

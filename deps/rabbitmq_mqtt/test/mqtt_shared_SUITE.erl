@@ -782,6 +782,10 @@ pubsub(Config) ->
     {ok, _, [1]} = emqtt:subscribe(C1, Topic1, qos1),
     C0 = connect(<<"c0">>, Config, 0, []),
     {ok, _, [1]} = emqtt:subscribe(C0, Topic0, qos1),
+    %% Ensure both nodes have consistent metadata before publishing
+    %% cross-node.
+    ok = await_metadata_store_consistent(Config, 0),
+    ok = await_metadata_store_consistent(Config, 1),
 
     {ok, _} = emqtt:publish(C0, Topic1, <<"m1">>, qos1),
     receive {publish, #{client_pid := C1,
@@ -1204,6 +1208,7 @@ rabbit_mqtt_qos0_queue(Config) ->
 
     %% Place MQTT publisher process on old node in mixed version.
     Pub = connect(<<"publisher">>, Config, 1, []),
+    ok = await_metadata_store_consistent(Config, 1),
 
     Msg = <<"msg">>,
     ok = emqtt:publish(Pub, Topic, Msg, qos0),
@@ -1484,13 +1489,13 @@ duplicate_client_id(Config) ->
     eventually(?_assertEqual(0, length(all_connection_pids(Config)))).
 
 session_reconnect(Config) ->
-    session_switch(Config, true).
+    session_switch(Config, true, ?FUNCTION_NAME).
 
 session_takeover(Config) ->
-    session_switch(Config, false).
+    session_switch(Config, false, ?FUNCTION_NAME).
 
-session_switch(Config, Disconnect) ->
-    Topic = ClientId = atom_to_binary(?FUNCTION_NAME),
+session_switch(Config, Disconnect, Name) ->
+    Topic = ClientId = atom_to_binary(Name),
     %% Connect to old node in mixed version cluster.
     C1 = connect(ClientId, Config, 1, non_clean_sess_opts()),
     {ok, _, [1]} = emqtt:subscribe(C1, Topic, qos1),
@@ -1515,7 +1520,9 @@ session_switch(Config, Disconnect) ->
     %% New connection should be able to unsubscribe.
     ?assertMatch({ok, _, _}, emqtt:unsubscribe(C2, Topic)),
     {ok, _} = emqtt:publish(C2, Topic, <<"m2">>, qos1),
-    receive Unexpected -> ct:fail({unexpected, Unexpected})
+    receive Unexpected ->
+                ct:pal("C1=~p C2=~p", [C1, C2]),
+                ct:fail({unexpected, Unexpected})
     after 300 -> ok
     end,
 

@@ -1293,48 +1293,6 @@ end}.
 %% =====================
 %%
 
-%% How to respond to cluster partitions.
-%% See https://www.rabbitmq.com/docs/partitions for further details.
-%%
-%% {cluster_partition_handling, ignore},
-
-{mapping, "cluster_partition_handling", "rabbit.cluster_partition_handling",
-    [{datatype, {enum, [ignore, pause_minority, autoheal, pause_if_all_down]}}]}.
-
-{mapping, "cluster_partition_handling.pause_if_all_down.recover",
-          "rabbit.cluster_partition_handling",
-          [{datatype, {enum, [ignore, autoheal]}}]}.
-
-{mapping, "cluster_partition_handling.pause_if_all_down.nodes.$name",
-          "rabbit.cluster_partition_handling",
-          [{datatype, atom}]}.
-
-{translation, "rabbit.cluster_partition_handling",
-fun(Conf) ->
-    case cuttlefish:conf_get("cluster_partition_handling", Conf) of
-        pause_if_all_down ->
-            PauseIfAllDownNodes = cuttlefish_variable:filter_by_prefix(
-                "cluster_partition_handling.pause_if_all_down.nodes",
-                Conf),
-            case PauseIfAllDownNodes of
-                [] ->
-                    cuttlefish:invalid("Nodes required for pause_if_all_down");
-                _  ->
-                    Nodes = [ V || {K,V} <- PauseIfAllDownNodes ],
-                    PauseIfAllDownRecover = cuttlefish:conf_get(
-                        "cluster_partition_handling.pause_if_all_down.recover",
-                        Conf),
-                    case PauseIfAllDownRecover of
-                        Recover when Recover == ignore; Recover == autoheal ->
-                            {pause_if_all_down, Nodes, Recover};
-                        Invalid ->
-                            cuttlefish:invalid("Recover strategy required for pause_if_all_down")
-                    end
-            end;
-        Other -> Other
-    end
-end}.
-
 %% Number of delegate processes to use for intra-cluster
 %% communication. On a machine which has a very large number of cores
 %% and is also part of a cluster, you may wish to increase this value.
@@ -2631,6 +2589,46 @@ end}.
 {translation, "aten.poll_interval",
   fun(Conf) ->
       case cuttlefish:conf_get("raft.adaptive_failure_detector.poll_interval", Conf, undefined) of
+          undefined -> cuttlefish:unset();
+          Val       -> Val
+      end
+  end
+}.
+
+{mapping, "raft.adaptive_failure_detector.scaling_factor", "aten.scaling_factor", [
+  {datatype, float}
+]}.
+
+{translation, "aten.scaling_factor",
+  fun(Conf) ->
+      case cuttlefish:conf_get("raft.adaptive_failure_detector.scaling_factor", Conf, undefined) of
+          undefined -> cuttlefish:unset();
+          Val       -> Val
+      end
+  end
+}.
+
+{mapping, "raft.adaptive_failure_detector.heartbeat_interval", "aten.heartbeat_interval", [
+  {datatype, integer},
+  {validators, ["non_zero_positive_integer"]}
+]}.
+
+{translation, "aten.heartbeat_interval",
+  fun(Conf) ->
+      case cuttlefish:conf_get("raft.adaptive_failure_detector.heartbeat_interval", Conf, undefined) of
+          undefined -> cuttlefish:unset();
+          Val       -> Val
+      end
+  end
+}.
+
+{mapping, "raft.adaptive_failure_detector.detection_threshold", "aten.detection_threshold", [
+  {datatype, float}
+]}.
+
+{translation, "aten.detection_threshold",
+  fun(Conf) ->
+      case cuttlefish:conf_get("raft.adaptive_failure_detector.detection_threshold", Conf, undefined) of
           undefined -> cuttlefish:unset();
           Val       -> Val
       end

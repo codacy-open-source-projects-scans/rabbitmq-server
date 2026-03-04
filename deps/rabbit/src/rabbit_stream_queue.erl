@@ -225,8 +225,6 @@ create_stream(Q0) ->
             end;
         {existing, Q} ->
             {existing, Q};
-        {absent, Q, Reason} ->
-            {absent, Q, Reason};
         {error, timeout} ->
             {protocol_error, internal_error,
              "Could not declare ~ts on node '~ts' because the metadata store "
@@ -457,7 +455,7 @@ query_local_pid(#stream_client{stream_id = StreamId} = State) ->
     case rabbit_stream_coordinator:local_pid(StreamId) of
         {ok, Pid} ->
             {Pid, State#stream_client{local_pid = Pid}};
-        {error, not_found} ->
+        {error, _} ->
             {undefined, State}
     end.
 
@@ -768,7 +766,7 @@ i(online, Q) ->
                          (Key, _, Acc) ->
                               [Key | Acc]
                       end, [], Members);
-        {error, not_found} ->
+        {error, _} ->
             []
     end;
 i(state, Q) when ?is_amqqueue(Q) ->
