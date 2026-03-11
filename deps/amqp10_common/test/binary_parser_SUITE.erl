@@ -21,7 +21,11 @@ all_tests() ->
     [
      roundtrip,
      array_with_extra_input,
-     unsupported_type
+     unsupported_type,
+     peek_described_section_total_sizes,
+     peek_described_section,
+     peek_non_described_throws,
+     peek_total_size_matches_parse
     ].
 
 groups() ->
@@ -85,3 +89,65 @@ unsupported_type(_Config) ->
     Bin = <<UnsupportedType, "hey">>,
     Expected = {primitive_type_unsupported, UnsupportedType, {position, 0}},
     ?assertThrow(Expected, amqp10_binary_parser:parse_many(Bin, [])).
+
+%%%===================================================================
+%%% peek/1 (exercises peek_value_size internally via described types)
+%%%===================================================================
+
+%% Asserts peek returns total size equal to byte_size for described sections.
+%% Covers the same value-size logic as peek_value_size without calling it,
+%% so the suite works when the dep is built without exporting peek_value_size (e.g. CI).
+peek_described_section_total_sizes(_Config) ->
+    Sections = [
+        {described, {ulong, 16#75}, {binary, <<>>}},
+        {described, {ulong, 16#75}, {binary, <<"x">>}},
+        {described, {ulong, 16#75}, {binary, <<"payload">>}},
+        {described, {symbol, <<"amqp:data:binary">>}, {binary, <<"x">>}},
+        {described, {symbol, <<"amqp:properties:list">>}, {list, []}},
+        {described, {symbol, <<"URL">>}, {utf8, <<"http://example.org">>}}
+    ],
+    lists:foreach(
+      fun(Term) ->
+              Bin = iolist_to_binary(amqp10_binary_generator:generate(Term)),
+              {_Descriptor, TotalSize} = amqp10_binary_parser:peek(Bin),
+              ?assertEqual(byte_size(Bin), TotalSize,
+                          "peek total size must equal section byte size")
+      end,
+      Sections).
+
+peek_described_section(_Config) ->
+    %% v1_0.data: described {ulong, 0x75}, value {binary, <<"x">>}
+    DataSection = {described, {ulong, 16#75}, {binary, <<"x">>}},
+    Bin = iolist_to_binary(amqp10_binary_generator:generate(DataSection)),
+    {Descriptor, TotalSize} = amqp10_binary_parser:peek(Bin),
+    ?assertEqual('v1_0.data', element(1, amqp10_framing0:record_for(Descriptor))),
+    ?assertEqual(6, TotalSize),
+    %% v1_0.properties (symbol descriptor) with empty list value
+    PropsSection = {described, {symbol, <<"amqp:properties:list">>}, {list, []}},
+    BinProps = iolist_to_binary(amqp10_binary_generator:generate(PropsSection)),
+    {DescriptorProps, TotalSizeProps} = amqp10_binary_parser:peek(BinProps),
+    ?assertEqual('v1_0.properties', element(1, amqp10_framing0:record_for(DescriptorProps))),
+    ?assertEqual(byte_size(BinProps), TotalSizeProps).
+
+peek_non_described_throws(_Config) ->
+    %% First byte must be ?DESCRIBED (0); any other type throws
+    ?assertThrow({not_described_type, 16#40}, amqp10_binary_parser:peek(<<16#40>>)),
+    ?assertThrow({not_described_type, 16#41}, amqp10_binary_parser:peek(<<16#41, 0>>)).
+
+peek_total_size_matches_parse(_Config) ->
+    %% For any described type, peek total size must equal bytes consumed by parse
+    Sections = [
+        {described, {ulong, 16#75}, {binary, <<>>}},
+        {described, {ulong, 16#75}, {binary, <<"payload">>}},
+        {described, {symbol, <<"amqp:data:binary">>}, {binary, <<"x">>}},
+        {described, {symbol, <<"URL">>}, {utf8, <<"http://example.org">>}}
+    ],
+    lists:foreach(
+      fun(Term) ->
+              Bin = iolist_to_binary(amqp10_binary_generator:generate(Term)),
+              {_Descriptor, TotalSize} = amqp10_binary_parser:peek(Bin),
+              {_Parsed, BytesParsed} = amqp10_binary_parser:parse(Bin),
+              ?assertEqual(BytesParsed, TotalSize,
+                          "peek total size must match parse bytes consumed")
+      end,
+      Sections).

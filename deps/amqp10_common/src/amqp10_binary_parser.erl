@@ -16,7 +16,13 @@
 -include("amqp10_framing.hrl").
 
 -export([parse/1,
-         parse_many/2]).
+         parse_many/2,
+         peek/1]).
+
+-ifdef(TEST).
+-export([peek_value_size_fixed_test/0,
+         peek_value_size_variable_test/0]).
+-endif.
 
 %% §1.6
 -define(CODE_ULONG, 16#80).
@@ -338,3 +344,91 @@ pm_compound(UnitSize, Bin, O, B) ->
 
 reached_body(Position, DescriptorCode) ->
     [{{pos, Position}, {body, DescriptorCode}}].
+
+%% Returns the descriptor and total byte size (1 + B1 + B2) of the described type
+%% at the start of the binary, without parsing the value.
+-spec peek(binary()) ->
+    {({ulong, non_neg_integer()} | {symbol, binary()}), TotalSize :: non_neg_integer()}.
+peek(<<?DESCRIBED, Rest/binary>>) ->
+    {Descriptor, B1} = parse(Rest),
+    <<_:B1/binary, Rest1/binary>> = Rest,
+    B2 = peek_value_size(Rest1),
+    {Descriptor, 1 + B1 + B2};
+peek(<<Type, _/binary>>) ->
+    throw({not_described_type, Type}).
+
+%% Returns the byte size of the AMQP value at the start of the binary
+%% without parsing it (no term construction). Used by peek/1.
+peek_value_size(<<16#40, _/binary>>) -> 1;
+peek_value_size(<<16#41, _/binary>>) -> 1;
+peek_value_size(<<16#42, _/binary>>) -> 1;
+peek_value_size(<<16#43, _/binary>>) -> 1;
+peek_value_size(<<16#44, _/binary>>) -> 1;
+peek_value_size(<<16#45, _/binary>>) -> 1;
+peek_value_size(<<16#50, _/binary>>) -> 2;
+peek_value_size(<<16#51, _/binary>>) -> 2;
+peek_value_size(<<16#52, _/binary>>) -> 2;
+peek_value_size(<<?CODE_SMALL_ULONG, _/binary>>) -> 2;
+peek_value_size(<<16#54, _/binary>>) -> 2;
+peek_value_size(<<16#55, _/binary>>) -> 2;
+peek_value_size(<<16#56, _/binary>>) -> 2;
+peek_value_size(<<16#60, _/binary>>) -> 3;
+peek_value_size(<<16#61, _/binary>>) -> 3;
+peek_value_size(<<16#70, _/binary>>) -> 5;
+peek_value_size(<<16#71, _/binary>>) -> 5;
+peek_value_size(<<16#72, _/binary>>) -> 5;
+peek_value_size(<<16#73, _/binary>>) -> 5;
+peek_value_size(<<16#74, _/binary>>) -> 5;
+peek_value_size(<<?CODE_ULONG, _/binary>>) -> 9;
+peek_value_size(<<16#81, _/binary>>) -> 9;
+peek_value_size(<<16#82, _/binary>>) -> 9;
+peek_value_size(<<16#83, _/binary>>) -> 9;
+peek_value_size(<<16#84, _/binary>>) -> 9;
+peek_value_size(<<16#94, _/binary>>) -> 17;
+peek_value_size(<<16#98, _/binary>>) -> 17;
+peek_value_size(<<16#a0, S:8, _/binary>>) -> 2 + S;
+peek_value_size(<<16#a1, S:8, _/binary>>) -> 2 + S;
+peek_value_size(<<?CODE_SYM_8, S:8, _/binary>>) -> 2 + S;
+peek_value_size(<<?CODE_SYM_32, S:32, _/binary>>) -> 5 + S;
+peek_value_size(<<16#b0, S:32, _/binary>>) -> 5 + S;
+peek_value_size(<<16#b1, S:32, _/binary>>) -> 5 + S;
+peek_value_size(<<16#c0, Size, _/binary>>) -> 2 + Size;
+peek_value_size(<<16#c1, Size, _/binary>>) -> 2 + Size;
+peek_value_size(<<16#d0, Size:32, _/binary>>) -> 5 + Size;
+peek_value_size(<<16#d1, Size:32, _/binary>>) -> 5 + Size;
+peek_value_size(<<16#e0, S:8, _/binary>>) -> 2 + S;
+peek_value_size(<<16#f0, S:32, _/binary>>) -> 5 + S;
+peek_value_size(<<Type, _/binary>>) ->
+    throw({primitive_type_unsupported, Type, peek_value_size}).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+peek_value_size_fixed_test() ->
+    %% 1-byte primitives (type code only)
+    ?assertEqual(1, peek_value_size(<<16#40, 0>>)),
+    ?assertEqual(1, peek_value_size(<<16#41, 0>>)),
+    ?assertEqual(1, peek_value_size(<<16#45, 0>>)),
+    %% 2-byte (type + 1 byte)
+    ?assertEqual(2, peek_value_size(<<16#50, 42>>)),
+    ?assertEqual(2, peek_value_size(<<16#53, 16#75>>)),
+    %% 3-byte (type + 2 bytes)
+    ?assertEqual(3, peek_value_size(<<16#60, 0, 1>>)),
+    %% 5-byte (type + 4 bytes)
+    ?assertEqual(5, peek_value_size(<<16#70, 0, 0, 0, 0>>)),
+    %% 9-byte (type + 8 bytes)
+    ?assertEqual(9, peek_value_size(<<16#80, 0:64>>)),
+    %% 17-byte (uuid)
+    ?assertEqual(17, peek_value_size(<<16#98, 0:128>>)).
+
+peek_value_size_variable_test() ->
+    %% Binary: 0xa0 + size (1 byte) + payload -> 2 + S
+    ?assertEqual(5, peek_value_size(<<16#a0, 3, "foo">>)),
+    %% UTF8: 0xa1 + size + payload
+    ?assertEqual(6, peek_value_size(<<16#a1, 4, "test">>)),
+    %% Symbol (CODE_SYM_8 = 0xa3)
+    ?assertEqual(7, peek_value_size(<<16#a3, 5, "hello">>)),
+    %% List: 0xc0 + size byte -> 2 + Size
+    ?assertEqual(4, peek_value_size(<<16#c0, 2, 0, 16#40>>)).
+
+-endif.
