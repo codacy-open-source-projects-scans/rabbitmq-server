@@ -15,7 +15,9 @@
 -dialyzer({nowarn_function, convert_v7_to_v8/2}).
 -dialyzer(no_improper_lists).
 
+-include("rabbit_queue_type.hrl").
 -include("rabbit_fifo.hrl").
+
 -include_lib("kernel/include/logger.hrl").
 
 -define(STATE, ?MODULE).
@@ -754,32 +756,35 @@ apply_(#{system_time := Ts} = Meta,
     %% Check if single_active consumer is in timeout or suspected_down state
     %% with no checked out messages
     %% and move it back to waiting_consumers if so
-    State2 =
+    {State2, Effects1} =
         case ConsumerStrat of
             single_active ->
                 maps:fold(
                   fun (CKey, #consumer{status = {_, _},
-                                       checked_out = Checked} = Con, S)
+                                       checked_out = Checked} = Con, {S, E})
                         when map_size(Checked) == 0 ->
                           %% Remove from active consumers and add to waiting
-                          %% if the consumer it timedout _and_ it has not
+                          %% if the consumer has timed out _and_ it has no
                           %% remaining messages checked out
                           Consumers = maps:remove(CKey, S#?STATE.consumers),
                           Waiting0 = S#?STATE.waiting_consumers,
                           Waiting = add_waiting({CKey, Con}, Waiting0),
-                          S#?STATE{consumers = Consumers,
-                                   waiting_consumers = Waiting};
+                          S1 = S#?STATE{consumers = Consumers,
+                                        waiting_consumers = Waiting},
+                          E1 = consumer_update_active_effects(
+                                 S1, Con, false, waiting, E),
+                          {S1, E1};
                      (_, _, Acc) ->
                           Acc
-                  end, State1,
+                  end, {State1, Effects0},
                   maps:iterator(State1#?STATE.consumers, ordered));
             _ ->
-                State1
+                {State1, Effects0}
         end,
 
-    {State3, Effects1} = update_next_consumer_timeout(State2, Effects0),
+    {State3, Effects2} = update_next_consumer_timeout(State2, Effects1),
     %% activate SAC
-    {State, Effects} = activate_next_consumer({State3, Effects1}),
+    {State, Effects} = activate_next_consumer({State3, Effects2}),
     checkout(Meta, State0, State, Effects);
 apply_(_Meta, Cmd, State) ->
     %% handle unhandled commands gracefully
@@ -926,34 +931,40 @@ snapshot_installed(_Meta, #?MODULE{cfg = #cfg{},
     delivery_effects(SendAcc, State) ++
     credit_reply_resend_effect(State).
 
-credit_reply_resend_effect(#?MODULE{cfg = #cfg{},
-                                    waiting_consumers = Waiting,
+credit_reply_resend_effect(#?MODULE{waiting_consumers = Waiting,
                                     consumers = Consumers} = State) ->
-    Available0 = messages_ready(State),
-    maps:fold(fun (ConsumerKey,
-                   #consumer{cfg = #consumer_cfg{tag = CTag,
-                                                 credit_mode = {credited, _},
-                                                 pid = CPid},
-                             drain = Drain,
-                             credit = Credit,
-                             delivery_count = DeliveryCount},
-                   Acc) ->
-                      Available = case is_map_key(ConsumerKey, Consumers) of
-                                      true ->
-                                          Available0;
-                                      false ->
-                                          0
-                                  end,
-                      [{send_msg, CPid,
-                        {credit_reply, CTag, DeliveryCount,
-                         Credit, Available, Drain},
-                        ?DELIVERY_SEND_MSG_OPTS} | Acc];
-                  (_, _, Acc) ->
-                      Acc
-              end, [], maps:merge(Consumers, maps:from_list(Waiting))).
-
-
-
+    Available = messages_ready(State),
+    maps:fold(
+      fun(ConsumerKey,
+          #consumer{cfg = #consumer_cfg{meta = CMeta,
+                                        tag = CTag,
+                                        credit_mode = {credited, _},
+                                        pid = CPid},
+                    drain = Drain,
+                    credit = Credit,
+                    delivery_count = DeliveryCount},
+          Acc) ->
+              {Avail, Props} = case is_map_key(ConsumerKey, Consumers) of
+                                   true ->
+                                       {Available, #{active => true}};
+                                   false ->
+                                       {0, #{active => false}}
+                               end,
+              Reply = case maps:get(link_state_properties, CMeta, false) of
+                          true ->
+                              #credit_reply{ctag = CTag,
+                                            delivery_count = DeliveryCount,
+                                            credit = Credit,
+                                            available = Avail,
+                                            drain = Drain,
+                                            properties = Props};
+                          false ->
+                              {credit_reply, CTag, DeliveryCount, Credit, Avail, Drain}
+                      end,
+              [{send_msg, CPid, Reply, ?DELIVERY_SEND_MSG_OPTS} | Acc];
+         (_, _, Acc) ->
+              Acc
+      end, [], maps:merge(Consumers, maps:from_list(Waiting))).
 
 v7_to_v8_consumer(Con, Timeout) ->
                      V7Cfg = element(#consumer.cfg, Con),
@@ -1765,18 +1776,37 @@ cancel_consumer(Meta, ConsumerKey,
             end
     end.
 
-consumer_update_active_effects(#?STATE{cfg = #cfg{resource = QName}},
-                               #consumer{cfg = #consumer_cfg{pid = CPid,
+consumer_update_active_effects(#?STATE{cfg = #cfg{resource = QName}} = State,
+                               #consumer{cfg = #consumer_cfg{meta = Meta,
+                                                             pid = CPid,
                                                              tag = CTag,
-                                                             meta = Meta}},
-                               Active, ActivityStatus,
-                               Effects) ->
+                                                             credit_mode = Mode},
+                                         delivery_count = DeliveryCount,
+                                         credit = Credit,
+                                         drain = Drain},
+                               Active, ActivityStatus, Effects0) ->
     Ack = maps:get(ack, Meta, undefined),
     Prefetch = maps:get(prefetch, Meta, undefined),
     Args = maps:get(args, Meta, []),
-    [{mod_call, rabbit_quorum_queue, update_consumer_handler,
-      [QName, {CTag, CPid}, false, Ack, Prefetch, Active, ActivityStatus, Args]}
-      | Effects].
+    Effects = [{mod_call, rabbit_quorum_queue, update_consumer_handler,
+                [QName, {CTag, CPid}, false, Ack, Prefetch,
+                 Active, ActivityStatus, Args]} | Effects0],
+    case Mode of
+        {credited, _} when map_get(link_state_properties, Meta) =:= true ->
+            Avail = case Active of
+                        true -> messages_ready(State);
+                        false -> 0
+                    end,
+            Reply = #credit_reply{ctag = CTag,
+                                  delivery_count = DeliveryCount,
+                                  credit = Credit,
+                                  available = Avail,
+                                  drain = Drain,
+                                  properties = #{active => Active}},
+            [{send_msg, CPid, Reply, ?DELIVERY_SEND_MSG_OPTS} | Effects];
+        _ ->
+            Effects
+    end.
 
 cancel_consumer0(Meta, ConsumerKey,
                  #?STATE{consumers = C0} = S0, Effects0, Reason) ->
@@ -2398,8 +2428,8 @@ return_all(Meta, #?STATE{consumers = Cons} = State0, Effects0, ConsumerKey,
                                  S, E, ConsumerKey)
               end, {State, Effects0}, maps:iterator(Checked, ordered)).
 
-checkout(Meta, OldState, State0, Effects0) ->
-    checkout(Meta, OldState, State0, Effects0, ok).
+checkout(Meta, OldState, State, Effects) ->
+    checkout(Meta, OldState, State, Effects, ok).
 
 checkout(#{index := Index} = Meta,
          #?STATE{} = OldState,
@@ -3189,11 +3219,12 @@ credit_active_consumer(Meta,
     {State2, ok, Effects} = checkout(Meta, State0, State1, []),
 
     #?STATE{consumers = Cons1 = #{ConsumerKey := Con2}} = State2,
-    #consumer{cfg = #consumer_cfg{pid = CPid,
+    #consumer{cfg = #consumer_cfg{meta = CMeta,
+                                  pid = CPid,
                                   tag = CTag},
               credit = PostCred,
               delivery_count = PostDeliveryCount} = Con2,
-    Available = messages_ready(State2),
+    Avail = messages_ready(State2),
     {Credit, DeliveryCount, State} =
         case Drain andalso PostCred > 0 of
             true ->
@@ -3207,24 +3238,31 @@ credit_active_consumer(Meta,
             false ->
                 {PostCred, PostDeliveryCount, State2}
         end,
+    Reply = case CMeta of
+                #{link_state_properties := true}  ->
+                    #credit_reply{ctag = CTag,
+                                  delivery_count = DeliveryCount,
+                                  credit = Credit,
+                                  available = Avail,
+                                  drain = Drain,
+                                  properties = #{active => true}};
+                _ ->
+                    {credit_reply, CTag, DeliveryCount, Credit, Avail, Drain}
+            end,
     %% We must send the delivery effects to the queue client
     %% before credit_reply such that session process can send to
     %% AMQP 1.0 client TRANSFERs before FLOW.
-    {State, ok, Effects ++ [{send_msg, CPid,
-                             {credit_reply, CTag, DeliveryCount,
-                              Credit, Available, Drain},
-                             ?DELIVERY_SEND_MSG_OPTS}]}.
+    {State, ok, Effects ++ [{send_msg, CPid, Reply, ?DELIVERY_SEND_MSG_OPTS}]}.
 
 credit_inactive_consumer(#credit{credit = LinkCreditRcv,
                                  delivery_count = DeliveryCountRcv,
                                  drain = Drain,
                                  consumer_key = ConsumerKey},
-                         #consumer{cfg = #consumer_cfg{pid = CPid,
+                         #consumer{cfg = #consumer_cfg{meta = CMeta,
+                                                       pid = CPid,
                                                        tag = CTag},
                                    delivery_count = DeliveryCountSnd} = Con0,
-  Waiting0, State0) ->
-    %% No messages are available for inactive consumers.
-    Available = 0,
+                         Waiting0, State0) ->
     LinkCreditSnd = link_credit_snd(DeliveryCountRcv,
                                     LinkCreditRcv,
                                     DeliveryCountSnd),
@@ -3248,10 +3286,20 @@ credit_inactive_consumer(#credit{credit = LinkCreditRcv,
                         delivery_count = DeliveryCount},
     Waiting = add_waiting({ConsumerKey, Con}, Waiting0),
     State = State0#?STATE{waiting_consumers = Waiting},
-    {State, ok,
-     {send_msg, CPid,
-      {credit_reply, CTag, DeliveryCount, Credit, Available, Drain},
-      ?DELIVERY_SEND_MSG_OPTS}}.
+    %% No messages are available for inactive consumers.
+    Avail = 0,
+    Reply = case CMeta of
+                #{link_state_properties := true} ->
+                    #credit_reply{ctag = CTag,
+                                  delivery_count = DeliveryCount,
+                                  credit = Credit,
+                                  available = Avail,
+                                  drain = Drain,
+                                  properties = #{active => false}};
+                _ ->
+                    {credit_reply, CTag, DeliveryCount, Credit, Avail, Drain}
+            end,
+    {State, ok, {send_msg, CPid, Reply, ?DELIVERY_SEND_MSG_OPTS}}.
 
 is_over_limit(#?STATE{cfg = #cfg{max_length = undefined,
                                   max_bytes = undefined}}) ->
