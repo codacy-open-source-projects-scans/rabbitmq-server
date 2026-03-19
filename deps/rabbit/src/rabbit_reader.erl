@@ -662,9 +662,6 @@ handle_other({rabbit_call, From, {info, Items}}, State) ->
                            catch Error -> {error, Error}
                            end),
     State;
-handle_other({'$gen_call', From, Req}, State) ->
-    %% Delete this function clause when feature flag 'rabbitmq_4.1.0' becomes required.
-    handle_other({rabbit_call, From, Req}, State);
 handle_other({'$gen_cast', {force_event_refresh, Ref}}, State)
   when ?IS_RUNNING(State) ->
     rabbit_event:notify(
@@ -955,11 +952,11 @@ create_channel(Channel,
             put({ch_pid, ChPid}, {Channel, MRef}),
             put({channel, Channel}, {ChPid, AState}),
             {ok, {ChPid, AState}, State#v1{channel_count = ChannelCount + 1}};
-        {true, Limit, Fmt} ->
+        {true, Limit, Fmt, FmtArg} ->
             {error, rabbit_misc:amqp_error(
                       not_allowed,
                       Fmt,
-                      [node(), Limit], 'none')}
+                      [FmtArg, Limit], 'none')}
     end.
 
 is_over_limits(Username) ->
@@ -972,13 +969,13 @@ is_over_limits(Username) ->
                     Fmt =
                         "number of channels opened on node '~ts' has reached "
                         "the maximum allowed limit of (~w)",
-                    {true, Limit, Fmt}
+                    {true, Limit, Fmt, node()}
             end;
         {true, Limit} ->
             Fmt =
                 "number of channels opened for user '~ts' has reached "
                 "the maximum allowed user limit of (~w)",
-            {true, Limit, Fmt}
+            {true, Limit, Fmt, Username}
     end.
 
 is_over_node_channel_limit() ->
@@ -1886,17 +1883,12 @@ connection_duration(ConnectedAt) ->
     end.
 
 gen_call(Pid, Req, Timeout) ->
-    case rabbit_feature_flags:is_enabled('rabbitmq_4.1.0') of
-        true ->
-            %% We use gen:call/4 with label rabbit_call instead of gen_server:call/3 with label '$gen_call'
-            %% because cowboy_websocket does not let rabbit_web_amqp_handler handle '$gen_call' messages:
-            %% https://github.com/ninenines/cowboy/blob/2.12.0/src/cowboy_websocket.erl#L427-L430
-            case catch gen:call(Pid, rabbit_call, Req, Timeout) of
-                {ok, Res} ->
-                    Res;
-                {'EXIT', Reason} ->
-                    exit({Reason, {?MODULE, ?FUNCTION_NAME, [Pid, Req, Timeout]}})
-            end;
-        false ->
-            gen_server:call(Pid, Req, Timeout)
+    %% We use gen:call/4 with label rabbit_call instead of gen_server:call/3 with label '$gen_call'
+    %% because cowboy_websocket does not let rabbit_web_amqp_handler handle '$gen_call' messages:
+    %% https://github.com/ninenines/cowboy/blob/2.12.0/src/cowboy_websocket.erl#L427-L430
+    case catch gen:call(Pid, rabbit_call, Req, Timeout) of
+        {ok, Res} ->
+            Res;
+        {'EXIT', Reason} ->
+            exit({Reason, {?MODULE, ?FUNCTION_NAME, [Pid, Req, Timeout]}})
     end.
