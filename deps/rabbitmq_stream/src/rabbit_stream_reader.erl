@@ -110,7 +110,8 @@
 -ifdef(TEST).
 -export([ensure_token_expiry_timer/2,
          evaluate_state_after_secret_update/4,
-         clean_subscriptions/4]).
+         clean_subscriptions/4,
+         negotiate_frame_max/2]).
 -endif.
 
 callback_mode() ->
@@ -194,7 +195,7 @@ init([KeepaliveSup,
                 #stream_connection_state{consumers = #{},
                                          blocked = false,
                                          data =
-                                             rabbit_stream_core:init(undefined)},
+                                             rabbit_stream_core:init(#{frame_max => FrameMax})},
             Transport:setopts(RealSocket, [{active, once}]),
             _ = rabbit_alarm:register(self(), {?MODULE, resource_alarm, []}),
             ConnectionNegotiationStepTimeout =
@@ -1462,12 +1463,18 @@ handle_frame_pre_auth(Transport,
 handle_frame_pre_auth(_Transport,
                       #stream_connection{helper_sup = SupPid,
                                          socket = Sock,
-                                         name = ConnectionName} =
+                                         name = ConnectionName,
+                                         frame_max = ConfiguredFrameMax} =
                           Connection,
-                      #stream_connection_state{blocked = Blocked} = State,
+                      #stream_connection_state{blocked = Blocked,
+                                               data = CoreState0} = State,
                       {tune, FrameMax, Heartbeat}) ->
     ?LOG_DEBUG("Tuning response ~tp ~tp ",
                                 [FrameMax, Heartbeat]),
+    %% 0 on either side means "no limit" and must not be clamped to 0.
+    NegotiatedFrameMax = negotiate_frame_max(FrameMax, ConfiguredFrameMax),
+    CoreState = rabbit_stream_core:set_frame_max(NegotiatedFrameMax,
+                                                 CoreState0),
     Parent = self(),
     %% sending a message to the main process so the heartbeat frame is sent from this main process
     %% otherwise heartbeat frames can interleave with chunk delivery
@@ -1494,10 +1501,10 @@ handle_frame_pre_auth(_Transport,
             ok
     end,
     {Connection#stream_connection{connection_step = tuned,
-                                  frame_max = FrameMax,
+                                  frame_max = NegotiatedFrameMax,
                                   heartbeat = Heartbeat,
                                   heartbeater = Heartbeater},
-     State};
+     State#stream_connection_state{data = CoreState}};
 handle_frame_pre_auth(Transport,
                       #stream_connection{user = User,
                                          socket = S,
@@ -1546,6 +1553,11 @@ handle_frame_pre_auth(Transport,
 handle_frame_pre_auth(_Transport, Connection, State, heartbeat) ->
     ?LOG_DEBUG("Received heartbeat frame pre auth"),
     {Connection, State};
+handle_frame_pre_auth(_Transport, Connection, State, {frame_too_large, Size, Max}) ->
+    ?LOG_ERROR("Frame size (~b bytes) exceeds maximum (~b bytes)",
+               [Size, Max]),
+    rabbit_global_counters:increase_protocol_counter(stream, ?FRAME_TOO_LARGE, 1),
+    {Connection#stream_connection{connection_step = failure}, State};
 handle_frame_pre_auth(_Transport, Connection, State, {unknown, _}) ->
     ?LOG_DEBUG("Received unrecognised data before authentication, closing connection."),
     {Connection#stream_connection{connection_step = failure}, State};
@@ -1553,6 +1565,16 @@ handle_frame_pre_auth(_Transport, Connection, State, Command) ->
     ?LOG_WARNING("unknown command ~w, closing connection.",
                                   [Command]),
     {Connection#stream_connection{connection_step = failure}, State}.
+
+%% 0 on either side means "no limit"; fall back to the other value.
+-spec negotiate_frame_max(non_neg_integer(), non_neg_integer()) ->
+    non_neg_integer().
+negotiate_frame_max(0, Configured) ->
+    Configured;
+negotiate_frame_max(Client, 0) ->
+    Client;
+negotiate_frame_max(Client, Configured) ->
+    min(Client, Configured).
 
 auth_fail(Username, Msg, Args, Connection, ConnectionState) ->
     notify_auth_result(Username,
@@ -2835,6 +2857,19 @@ handle_frame_post_auth(Transport,
 handle_frame_post_auth(_Transport, Connection, State, heartbeat) ->
     ?LOG_DEBUG("Received heartbeat frame post auth"),
     {Connection, State};
+handle_frame_post_auth(Transport,
+                       #stream_connection{socket = S} = Connection,
+                       State,
+                       {frame_too_large, Size, Max}) ->
+    ?LOG_ERROR("Frame size (~b bytes) exceeds maximum (~b bytes)",
+               [Size, Max]),
+    rabbit_global_counters:increase_protocol_counter(stream, ?FRAME_TOO_LARGE, 1),
+    Frame =
+        rabbit_stream_core:frame({request, 1,
+                                  {close, ?RESPONSE_CODE_FRAME_TOO_LARGE,
+                                   <<"frame too large">>}}),
+    send(Transport, S, Frame),
+    {Connection#stream_connection{connection_step = close_sent}, State};
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S} = Connection,
                        State,

@@ -73,6 +73,11 @@ groups() ->
        test_publisher_with_too_long_reference_errors,
        test_consumer_with_too_long_reference_errors,
        subscribe_unsubscribe_should_create_events,
+       oversized_frame_rejected_pre_auth,
+       oversized_frame_rejected_post_auth,
+       oversized_frame_rejected_after_tune_negotiation,
+       frame_max_clamped_when_client_negotiates_higher,
+       client_tune_response_with_zero_frame_max_is_unlimited,
        test_stream_test_utils,
        sac_subscription_with_partition_index_conflict_should_return_error,
        test_metadata_with_advertised_hints,
@@ -577,6 +582,123 @@ unauthenticated_client_rejected_tcp_connected(Config) ->
     {ok, S} = gen_tcp:connect("localhost", Port, [{active, false}, {mode, binary}]),
     ?assertEqual(ok, gen_tcp:send(S, <<"invalid data">>)),
     ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
+
+oversized_frame_rejected_pre_auth(Config) ->
+    Port = get_stream_port(Config),
+    {ok, S} = gen_tcp:connect("localhost", Port, [{active, false}, {mode, binary}]),
+    FrameMax = rpc(Config, 0, application, get_env,
+                   [rabbitmq_stream, frame_max, ?DEFAULT_FRAME_MAX]),
+    OversizedSize = FrameMax + 1000,
+    Header = <<OversizedSize:32>>,
+    ?assertEqual(ok, gen_tcp:send(S, Header)),
+    ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
+
+oversized_frame_rejected_post_auth(Config) ->
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = test_authenticate(Transport, S, C1),
+    FrameMax = rpc(Config, 0, application, get_env,
+                   [rabbitmq_stream, frame_max, ?DEFAULT_FRAME_MAX]),
+    OversizedSize = FrameMax + 1000,
+    Header = <<OversizedSize:32>>,
+    ?assertEqual(ok, gen_tcp:send(S, Header)),
+    {Cmd, _C3} = receive_commands(Transport, S, C2),
+    ?assertMatch({request, _, {close, ?RESPONSE_CODE_FRAME_TOO_LARGE, _}}, Cmd),
+    ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
+
+%% Verifies that after the client negotiates a smaller frame_max via
+%% TUNE, the server enforces the negotiated value and not just the
+%% configured ceiling.
+oversized_frame_rejected_after_tune_negotiation(Config) ->
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = sasl_handshake(Transport, S, C1),
+    C3 = test_plain_sasl_authenticate(Transport, S, C2, <<"guest">>),
+    {{tune, ServerFrameMax, _}, C4} = receive_commands(Transport, S, C3),
+    NegotiatedFrameMax = 4096,
+    ?assert(NegotiatedFrameMax < ServerFrameMax),
+    TuneResponse =
+        frame({response, 0, {tune, NegotiatedFrameMax, 0}}),
+    ok = Transport:send(S, TuneResponse),
+    OpenFrame = request(3, {open, <<"/">>}),
+    ok = Transport:send(S, OpenFrame),
+    {{response, 3, {open, ?RESPONSE_CODE_OK, _}}, C5} =
+        receive_commands(Transport, S, C4),
+    %% The size sits between the negotiated and configured limits,
+    %% so only a parser that honours the negotiated value catches it.
+    OversizedSize = NegotiatedFrameMax + 1000,
+    ?assert(OversizedSize < ServerFrameMax),
+    Header = <<OversizedSize:32>>,
+    ?assertEqual(ok, Transport:send(S, Header)),
+    {Cmd, _C6} = receive_commands(Transport, S, C5),
+    ?assertMatch({request, _, {close, ?RESPONSE_CODE_FRAME_TOO_LARGE, _}}, Cmd),
+    ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
+
+%% Verifies that a client requesting a frame_max larger than what the
+%% server advertised in TUNE is clamped to the configured ceiling.
+frame_max_clamped_when_client_negotiates_higher(Config) ->
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = sasl_handshake(Transport, S, C1),
+    C3 = test_plain_sasl_authenticate(Transport, S, C2, <<"guest">>),
+    {{tune, ServerFrameMax, _}, C4} = receive_commands(Transport, S, C3),
+    %% A compliant client must not negotiate above the server's
+    %% advertised value; this one does, to exercise the clamp.
+    MisbehavingFrameMax = ServerFrameMax + 1_000_000,
+    TuneResponse =
+        frame({response, 0, {tune, MisbehavingFrameMax, 0}}),
+    ok = Transport:send(S, TuneResponse),
+    OpenFrame = request(3, {open, <<"/">>}),
+    ok = Transport:send(S, OpenFrame),
+    {{response, 3, {open, ?RESPONSE_CODE_OK, _}}, C5} =
+        receive_commands(Transport, S, C4),
+    %% A frame between the advertised and the requested value must
+    %% still be rejected, proving the server clamped to its ceiling.
+    OversizedSize = ServerFrameMax + 1000,
+    ?assert(OversizedSize < MisbehavingFrameMax),
+    Header = <<OversizedSize:32>>,
+    ?assertEqual(ok, Transport:send(S, Header)),
+    {Cmd, _C6} = receive_commands(Transport, S, C5),
+    ?assertMatch({request, _, {close, ?RESPONSE_CODE_FRAME_TOO_LARGE, _}}, Cmd),
+    ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
+
+%% The stream protocol TUNE exchange follows the AMQP 0-9-1 convention
+%% where 0 means "no limit". A client that echoes FrameMax = 0 back to
+%% the server must not cause the server to clamp its parser to a
+%% 0-byte ceiling; the configured value must apply instead.
+client_tune_response_with_zero_frame_max_is_unlimited(Config) ->
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = sasl_handshake(Transport, S, C1),
+    C3 = test_plain_sasl_authenticate(Transport, S, C2, <<"guest">>),
+    {{tune, _ServerFrameMax, _}, C4} = receive_commands(Transport, S, C3),
+    TuneResponse = frame({response, 0, {tune, 0, 0}}),
+    ok = Transport:send(S, TuneResponse),
+    OpenFrame = request(3, {open, <<"/">>}),
+    ok = Transport:send(S, OpenFrame),
+    %% If the server naively used min(0, Configured) = 0 for its
+    %% parser ceiling, the open frame itself would be rejected and
+    %% the server would send a close request instead of the expected
+    %% open response.
+    {Cmd, _C5} = receive_commands(Transport, S, C4),
+    ?assertMatch({response, 3, {open, ?RESPONSE_CODE_OK, _}}, Cmd),
+    gen_tcp:close(S).
 
 timeout_tcp_connected(Config) ->
     Port = get_stream_port(Config),
