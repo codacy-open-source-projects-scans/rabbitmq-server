@@ -196,6 +196,7 @@ all_tests() ->
      subscribe_redelivery_limit_disable,
      subscribe_redelivery_limit_many,
      subscribe_redelivery_policy,
+     delivery_limit_policy_update,
      subscribe_redelivery_limit_with_dead_letter,
      purge,
      consumer_metrics,
@@ -4225,6 +4226,52 @@ subscribe_redelivery_policy(Config) ->
     wait_for_messages(Config, [[QQ, <<"0">>, <<"0">>, <<"0">>]]),
     ok = rabbit_ct_broker_helpers:clear_policy(Config, 0, <<"delivery-limit">>).
 
+delivery_limit_policy_update(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+
+    %% Declare quorum queue without delivery limit
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+
+    VHost = <<"%2F">>,
+    RaName = binary_to_atom(<<VHost/binary, "_", QQ/binary>>, utf8),
+
+    %% Initially, delivery_limit should be the default (20)
+    ?awaitMatch({ok, #{machine := #{config := #{delivery_limit := 20}}}, _},
+                rpc:call(Server, ra, member_overview, [RaName]),
+                ?DEFAULT_AWAIT),
+
+    %% Set a delivery limit policy
+    ok = rabbit_ct_broker_helpers:set_policy(
+           Config, 0, <<"delivery-limit-test">>, <<".*">>, <<"queues">>,
+           [{<<"delivery-limit">>, 5}]),
+
+    %% Verify that the policy was applied to the queue config
+    ?awaitMatch({ok, #{machine := #{config := #{delivery_limit := 5}}}, _},
+                rpc:call(Server, ra, member_overview, [RaName]),
+                ?DEFAULT_AWAIT),
+
+    %% Update the policy with a new delivery limit
+    ok = rabbit_ct_broker_helpers:set_policy(
+           Config, 0, <<"delivery-limit-test">>, <<".*">>, <<"queues">>,
+           [{<<"delivery-limit">>, 10}]),
+
+    %% Verify that the new policy was applied
+    ?awaitMatch({ok, #{machine := #{config := #{delivery_limit := 10}}}, _},
+                rpc:call(Server, ra, member_overview, [RaName]),
+                ?DEFAULT_AWAIT),
+
+    %% Clear the policy
+    ok = rabbit_ct_broker_helpers:clear_policy(Config, 0, <<"delivery-limit-test">>),
+
+    %% Verify that the default delivery limit is restored
+    ?awaitMatch({ok, #{machine := #{config := #{delivery_limit := 20}}}, _},
+                rpc:call(Server, ra, member_overview, [RaName]),
+                ?DEFAULT_AWAIT).
+
 subscribe_redelivery_limit_with_dead_letter(Config) ->
     [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
@@ -4670,17 +4717,19 @@ status_noproc(Config) ->
     %% hasn't recorded any counters yet
     rabbit_ct_broker_helpers:rpc(Config, N1, ra_counters, delete, [{RaName, N1}]),
 
-    %% check that some status is returned for each node
-    ?assertMatch([?STATUS_MATCH(N1, noproc, T1),
-                  ?STATUS_MATCH(N2, RS2, T2),
-                  ?STATUS_MATCH(N3, RS3, T3)
-                 ] when T1 == <<>> andalso
-                        T2 /= <<>> andalso
-                        T3 /= <<>> andalso
-                        (RS2 == leader orelse RS2 == follower) andalso
-                        (RS3 == leader orelse RS3 == follower),
-                 rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_quorum_queue,
-                                              status, [<<"/">>, QQ])),
+    %% check that some status is returned for each node;
+    %% N2 and N3 need time to elect a leader after N1's process is killed
+    ?awaitMatch([?STATUS_MATCH(N1, noproc, T1),
+                 ?STATUS_MATCH(N2, RS2, T2),
+                 ?STATUS_MATCH(N3, RS3, T3)
+                ] when T1 == <<>> andalso
+                       T2 /= <<>> andalso
+                       T3 /= <<>> andalso
+                       (RS2 == leader orelse RS2 == follower) andalso
+                       (RS3 == leader orelse RS3 == follower),
+                rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_quorum_queue,
+                                             status, [<<"/">>, QQ]),
+                30_000),
     ok.
 format(Config) ->
     %% tests rabbit_quorum_queue:format/2
@@ -6044,8 +6093,6 @@ delayed_retry_all(Config) ->
                                         multiple = false,
                                         requeue = true}),
     %% Message should be delayed - not ready
-    timer:sleep(500),
-    % ct:pal("mac ov ~p", [machine_overview({RaName, Server})]),
     wait_for_messages(Config, [[QQ, <<"1">>, <<"0">>, <<"0">>]]),
     %% Verify delayed message count in overview
     Overview1 = machine_overview({RaName, Server}),

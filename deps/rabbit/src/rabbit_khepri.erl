@@ -282,15 +282,19 @@ setup(_Context) ->
     ?LOG_DEBUG("Starting Khepri-based " ?RA_FRIENDLY_NAME),
     ok = ensure_ra_system_started(),
     Timeout = application:get_env(rabbit, khepri_default_timeout, 30000),
+    SnapshotInterval = application:get_env(rabbit, khepri_snapshot_interval, 50000),
     ok = application:set_env(
            [{khepri, [{default_timeout, Timeout},
                       {default_store_id, ?STORE_ID},
                       {default_ra_system, ?RA_SYSTEM}]}],
            [{persistent, true}]),
+    MachineConfig = #{snapshot_interval => SnapshotInterval},
     RaServerConfig = #{cluster_name => ?RA_CLUSTER_NAME,
                        metrics_labels => #{ra_system => ?RA_SYSTEM,
                                            module => ?MODULE},
-                       friendly_name => ?RA_FRIENDLY_NAME},
+                       friendly_name => ?RA_FRIENDLY_NAME,
+                       min_recovery_checkpoint_interval => 4096,
+                       machine_config => MachineConfig},
     case khepri:start(?RA_SYSTEM, RaServerConfig) of
         {ok, ?STORE_ID} ->
             RetryTimeout = retry_timeout(),
@@ -2333,11 +2337,30 @@ discover_mnesia_tables_to_migrate1([], MigrationsPerApp) ->
               Acc ++ maps:get(App, MigrationsPerApp)
       end, [], Apps).
 
+%% The MFA implementation must not assume any Rabbit sub-system is ready. Also,
+%% it must be able to run even when provided by a plugin and said plugin is not
+%% running.
+mnesia_tables_from_mfa(Mod, Fun, Args) ->
+    Ret = apply(Mod, Fun, Args),
+    ?assert(is_list(Ret)),
+    ?assert(lists:all(fun(Table) -> is_atom(Table) end, Ret)),
+    Ret.
+
 do_migrate_mnesia_tables(FeatureName, Migrations) ->
-    Tables = lists:map(
+    Tables = lists:flatmap(
                fun
-                   ({Table, _Mod}) when is_atom(Table) -> Table;
-                   (Table) when is_atom(Table)         -> Table
+                   ({Table, _Mod}) when is_atom(Table) ->
+                       [Table];
+                   (Table) when is_atom(Table) ->
+                       [Table];
+                   ({{mfa, Mod, Fun, Args}, _Mod}) when is_atom(Mod),
+                                                        is_atom(Fun),
+                                                        is_list(Args) ->
+                       mnesia_tables_from_mfa(Mod, Fun, Args);
+                   ({mfa, Mod, Fun, Args}) when is_atom(Mod),
+                                                is_atom(Fun),
+                                                is_list(Args) ->
+                       mnesia_tables_from_mfa(Mod, Fun, Args)
                end,
                Migrations),
     ?LOG_NOTICE(
