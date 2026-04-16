@@ -78,6 +78,7 @@ some_tests() ->
     [
         users_test,
         users_protected_test,
+        users_protected_bulk_delete_test,
         exchanges_test,
         queues_test,
         bindings_test,
@@ -213,6 +214,7 @@ all_tests() -> [
     config_environment_test,
     disabled_qq_replica_opers_test,
     qq_status_test,
+    qq_status_vhost_authorisation_test,
     list_deprecated_features_test,
     list_used_deprecated_features_test,
     connections_amqpl,
@@ -665,6 +667,24 @@ users_protected_test(Config) ->
     http_delete(Config, "/users/protected_user", ?BAD_REQUEST),
 
     rabbit_ct_broker_helpers:delete_user(Config, ProtectedUser),
+    passed.
+
+users_protected_bulk_delete_test(Config) ->
+    Protected = <<"protected_bulk">>,
+    Regular = <<"regular_bulk">>,
+    rabbit_ct_broker_helpers:add_user(Config, Protected),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, Protected, [management, protected]),
+    rabbit_ct_broker_helpers:add_user(Config, Regular),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, Regular, [management]),
+
+    http_post_json(Config, "/users/bulk-delete",
+                   "{\"users\": [\"protected_bulk\", \"regular_bulk\"]}",
+                   {group, '2xx'}),
+    %% The protected user must survive bulk deletion
+    http_get(Config, "/users/protected_bulk", {group, '2xx'}),
+    http_get(Config, "/users/regular_bulk", ?NOT_FOUND),
+
+    rabbit_ct_broker_helpers:delete_user(Config, Protected),
     passed.
 
 without_permissions_users_test(Config) ->
@@ -3733,6 +3753,14 @@ cors_test(Config) ->
                                        [{"origin", "https://rabbitmq.com"}, auth_header("guest", "guest")]),
     false = lists:keymember("access-control-max-age", 1, HdNoMaxAgeCORS),
 
+    %% Test wildcard CORS configuration
+    rpc(Config, application, set_env, [rabbitmq_management, cors_allow_origins, ["*"]]),
+    {ok, {_, HdWildcardCORS, _}} = req(Config, get, "/overview",
+                                       [{"origin", "https://evil.com"}, auth_header("guest", "guest")]),
+    %% When using wildcard, the origin should be literally "*" and credentials should not be allowed
+    {_, "*"} = lists:keyfind("access-control-allow-origin", 1, HdWildcardCORS),
+    false = lists:keymember("access-control-allow-credentials", 1, HdWildcardCORS),
+
     %% Check OPTIONS method in all paths
     check_cors_all_endpoints(Config),
     %% Disable CORS again.
@@ -4236,6 +4264,25 @@ qq_status_test(Config) ->
     http_delete(Config, "/queues/%2f/cq_status", {group, '2xx'}),
     passed.
 
+qq_status_vhost_authorisation_test(Config) ->
+    Vhost = <<"qq-status-vh">>,
+    User = <<"qq-status-user">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, Vhost),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, <<"guest">>, Vhost),
+    QQArgs = [{durable, true}, {arguments, [{'x-queue-type', 'quorum'}]}],
+    http_put(Config, "/queues/qq-status-vh/qq_status_auth", QQArgs, {group, '2xx'}),
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
+    http_get(Config, "/queues/quorum/qq-status-vh/qq_status_auth/status",
+             User, User, ?NOT_AUTHORISED),
+    %% Permissions granted, must succeed.
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User, Vhost),
+    http_get(Config, "/queues/quorum/qq-status-vh/qq_status_auth/status",
+             User, User, ?OK),
+    http_delete(Config, "/queues/qq-status-vh/qq_status_auth", {group, '2xx'}),
+    rabbit_ct_broker_helpers:delete_user(Config, User),
+    rabbit_ct_broker_helpers:delete_vhost(Config, Vhost),
+    passed.
 
 list_deprecated_features_test(Config) ->
     Desc = "This is a deprecated feature",

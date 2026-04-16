@@ -189,7 +189,9 @@
          topic_binding_projection_post_enable/1]).
 
 -ifdef(TEST).
--export([register_projections/0]).
+-export([register_projections/0,
+         expand_mnesia_migrations/1,
+         mnesia_tables_from_migrations/1]).
 -endif.
 
 -type timeout_error() :: khepri:error(timeout).
@@ -2346,33 +2348,48 @@ mnesia_tables_from_mfa(Mod, Fun, Args) ->
     ?assert(lists:all(fun(Table) -> is_atom(Table) end, Ret)),
     Ret.
 
+expand_mnesia_migrations(Migrations) ->
+    lists:flatmap(
+      fun
+          ({Table, _Mod} = Entry) when is_atom(Table) ->
+              [Entry];
+          (Table) when is_atom(Table) ->
+              [Table];
+          ({{mfa, Mod, Fun, Args}, ConverterMod}) when is_atom(Mod),
+                                                       is_atom(Fun),
+                                                       is_list(Args) ->
+              [{T, ConverterMod}
+               || T <- mnesia_tables_from_mfa(Mod, Fun, Args)];
+          ({mfa, Mod, Fun, Args}) when is_atom(Mod),
+                                       is_atom(Fun),
+                                       is_list(Args) ->
+              mnesia_tables_from_mfa(Mod, Fun, Args)
+      end,
+      Migrations).
+
+mnesia_tables_from_migrations(ExpandedMigrations) ->
+    lists:map(
+      fun
+          ({Table, _Mod}) when is_atom(Table) ->
+              Table;
+          (Table) when is_atom(Table) ->
+              Table
+      end,
+      ExpandedMigrations).
+
 do_migrate_mnesia_tables(FeatureName, Migrations) ->
-    Tables = lists:flatmap(
-               fun
-                   ({Table, _Mod}) when is_atom(Table) ->
-                       [Table];
-                   (Table) when is_atom(Table) ->
-                       [Table];
-                   ({{mfa, Mod, Fun, Args}, _Mod}) when is_atom(Mod),
-                                                        is_atom(Fun),
-                                                        is_list(Args) ->
-                       mnesia_tables_from_mfa(Mod, Fun, Args);
-                   ({mfa, Mod, Fun, Args}) when is_atom(Mod),
-                                                is_atom(Fun),
-                                                is_list(Args) ->
-                       mnesia_tables_from_mfa(Mod, Fun, Args)
-               end,
-               Migrations),
+    ExpandedMigrations = expand_mnesia_migrations(Migrations),
+    Tables = mnesia_tables_from_migrations(ExpandedMigrations),
     ?LOG_NOTICE(
        "Feature flags: `~ts`: starting migration of ~b tables from Mnesia "
        "to Khepri; expect decrease in performance and increase in memory "
        "footprint",
-       [FeatureName, length(Migrations)],
+       [FeatureName, length(Tables)],
        #{domain => ?RMQLOG_DOMAIN_DB}),
     rabbit_mnesia:wait(Tables, _Retry = true),
     Ret = mnesia_to_khepri:copy_tables(
             ?STORE_ID, ?MIGRATION_ID, Tables,
-            {rabbit_db_m2k_converter, Migrations}),
+            {rabbit_db_m2k_converter, ExpandedMigrations}),
     case Ret of
         ok ->
             ?LOG_NOTICE(
