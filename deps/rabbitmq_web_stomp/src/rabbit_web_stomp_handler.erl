@@ -117,7 +117,11 @@ init(Req0, Opts) ->
                     end
             end,
             WsOpts0 = proplists:get_value(ws_opts, Opts, #{}),
-            WsOpts  = maps:merge(#{compress => true}, WsOpts0),
+            MaxFrameSize = application:get_env(
+                rabbitmq_stomp, max_frame_size_unauthenticated,
+                ?DEFAULT_MAX_FRAME_SIZE_UNAUTHENTICATED) + 4096,
+            WsOpts = maps:merge(#{compress => true,
+                                   max_frame_size => MaxFrameSize}, WsOpts0),
             {?MODULE, Req, #state{
                 frame_type         = proplists:get_value(type, Opts, text),
                 heartbeat_sup      = KeepaliveSup,
@@ -305,6 +309,11 @@ websocket_info(close_websocket, State) ->
 websocket_info(emit_stats, State) ->
     {ok, emit_stats(State)};
 
+websocket_info(increase_max_frame_size, State) ->
+    MaxFrameSize = application:get_env(
+        rabbitmq_stomp, max_frame_size, ?DEFAULT_MAX_FRAME_SIZE) + 4096,
+    {[{set_options, #{max_frame_size => MaxFrameSize}}], State};
+
 websocket_info(login_timeout, State = #state{connection = C})
   when C =:= none; C =:= undefined ->
     ?LOG_ERROR("Web STOMP: closing connection (login timeout)"),
@@ -387,13 +396,15 @@ handle_data(Data, State0) ->
 handle_data1(<<>>, State) ->
     {ok, ensure_stats_timer(State)};
 handle_data1(Bytes, State = #state{proc_state  = ProcState,
-                                   parse_state = ParseState}) ->
+                                   parse_state = ParseState,
+                                   connection  = OldConn}) ->
     case rabbit_stomp_frame:parse(Bytes, ParseState) of
         {more, ParseState1} ->
             {ok, ensure_stats_timer(State#state{ parse_state = ParseState1 })};
         {ok, Frame, Rest} ->
             case rabbit_stomp_processor:process_frame(Frame, ProcState) of
                 {ok, ProcState1, ConnPid} ->
+                    maybe_increase_max_frame_size(OldConn, ConnPid),
                     ParseState1 = rabbit_stomp_frame:initial_state(),
                     State1 = maybe_block(State, Frame),
                     handle_data1(
@@ -409,6 +420,13 @@ handle_data1(Bytes, State = #state{proc_state  = ProcState,
         Other ->
             Other
     end.
+
+maybe_increase_max_frame_size(OldConn, ConnPid)
+  when (OldConn =:= none orelse OldConn =:= undefined) andalso
+       is_pid(ConnPid) ->
+    self() ! increase_max_frame_size;
+maybe_increase_max_frame_size(_, _) ->
+    ok.
 
 maybe_block(State = #state{state = blocking, heartbeat = Heartbeat},
             #stomp_frame{command = "SEND"}) ->
