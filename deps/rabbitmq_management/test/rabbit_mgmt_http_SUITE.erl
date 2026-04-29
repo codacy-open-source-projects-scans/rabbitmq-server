@@ -139,6 +139,7 @@ all_tests() -> [
     adding_a_user_with_generated_password_hash_test,
     adding_a_user_with_permissions_in_single_operation_test,
     adding_a_user_without_tags_fails_test,
+    adding_a_user_with_too_many_tags_fails_test,
     adding_a_user_without_password_or_hash_test,
     adding_a_user_with_both_password_and_hash_fails_test,
     updating_a_user_without_password_or_hash_clears_password_test,
@@ -544,13 +545,21 @@ vhosts_test(Config) ->
     rabbit_ct_broker_helpers:force_vhost_failure(Config, <<"myvhost">>),
     [NodeData] = http_get(Config, "/nodes"),
     Node = binary_to_atom(maps:get(name, NodeData), utf8),
-    assert_item(#{name => <<"myvhost">>, cluster_state => #{Node => <<"stopped">>}},
-                http_get(Config, "/vhosts/myvhost")),
+    ?AWAIT(begin
+               assert_item(#{name => <<"myvhost">>,
+                             cluster_state => #{Node => <<"stopped">>}},
+                           http_get(Config, "/vhosts/myvhost")),
+               true
+           end),
 
     %% Restart it
     http_post(Config, "/vhosts/myvhost/start/" ++ atom_to_list(Node), [], {group, '2xx'}),
-    assert_item(#{name => <<"myvhost">>, cluster_state => #{Node => <<"running">>}},
-                http_get(Config, "/vhosts/myvhost")),
+    ?AWAIT(begin
+               assert_item(#{name => <<"myvhost">>,
+                             cluster_state => #{Node => <<"running">>}},
+                           http_get(Config, "/vhosts/myvhost")),
+               true
+           end),
 
     %% Restart on a non-existent node
     http_post(Config, "/vhosts/myvhost/start/does-not-exist", [], ?BAD_REQUEST),
@@ -824,6 +833,25 @@ adding_a_user_with_permissions_in_single_operation_test(Config) ->
 
 adding_a_user_without_tags_fails_test(Config) ->
     http_put(Config, "/users/no-tags", [{password, <<"password">>}], ?BAD_REQUEST).
+
+adding_a_user_with_too_many_tags_fails_test(Config) ->
+    Max = rabbit_ct_broker_helpers:rpc(Config, 0,
+            rabbit_auth_backend_internal, max_user_tags, []),
+    OverList = [<<"t", (integer_to_binary(I))/binary>> || I <- lists:seq(1, Max + 1)],
+    http_put(Config, "/users/too-many-tags",
+             [{password, <<"password">>}, {tags, OverList}], ?BAD_REQUEST),
+    http_put(Config, "/users/too-many-tags",
+             [{password, <<"password">>}, {tags, csv_tags(Max + 1)}], ?BAD_REQUEST),
+    http_get(Config, "/users/too-many-tags", ?NOT_FOUND),
+
+    http_put(Config, "/users/at-limit",
+             [{password, <<"password">>}, {tags, csv_tags(Max)}], {group, '2xx'}),
+    http_delete(Config, "/users/at-limit", ?NO_CONTENT),
+    passed.
+
+csv_tags(N) ->
+    Names = ["t" ++ integer_to_list(I) || I <- lists:seq(1, N)],
+    list_to_binary(string:join(Names, ",")).
 
 %% creating a passwordless user makes sense when x509x certificates or another
 %% "external" authentication mechanism or backend is used.
@@ -1408,35 +1436,36 @@ queues_test(Config) ->
     %% The vhost is down
     Node = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
     DownVHost = #{name => <<"downvhost">>, tracing => false, cluster_state => #{Node => <<"stopped">>}},
-    assert_item(DownVHost, http_get(Config, "/vhosts/downvhost")),
-
-    DownQueues = http_get(Config, "/queues/downvhost"),
-    DownQueue  = http_get(Config, "/queues/downvhost/foo"),
-
-    assert_list([#{name        => <<"bar">>,
-                   vhost       => <<"downvhost">>,
-                   state       => <<"stopped">>,
-                   durable     => true,
-                   auto_delete => false,
-                   exclusive   => false,
-                   arguments   => #{'x-queue-type' => <<"classic">>}
-                 },
-                 #{name        => <<"foo">>,
-                   vhost       => <<"downvhost">>,
-                   state       => <<"stopped">>,
-                   durable     => true,
-                   auto_delete => false,
-                   exclusive   => false,
-                   arguments   => #{'x-queue-type' => <<"classic">>}
-                 }], DownQueues),
-    assert_item(#{name        => <<"foo">>,
-                  vhost       => <<"downvhost">>,
-                  state       => <<"stopped">>,
-                  durable     => true,
-                  auto_delete => false,
-                  exclusive   => false,
-                  arguments   => #{'x-queue-type' => <<"classic">>}
-                }, DownQueue),
+    DownQueueExpected = [#{name        => <<"bar">>,
+                           vhost       => <<"downvhost">>,
+                           state       => <<"stopped">>,
+                           durable     => true,
+                           auto_delete => false,
+                           exclusive   => false,
+                           arguments   => #{'x-queue-type' => <<"classic">>}
+                          },
+                         #{name        => <<"foo">>,
+                           vhost       => <<"downvhost">>,
+                           state       => <<"stopped">>,
+                           durable     => true,
+                           auto_delete => false,
+                           exclusive   => false,
+                           arguments   => #{'x-queue-type' => <<"classic">>}
+                          }],
+    ?AWAIT(begin
+               assert_item(DownVHost, http_get(Config, "/vhosts/downvhost")),
+               assert_list(DownQueueExpected, http_get(Config, "/queues/downvhost")),
+               assert_item(#{name        => <<"foo">>,
+                             vhost       => <<"downvhost">>,
+                             state       => <<"stopped">>,
+                             durable     => true,
+                             auto_delete => false,
+                             exclusive   => false,
+                             arguments   => #{'x-queue-type' => <<"classic">>}
+                            },
+                           http_get(Config, "/queues/downvhost/foo")),
+               true
+           end),
 
     http_put(Config, "/queues/badvhost/bar", Good, ?NOT_FOUND),
     http_put(Config, "/queues/%2F/bar",
