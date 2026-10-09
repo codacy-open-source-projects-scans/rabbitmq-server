@@ -22,6 +22,7 @@
          get_targets/1,
          get_all/0,
          get_all/1,
+         fold/2,
          get_all_by_type/1,
          get_all_by_type_and_vhost/2,
          get_all_by_type_and_node/3,
@@ -60,7 +61,7 @@
 
 %% Used by other rabbit_db_* modules
 -export([
-         update_in_khepri_tx/2,
+         update_in_khepri_tx/3,
          get_in_khepri_tx/1
         ]).
 
@@ -100,6 +101,28 @@ get_all() ->
                       []
               end
       end).
+
+-spec fold(Fun, Acc) -> Acc when
+      Fun :: fun((Queue :: amqqueue:amqqueue(), Acc) -> Acc),
+      Acc :: term().
+
+%% @doc Folds over all queue records without materialising them into a list,
+%% making it more memory-efficient than `get_all/0` followed by a fold over the
+%% returned list. Useful when iterating over very large numbers of queues.
+%%
+%% @returns the fold accumulator.
+%%
+%% @private
+
+%% Not wrapped in list_with_possible_retry/1: the callback may have side effects
+%% and the accumulator is arbitrary, so the fold must never be replayed.
+fold(Fun, Acc) ->
+    try
+        ets:foldl(Fun, Acc, ?KHEPRI_PROJECTION)
+    catch
+        error:badarg ->
+            Acc
+    end.
 
 -spec get_all(VHostName) -> [Queue] when
       VHostName :: vhost:name(),
@@ -299,7 +322,7 @@ delete_if(QueueName, Conditions, OnlyDurable) ->
         true ->
             case rabbit_khepri:adv_delete(Pattern) of
                 {ok, #{Path := #{data := _}} = Deleted} ->
-                    rabbit_db_binding:khepri_ret_to_deletions(
+                    rabbit_db_binding:node_props_to_deletions(
                       Deleted, OnlyDurable);
                 {ok, _} ->
                     ok;
@@ -847,9 +870,13 @@ do_delete_transient_queues_in_khepri_tx([{Path, Vsn, QName} | Rest], Acc) ->
                                   false
                           end,
     case khepri_tx_adv:delete(VersionedPath) of
-        {ok, #{Path := #{data := _}}} when UsesUniformWriteRet ->
-            Deletions = rabbit_db_binding:delete_for_destination_in_khepri(
-                          QName, false),
+        {ok, #{Path := #{data := _}} = Deleted} when UsesUniformWriteRet ->
+            %% See rabbitmq/rabbitmq-server#17255
+            Deletions = rabbit_binding:combine_deletions(
+                          rabbit_db_binding:node_props_to_deletions_in_khepri_tx(
+                            Deleted, false),
+                          rabbit_db_binding:delete_for_destination_in_khepri(
+                            QName, false)),
             Acc1 = [{QName, Deletions} | Acc],
             do_delete_transient_queues_in_khepri_tx(Rest, Acc1);
         {ok, #{data := _}} when not UsesUniformWriteRet ->
@@ -937,19 +964,22 @@ set_dirty(_Q) ->
 %% update_in_khepri_tx().
 %% -------------------------------------------------------------------
 
--spec update_in_khepri_tx(QName, UpdateFun) -> Ret when
-      QName :: rabbit_amqqueue:name(),
+-spec update_in_khepri_tx(VHost, QName, UpdateFun) -> Ret when
+      VHost :: vhost:name(),
+      QName :: khepri_path:pattern_component(),
       Queue :: amqqueue:amqqueue(),
       UpdateFun :: fun((Queue) -> Queue),
       Ret :: Queue | not_found.
 
-update_in_khepri_tx(Name, Fun) ->
-    Path = khepri_queue_path(Name),
+update_in_khepri_tx(VHost, Pattern, Fun) ->
+    Path = khepri_queue_path(VHost, Pattern),
     case khepri_tx:get(Path) of
         {ok, Q} ->
             Q1 = Fun(Q),
             ok = khepri_tx:put(Path, Q1),
             Q1;
+        {error, ?khepri_error(mismatching_node, _)} ->
+            khepri_tx:abort(mismatching_node);
         _  ->
             not_found
     end.
@@ -1016,9 +1046,10 @@ tie_binding_to_dest_with_keep_while_cond_enable(
                        "auto-delete exchanges",
                        [FeatureName],
                        #{domain => ?RMQLOG_DOMAIN_DB}),
+                    %% `#if_has_data{}' skips data-less intermediate nodes.
                     ExchangePattern = rabbit_db_exchange:khepri_exchange_path(
                                         ?KHEPRI_WILDCARD_STAR,
-                                        ?KHEPRI_WILDCARD_STAR),
+                                        #if_has_data{}),
                     ok = khepri_tx:foreach(
                            ExchangePattern,
                            fun(ExchangePath, #{data := Exchange}) ->
@@ -1028,9 +1059,22 @@ tie_binding_to_dest_with_keep_while_cond_enable(
                                        true ->
                                            ok;
                                        false ->
-                                           ok = khepri_tx:put(
-                                                  ExchangePath, Exchange,
-                                                  PutOptions)
+                                           %% An auto-delete exchange's
+                                           %% `keep_while' condition requires at
+                                           %% least one binding where it is the
+                                           %% source. Adding it to an exchange
+                                           %% without such bindings is rejected
+                                           %% by Khepri with
+                                           %% `keep_while_conditions_not_met'.
+                                           case rabbit_db_binding:has_for_source_in_khepri(
+                                                  Exchange#exchange.name) of
+                                               true ->
+                                                   ok = khepri_tx:put(
+                                                          ExchangePath, Exchange,
+                                                          PutOptions);
+                                               false ->
+                                                   ok
+                                           end
                                    end
                            end),
 
@@ -1040,12 +1084,13 @@ tie_binding_to_dest_with_keep_while_cond_enable(
                        "bindings",
                        [FeatureName],
                        #{domain => ?RMQLOG_DOMAIN_DB}),
+                    %% Same `#if_has_data{}' guard as above.
                     BindingPattern = rabbit_db_binding:khepri_route_path(
                                        ?KHEPRI_WILDCARD_STAR,
                                        ?KHEPRI_WILDCARD_STAR,
                                        ?KHEPRI_WILDCARD_STAR,
                                        ?KHEPRI_WILDCARD_STAR,
-                                       ?KHEPRI_WILDCARD_STAR),
+                                       #if_has_data{}),
                     ok = khepri_tx:foreach(
                            BindingPattern,
                            fun(BindingPath, #{data := Set}) ->

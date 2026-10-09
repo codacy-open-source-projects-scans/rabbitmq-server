@@ -60,7 +60,9 @@ federation_mechanics_tests() ->
                                                        dynamic_reconfiguration,
                                                        federate_unfederate,
                                                        dynamic_plugin_stop_start,
-                                                       supervisor_shutdown_concurrency_safety
+                                                       supervisor_shutdown_concurrency_safety,
+                                                       clear_upstream_leaves_same_named_exchange_intact,
+                                                       poison_x_received_from_does_not_crash_link
                                                       ]}
                                 ]}
     ].
@@ -399,6 +401,84 @@ supervisor_shutdown_concurrency_safety(Config) ->
 
           expect_federation(Ch, UpQ1, DownQ1, ?EXPECT_FEDERATION_TIMEOUT)
       end, upstream_downstream(Config) ++ [q(DownQ2, Args)]).
+
+%% Clearing a queue-federation upstream must leave a same-named exchange
+%% untouched. See rabbitmq/rabbitmq-server#16991.
+clear_upstream_leaves_same_named_exchange_intact(Config) ->
+    %% The federated queue and a fanout exchange share {vhost, name}.
+    Name = <<"fed1.downstream">>,
+    XName = rabbit_misc:r(<<"/">>, exchange, Name),
+    with_ch(Config,
+      fun (Ch) ->
+              #'exchange.declare_ok'{} =
+                  amqp_channel:call(Ch, #'exchange.declare'{exchange = Name,
+                                                            type = <<"fanout">>,
+                                                            durable = true}),
+              #'queue.bind_ok'{} =
+                  amqp_channel:call(Ch, #'queue.bind'{queue = Name,
+                                                      exchange = Name}),
+
+              await_running_federation(Config,
+                [{Name, <<"upstream">>}],
+                ?EXPECT_FEDERATION_TIMEOUT),
+              expect_federation(Ch, <<"upstream">>, Name, ?EXPECT_FEDERATION_TIMEOUT),
+
+              %% Before clearing, the decorators are a valid {Route, NoRoute} tuple.
+              {_, _} = exchange_decorators(Config, XName),
+
+              clear_upstream(Config, 0, <<"localhost">>),
+
+              %% After clearing they must still be a tuple, not a bare [].
+              {_, _} = exchange_decorators(Config, XName),
+
+              %% Publishing to the exchange still routes to the queue rather
+              %% than crashing the channel with a decorator function_clause.
+              Payload = <<"after-clear">>,
+              publish(Ch, Name, <<>>, Payload),
+              expect(Ch, Name, [Payload]),
+
+              %% Restore the upstream: it is shared with other tests.
+              set_upstream(Config, 0, <<"localhost">>,
+                rabbit_ct_broker_helpers:node_uri(Config, 0))
+      end, upstream_downstream(Config)).
+
+%% `x-received-from`: a publisher on the upstream
+%% queue can send two hop records matching the link's (uri, queue),
+%% and `update_visit_count/3` must tolerate that without failing
+%% with an exception.
+poison_x_received_from_does_not_crash_link(Config) ->
+    with_ch(Config,
+      fun (Ch) ->
+              await_running_federation(Config,
+                [{<<"fed1.downstream">>, <<"upstream">>}],
+                ?EXPECT_FEDERATION_TIMEOUT),
+              Status = rabbit_ct_broker_helpers:rpc(Config, 0,
+                                                    rabbit_federation_status, status, []),
+              [Link] = [L || L <- Status,
+                             proplists:get_value(queue, L) =:= <<"fed1.downstream">>],
+              SafeUri = proplists:get_value(uri, Link),
+              HopFields = [{<<"uri">>, longstr, SafeUri},
+                           {<<"queue">>, longstr, <<"fed1.downstream">>}],
+              Hop = {table, HopFields},
+              FloatHop = {table, HopFields ++ [{<<"visit-count">>, double, 1.5}]},
+              [begin
+                   Headers = [{<<"x-received-from">>, array, Hops}],
+                   Msg = #amqp_msg{payload = Payload,
+                                   props = #'P_basic'{headers = Headers}},
+                   publish(Ch, <<>>, <<"upstream">>, Msg),
+                   expect(Ch, <<"fed1.downstream">>, [Payload])
+               end || {Payload, Hops} <- [{<<"duplicate-hop">>, [Hop, Hop]},
+                                          {<<"float-visit-count">>, [FloatHop]}]],
+              %% The link must still be alive and forwarding afterwards.
+              expect_federation(Ch, <<"upstream">>, <<"fed1.downstream">>, ?EXPECT_FEDERATION_TIMEOUT)
+      end, upstream_downstream(Config)).
+
+%% #exchange.decorators
+exchange_decorators(Config, XName) ->
+    {ok, X} = rabbit_ct_broker_helpers:rpc(Config, 0,
+                                           rabbit_exchange, lookup, [XName]),
+    element(11, X).
+
 restart_upstream(Config) ->
     [Rabbit, Hare] = rabbit_ct_broker_helpers:get_node_configs(Config,
       nodename),

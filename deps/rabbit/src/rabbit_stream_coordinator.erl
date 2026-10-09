@@ -79,19 +79,28 @@
 %% exported for unit tests only
 -ifdef(TEST).
 -export([update_stream/3,
-         evaluate_stream/3]).
+         evaluate_stream/3,
+         backoff_class/1,
+         retry_jitter/2,
+         run_action/6,
+         make_aux/1,
+         aux_running_count/1,
+         aux_pending_count/1,
+         aux_running_pids/1]).
 -endif.
 
 -include("rabbit_stream_coordinator.hrl").
 -include("amqqueue.hrl").
 -include_lib("kernel/include/logger.hrl").
 
--define(REPLICA_FRESHNESS_LIMIT_MS, 10 * 1000). %% 10s
--define(V2_OR_MORE(Vsn), (Vsn >= 2)).
--define(V5_OR_MORE(Vsn), (Vsn >= 5)).
--define(V7_OR_MORE(Vsn), (Vsn >= 7)). %% SAC monitors no longer in monitors map
--define(SAC_V4, rabbit_stream_sac_coordinator_v4).
+-define(REPLICA_FRESHNESS_LIMIT_MS, (10 * 1000)). %% 10s
 -define(SAC_CURRENT, rabbit_stream_sac_coordinator).
+%% Upper bound on the number of action worker processes the leader runs
+%% concurrently. Excess actions are queued in the aux state and started as
+%% running ones complete, so a mass stream event cannot spawn an unbounded
+%% number of workers (and feedback commands) at once. Overridable via the
+%% 'stream_coordinator_max_concurrent_actions' application environment key.
+-define(DEFAULT_MAX_CONCURRENT_ACTIONS, 64).
 
 -type state() :: #?MODULE{}.
 -type args() :: #{index := ra:index(),
@@ -215,8 +224,14 @@ add_replica(Q, Node) when ?is_amqqueue(Q) ->
     try
         ReplState0 = osiris_writer:query_replication_state(Pid),
         {{_, InitTs}, ReplState} = maps:take(node(Pid), ReplState0),
-        {MaxTs, MinTs} = maps:fold(fun (_, {_, Ts}, {Max, Min}) ->
-                                           {max(Ts, Max), min(Ts, Min)}
+        %% a replica with an empty log (e.g. one that hasn't received its
+        %% first chunk yet) can report a non-integer timestamp such as
+        %% `empty`; treat it as agreeing with the leader's own timestamp
+        %% rather than letting it corrupt the min/max comparison below
+        {MaxTs, MinTs} = maps:fold(fun (_, {_, Ts}, {Max, Min}) when is_integer(Ts) ->
+                                           {max(Ts, Max), min(Ts, Min)};
+                                       (_, {_, _NonNumericTs}, Acc) ->
+                                           Acc
                                    end, {InitTs, InitTs}, ReplState),
         case (MaxTs - MinTs) > ?REPLICA_FRESHNESS_LIMIT_MS of
             true ->
@@ -552,16 +567,20 @@ reachable_coord_members() ->
     Nodes = rabbit_nodes:list_reachable(),
     [{?MODULE, Node} || Node <- Nodes].
 
-version() -> 7.
+version() -> 8.
 
+%% Machine versions up to 7 are served by the frozen rabbit_stream_coordinator_v7
+%% module (a verbatim copy of the v7 implementation), so old-version log entries
+%% and the mixed-version window during a rolling upgrade replay against byte
+%% identical code. Version 8 and later are served by this module.
+which_module(V) when V =< 7 ->
+    rabbit_stream_coordinator_v7;
 which_module(_) ->
     ?MODULE.
 
-init(#{machine_version := Vsn}) when ?V5_OR_MORE(Vsn) ->
-    #?MODULE{single_active_consumer =
-             rabbit_stream_sac_coordinator:init_state()};
 init(_) ->
-    #?MODULE{single_active_consumer = rabbit_stream_sac_coordinator_v4:init_state()}.
+    #?MODULE{single_active_consumer =
+             rabbit_stream_sac_coordinator:init_state()}.
 
 -spec apply(ra_machine:command_meta_data(), command(), state()) ->
     {state(), term(), ra_machine:effects()}.
@@ -586,36 +605,34 @@ apply(#{index := _Idx, machine_version := MachineVersion} = Meta0,
                     return(Meta, State0#?MODULE{streams = maps:remove(StreamId, Streams0)},
                            Reply, inform_listeners_eol(MachineVersion, Stream0));
                 _ ->
-                    {Stream2, Effects0} = evaluate_stream(Meta, Stream1, []),
+                    {Stream1b, Parked, ParkEffs} =
+                        maybe_park_action(Meta, Cmd, Stream0, Stream1,
+                                          parked_tree(State0)),
+                    {Stream2, Effects0} = evaluate_stream(Meta, Stream1b, ParkEffs),
                     {Stream3, Effects1} = eval_listeners(MachineVersion, Stream2, Stream0, Effects0),
                     {Stream, Effects2} = eval_retention(Meta, Stream3, Effects1),
                     {Monitors, Effects} = ensure_monitors(Stream, Monitors0, Effects2),
                     return(Meta,
                            State0#?MODULE{streams = Streams0#{StreamId => Stream},
-                                          monitors = Monitors}, Reply, Effects)
+                                          monitors = Monitors,
+                                          parked = Parked}, Reply, Effects)
             end;
         {reply, Reply} ->
             return(Meta, State0, Reply, [])
     end;
-apply(#{machine_version := Vsn} = Meta, {sac, SacCommand},
+apply(Meta, {sac, SacCommand},
       #?MODULE{single_active_consumer = SacState0,
                monitors = Monitors0} = State0) ->
     Mod = sac_module(Meta),
-    {SacState1, Reply, Effects0} = Mod:apply(SacCommand, SacState0),
-    {SacState2, Monitors1, Effects1} =
-         Mod:ensure_monitors(SacCommand, SacState1, Monitors0, Effects0),
-    Monitors2 = case ?V7_OR_MORE(Vsn) of
-                    true ->
-                        Monitors0;
-                    false ->
-                        Monitors1
-                end,
+    {SacState1, Reply, Effects0} = sac_apply(Mod, Meta, SacCommand, SacState0),
+    {SacState2, _Monitors1, Effects1} =
+         sac_ensure_monitors(Mod, Meta, SacCommand, SacState1, Monitors0, Effects0),
+    %% SAC connections are no longer tracked in the coordinator monitors map
     return(Meta, State0#?MODULE{single_active_consumer = SacState2,
-                                monitors = Monitors2}, Reply, Effects1);
+                                monitors = Monitors0}, Reply, Effects1);
 apply(#{machine_version := Vsn} = Meta, {down, Pid, Reason} = Cmd,
       #?MODULE{streams = Streams0,
                monitors = Monitors0,
-               listeners = StateListeners0,
                single_active_consumer = SacState0 } = State) ->
     Effects0 = case Reason of
                    noconnection ->
@@ -623,34 +640,13 @@ apply(#{machine_version := Vsn} = Meta, {down, Pid, Reason} = Cmd,
                    _ ->
                        []
                end,
+    %% all down PIDs are submitted to SAC, it filters out if not interested
     {SacState1, SacEffects} =
-        case Vsn >= 7 of
-            true ->
-                %% all down PIDs are submitted to SAC
-                %% it filters out if not interested
-                sac_handle_connection_down(Meta, SacState0,
-                                           Pid, Reason, Vsn);
-            false ->
-                {SacState0, []}
-        end,
+        sac_handle_connection_down(Meta, SacState0, Pid, Reason, Vsn),
     Effects1 = Effects0 ++ SacEffects,
     State1 = State#?MODULE{single_active_consumer = SacState1},
     case maps:take(Pid, Monitors0) of
-        {{StreamId, listener}, Monitors} when Vsn < 2 ->
-            Listeners = case maps:take(StreamId, StateListeners0) of
-                            error ->
-                                StateListeners0;
-                            {Pids0, Listeners1} ->
-                                case maps:remove(Pid, Pids0) of
-                                    Pids when map_size(Pids) == 0 ->
-                                        Listeners1;
-                                    Pids ->
-                                        Listeners1#{StreamId => Pids}
-                                end
-                        end,
-            return(Meta, State1#?MODULE{listeners = Listeners,
-                                        monitors = Monitors}, ok, Effects1);
-        {{PidStreams, listener}, Monitors} when ?V2_OR_MORE(Vsn) ->
+        {{PidStreams, listener}, Monitors} ->
             Streams = maps:fold(
                 fun(StreamId, _, Acc) ->
                     case Acc of
@@ -683,45 +679,16 @@ apply(#{machine_version := Vsn} = Meta, {down, Pid, Reason} = Cmd,
                     return(Meta, State1#?MODULE{streams = Streams0,
                                                 monitors = Monitors1}, ok, Effects1)
             end;
-        {sac, Monitors1} when Vsn < 7 ->
-            #?MODULE{single_active_consumer = SacSt0} = State1,
-            {SacSt1, SacEfts} = sac_handle_connection_down(Meta, SacSt0,
-                                                           Pid, Reason, Vsn),
-            return(Meta, State1#?MODULE{single_active_consumer = SacSt1,
-                                        monitors = Monitors1},
-                   ok, Effects1 ++ SacEfts);
         error ->
             return(Meta, State1, ok, Effects1);
         _ ->
             return(Meta, State1, ok, Effects1)
     end;
-apply(#{machine_version := MachineVersion} = Meta,
+apply(Meta,
       {register_listener, #{pid := Pid,
                             stream_id := StreamId} = Args},
       #?MODULE{streams = Streams,
-               monitors = Monitors0} = State0) when MachineVersion =< 1 ->
-    Type = maps:get(type, Args, leader),
-    case {Streams, Type} of
-        {#{StreamId := #stream{listeners = Listeners0} = Stream0}, leader} ->
-            Stream1 = Stream0#stream{listeners = maps:put(Pid, undefined, Listeners0)},
-            {Stream, Effects} = eval_listeners(MachineVersion, Stream1, []),
-            Monitors = maps:put(Pid, {StreamId, listener}, Monitors0),
-            return(Meta,
-                   State0#?MODULE{streams = maps:put(StreamId, Stream, Streams),
-                                  monitors = Monitors}, ok,
-                   [{monitor, process, Pid} | Effects]);
-        {#{StreamId := _Stream}, local_member} ->
-            %% registering a local member listener does not change the state in v1
-            return(Meta, State0, ok, []);
-        _ ->
-            return(Meta, State0, stream_not_found, [])
-    end;
-
-apply(#{machine_version := Vsn} = Meta,
-      {register_listener, #{pid := Pid,
-                            stream_id := StreamId} = Args},
-      #?MODULE{streams = Streams,
-               monitors = Monitors0} = State0) when ?V2_OR_MORE(Vsn) ->
+               monitors = Monitors0} = State0) ->
     Node = maps:get(node, Args, node(Pid)),
     Type = maps:get(type, Args, leader),
 
@@ -748,32 +715,36 @@ apply(#{machine_version := Vsn} = Meta,
 apply(Meta, {nodeup, Node} = Cmd,
       #?MODULE{monitors = Monitors0,
                streams = Streams0,
-               single_active_consumer = Sac0} = State)  ->
-    %% reissue monitors for all disconnected members
-    {Effects0, Monitors} =
+               single_active_consumer = Sac0} = State) ->
+    %% Only streams with a member on Node that was parked for this nodeup can
+    %% change: a disconnected replica to resume (and re-monitor), or a member
+    %% whose pending action went to sleep waiting for the node. Every other
+    %% stream is left untouched rather than re-evaluating all of them, which is
+    %% O(total streams) and, in steady state, a no-op.
+    {Streams, Monitors, Effects0} =
         maps:fold(
-          fun(_, #stream{id = Id,
-                         members = M}, {Acc, Mon}) ->
+          fun(Id, #stream{members = M} = S0, {Ss, Mon, E0}) ->
                   case M of
                       #{Node := #member{state = {disconnected, _, P}}} ->
-                          {[{monitor, process, P} | Acc],
-                           Mon#{P => {Id, member}}};
-                      _ ->
-                          {Acc, Mon}
-                  end
-          end, {[], Monitors0}, Streams0),
-    {Streams, Effects1} =
-        maps:fold(fun (Id, S0, {Ss, E0}) ->
+                          %% resume the replica and re-issue its process monitor
                           S1 = update_stream(Meta, Cmd, S0),
-                          {S, E} = evaluate_stream(Meta, S1, E0),
-                          {Ss#{Id => S}, E}
-                  end, {Streams0, Effects0}, Streams0),
-
-
-    {Sac1, Effects2} = sac_handle_node_reconnected(Meta, Node, Sac0, Effects1),
+                          {S2, E1} = evaluate_stream(Meta, S1, E0),
+                          {Ss#{Id => S2},
+                           Mon#{P => {Id, member}},
+                           [{monitor, process, P} | E1]};
+                      #{Node := #member{current = {sleeping, nodeup}}} ->
+                          %% wake the member up so its action can be retried
+                          S1 = update_stream(Meta, Cmd, S0),
+                          {S2, E1} = evaluate_stream(Meta, S1, E0),
+                          {Ss#{Id => S2}, Mon, E1};
+                      _ ->
+                          {Ss, Mon, E0}
+                  end
+          end, {Streams0, Monitors0, []}, Streams0),
+    {Sac1, Effects1} = sac_handle_node_reconnected(Meta, Node, Sac0, Effects0),
     return(Meta, State#?MODULE{monitors = Monitors,
                                streams = Streams,
-                               single_active_consumer = Sac1}, ok, Effects2);
+                               single_active_consumer = Sac1}, ok, Effects1);
 apply(Meta, {machine_version, From, To}, State0) ->
     ?LOG_INFO("Stream coordinator machine version changes from ~tp to ~tp, "
                     ++ "applying incremental upgrade.", [From, To]),
@@ -789,6 +760,8 @@ apply(Meta, {timeout, {sac, node_disconnected, #{connection_pid := Pid}}},
     {SacState1, Effects} = sac_presume_connection_down(Meta, Pid, SacState0),
     return(Meta, State0#?MODULE{single_active_consumer = SacState1}, ok,
            Effects);
+apply(Meta, {timeout, retry_reconcile}, State0) ->
+    reconcile_retries(Meta, State0);
 apply(Meta, UnkCmd, State) ->
     ?LOG_DEBUG("~ts: unknown command ~W",
                      [?MODULE, UnkCmd, 10]),
@@ -808,21 +781,32 @@ state_enter(recover, _) ->
     [];
 state_enter(leader, #?MODULE{streams = Streams,
                              monitors = Monitors,
-                             single_active_consumer = SacState}) ->
+                             single_active_consumer = SacState} = State) ->
     Pids = maps:keys(Monitors),
     %% monitor all the known nodes
     Nodes = all_member_nodes(Streams),
     NodeMons = [{monitor, node, N} || N <- Nodes],
     SacEffects = ?SAC_CURRENT:state_enter(leader, SacState),
-    SacEffects ++ NodeMons ++ [{aux, fail_active_actions} |
-                               [{monitor, process, P} || P <- Pids]];
+    %% timers are lost on leader change but the parked actions survive in the
+    %% (replicated) machine state, so re-arm the retry reconcile if any remain.
+    %% state_enter is a leader-only, non-replicated hook (like tick/2), so
+    %% wall-clock time is fine here and lets us re-arm to the exact next retry
+    Parked = parked_tree(State),
+    RetryEff = case gb_trees:is_empty(Parked) of
+                   true ->
+                       [];
+                   false ->
+                       Now = erlang:system_time(millisecond),
+                       [{timer, retry_reconcile,
+                         retry_reconcile_delay(Parked, Now)}]
+               end,
+    SacEffects ++ NodeMons ++ RetryEff ++ [{aux, fail_active_actions} |
+                                           [{monitor, process, P} || P <- Pids]];
 state_enter(_S, _) ->
     [].
 
-sac_module(#{machine_version := Vsn}) when ?V5_OR_MORE(Vsn) ->
-    ?SAC_CURRENT;
 sac_module(_) ->
-    ?SAC_V4.
+    ?SAC_CURRENT.
 
 all_member_nodes(Streams) ->
     maps:keys(
@@ -831,9 +815,18 @@ all_member_nodes(Streams) ->
                 maps:merge(Acc, M)
         end, #{}, Streams)).
 
-tick(_Ts, #?MODULE{single_active_consumer = SacState}) ->
-    [{aux, maybe_resize_coordinator_cluster} |
-     maybe_update_sac_configuration(SacState)].
+tick(Ts, #?MODULE{single_active_consumer = SacState} = State) ->
+    %% backstop: re-arm the retry reconcile timer in case it was somehow lost
+    %% (the reconcile itself and state_enter/park already re-arm it precisely)
+    Parked = parked_tree(State),
+    RetryEff = case gb_trees:is_empty(Parked) of
+                   true ->
+                       [];
+                   false ->
+                       [{timer, retry_reconcile, retry_reconcile_delay(Parked, Ts)}]
+               end,
+    RetryEff ++ [{aux, maybe_resize_coordinator_cluster} |
+                 maybe_update_sac_configuration(SacState)].
 
 members() ->
     %% TODO: this can be replaced with a ra_leaderboard
@@ -902,8 +895,7 @@ maybe_resize_coordinator_cluster(LeaderPid, SacNodes, MachineVersion) ->
                   end
           end).
 
-maybe_handle_stale_nodes(SacNodes, BrokerNodes,
-                         LeaderPid, Vsn) when ?V5_OR_MORE(Vsn) ->
+maybe_handle_stale_nodes(SacNodes, BrokerNodes, LeaderPid, _Vsn) ->
     case SacNodes -- BrokerNodes of
         [] ->
             ok;
@@ -915,9 +907,7 @@ maybe_handle_stale_nodes(SacNodes, BrokerNodes,
             ok;
         _ ->
             ok
-    end;
-maybe_handle_stale_nodes(_, _, _, _) ->
-    ok.
+    end.
 
 maybe_update_sac_configuration(SacState) ->
     case sac_check_conf_change(SacState) of
@@ -989,31 +979,83 @@ remove_member(Leader, Members, Node) ->
             ok
     end.
 
--record(aux, {actions = #{} ::
-              #{pid() := {stream_id(), #{node := node(),
-                                         index := non_neg_integer(),
-                                         epoch := osiris:epoch()}}},
-              resizer :: undefined | pid()}).
+%% Tag of the current aux record. The aux state is transient (never
+%% snapshotted) and Ra does not re-initialise it when the effective machine
+%% version changes in place, so handle_aux/5 must recognise and upgrade an aux
+%% record built by an earlier version (see the upgrade clause below). Bump this
+%% tag whenever the aux record shape changes.
+-define(AUX, aux_v2).
+-record(aux_v2,
+        {actions = #{} ::
+             #{pid() := {stream_id(), atom(), #{node := node(),
+                                                index := non_neg_integer(),
+                                                epoch := osiris:epoch()}}},
+         resizer :: undefined | pid(),
+         %% actions waiting for a worker slot, started FIFO as running
+         %% actions complete
+         pending = queue:new() :: queue:queue(),
+         %% the maximum number of action workers to run at once
+         max_concurrency = ?DEFAULT_MAX_CONCURRENT_ACTIONS :: pos_integer(),
+         % elp:ignore W0003 (unused_record_field)
+         unused_1,
+         % elp:ignore W0003 (unused_record_field)
+         unused_2}).
 
 init_aux(_Name) ->
-    #aux{}.
+    #?AUX{max_concurrency = max_concurrent_actions()}.
 
+max_concurrent_actions() ->
+    case application:get_env(rabbit, stream_coordinator_max_concurrent_actions,
+                             ?DEFAULT_MAX_CONCURRENT_ACTIONS) of
+        N when is_integer(N), N > 0 ->
+            N;
+        _ ->
+            ?DEFAULT_MAX_CONCURRENT_ACTIONS
+    end.
+
+-ifdef(TEST).
+make_aux(MaxConcurrency) ->
+    #?AUX{max_concurrency = MaxConcurrency}.
+
+aux_running_count(#?AUX{actions = Actions}) ->
+    map_size(Actions).
+
+aux_pending_count(#?AUX{pending = Pending}) ->
+    queue:len(Pending).
+
+aux_running_pids(#?AUX{actions = Actions}) ->
+    maps:keys(Actions).
+-endif.
+
+handle_aux(RaftState, Type, Cmd, Aux, RaAux)
+  when element(1, Aux) == aux ->
+    %% Upgrade an aux record built by a pre-v8 version
+    %% (rabbit_stream_coordinator_v7, record tag 'aux') that survived an
+    %% in-place machine version change. The in-flight action and resizer
+    %% tracking is preserved; the new fields (pending, max_concurrency) take
+    %% their defaults. Any actions in flight at the upgrade are recovered by
+    %% the state machine (fail_active_actions / re-evaluation) if they fail.
+    {aux, Actions, Resizer} = Aux,
+    Upgraded = #?AUX{actions = Actions,
+                     resizer = Resizer,
+                     max_concurrency = max_concurrent_actions()},
+    handle_aux(RaftState, Type, Cmd, Upgraded, RaAux);
 %% TODO ensure the dead writer is restarted as a replica at some point in time, increasing timeout?
 handle_aux(leader, _, maybe_resize_coordinator_cluster,
-           #aux{resizer = undefined} = Aux, RaAux) ->
+           #?AUX{resizer = undefined} = Aux, RaAux) ->
     Leader = ra_aux:leader_id(RaAux),
     MachineVersion = ra_aux:effective_machine_version(RaAux),
     SacNodes = sac_list_nodes(ra_aux:machine_state(RaAux), MachineVersion),
     Pid = maybe_resize_coordinator_cluster(Leader, SacNodes, MachineVersion),
-    {no_reply, Aux#aux{resizer = Pid}, RaAux, [{monitor, process, aux, Pid}]};
+    {no_reply, Aux#?AUX{resizer = Pid}, RaAux, [{monitor, process, aux, Pid}]};
 handle_aux(leader, _, maybe_resize_coordinator_cluster,
            AuxState, RaAux) ->
     %% Coordinator resizing is still happening, let's ignore this tick event
     {no_reply, AuxState, RaAux};
 handle_aux(leader, _, {down, Pid, _},
-           #aux{resizer = Pid} = Aux, RaAux) ->
+           #?AUX{resizer = Pid} = Aux, RaAux) ->
     %% Coordinator resizing has finished
-    {no_reply, Aux#aux{resizer = undefined}, RaAux};
+    {no_reply, Aux#?AUX{resizer = undefined}, RaAux};
 handle_aux(leader, _, {start_writer, StreamId,
                        #{epoch := Epoch, node := Node} = Args, Conf},
            Aux, RaAux) ->
@@ -1039,25 +1081,25 @@ handle_aux(leader, _, {stop, StreamId, #{node := Node,
     ActionFun = phase_stop_member(StreamId, Args, Conf),
     run_action(stopping, StreamId, Args, ActionFun, Aux, RaAux);
 handle_aux(leader, _, {update_mnesia, StreamId, Args, Conf},
-           #aux{actions = _Monitors} = Aux, RaAux) ->
+           #?AUX{actions = _Monitors} = Aux, RaAux) ->
     ?LOG_DEBUG("~ts: running action: 'update_mnesia'"
                      " for ~ts", [?MODULE, StreamId]),
     ActionFun = phase_update_mnesia(StreamId, Args, Conf),
     run_action(updating_mnesia, StreamId, Args, ActionFun, Aux, RaAux);
 handle_aux(leader, _, {update_retention, StreamId, Args, _Conf},
-           #aux{actions = _Monitors} = Aux, RaAux) ->
+           #?AUX{actions = _Monitors} = Aux, RaAux) ->
     ?LOG_DEBUG("~ts: running action: 'update_retention'"
                      " for ~ts", [?MODULE, StreamId]),
     ActionFun = phase_update_retention(StreamId, Args),
     run_action(update_retention, StreamId, Args, ActionFun, Aux, RaAux);
 handle_aux(leader, _, {delete_member, StreamId, #{node := Node} = Args, Conf},
-           #aux{actions = _Monitors} = Aux, RaAux) ->
+           #?AUX{actions = _Monitors} = Aux, RaAux) ->
     ?LOG_DEBUG("~ts: running action: 'delete_member'"
                      " for ~ts ~ts", [?MODULE, StreamId, Node]),
     ActionFun = phase_delete_member(StreamId, Args, Conf),
     run_action(delete_member, StreamId, Args, ActionFun, Aux, RaAux);
 handle_aux(leader, _, fail_active_actions,
-           #aux{actions = Actions} = Aux, RaAux) ->
+           #?AUX{actions = Actions} = Aux, RaAux) ->
     %% this bit of code just creates an exclude map of currently running
     %% tasks to avoid failing them, this could only really happen during
     %% a leader flipflap
@@ -1069,22 +1111,22 @@ handle_aux(leader, _, fail_active_actions,
     fail_active_actions(Streams, Exclude),
     {no_reply, Aux, RaAux, []};
 handle_aux(leader, _, {down, Pid, normal},
-           #aux{actions = Monitors} = Aux, RaAux) ->
-    %% action process finished normally, just remove from actions map
-    {no_reply, Aux#aux{actions = maps:remove(Pid, Monitors)}, RaAux, []};
+           #?AUX{actions = Monitors} = Aux, RaAux) ->
+    %% action process finished normally: free the slot and start the next
+    %% pending action, if any
+    start_pending(Aux#?AUX{actions = maps:remove(Pid, Monitors)}, RaAux);
 handle_aux(leader, _, {down, Pid, Reason},
-           #aux{actions = Monitors0} = Aux, RaAux) ->
+           #?AUX{actions = Monitors0} = Aux, RaAux) ->
     %% An action has failed - report back to the state machine
     case maps:get(Pid, Monitors0, undefined) of
         {StreamId, Action, #{node := Node, epoch := Epoch} = Args} ->
             ?LOG_WARNING("~ts: error while executing action ~w for stream queue ~ts, "
                                " node ~ts, epoch ~b Err: ~w",
                                [?MODULE, Action, StreamId, Node, Epoch, Reason]),
-            Monitors = maps:remove(Pid, Monitors0),
             Cmd = {action_failed, StreamId, Args#{action => Action}},
             send_self_command(Cmd),
-            {no_reply, Aux#aux{actions = maps:remove(Pid, Monitors)},
-             RaAux, []};
+            %% free the slot and start the next pending action, if any
+            start_pending(Aux#?AUX{actions = maps:remove(Pid, Monitors0)}, RaAux);
         undefined ->
             %% should this ever happen?
             {no_reply, Aux, RaAux, []}
@@ -1094,7 +1136,7 @@ handle_aux(_, _, _, AuxState, RaAux) ->
 
 overview(#?MODULE{streams = Streams,
                   monitors = Monitors,
-                  single_active_consumer = Sac}) ->
+                  single_active_consumer = Sac} = State) ->
     StreamsOverview = maps:map(
                         fun (_, Stream) ->
                                 stream_overview0(Stream)
@@ -1102,6 +1144,7 @@ overview(#?MODULE{streams = Streams,
     #{
       num_streams => map_size(Streams),
       num_monitors => map_size(Monitors),
+      num_parked_actions => gb_trees:size(parked_tree(State)),
       single_active_consumer => rabbit_stream_sac_coordinator:overview(Sac),
       streams => StreamsOverview
      }.
@@ -1126,7 +1169,20 @@ stream_overview0(#stream{epoch = Epoch,
 
 run_action(Action, StreamId, #{node := _Node,
                                epoch := _Epoch} = Args,
-           ActionFun, #aux{actions = Actions0} = Aux, RaAux) ->
+           ActionFun, #?AUX{actions = Actions0,
+                           pending = Pending0,
+                           max_concurrency = Max} = Aux, RaAux) ->
+    case map_size(Actions0) < Max of
+        true ->
+            start_action(Action, StreamId, Args, ActionFun, Aux, RaAux);
+        false ->
+            %% at capacity: defer the action until a running one completes
+            Pending = queue:in({Action, StreamId, Args, ActionFun}, Pending0),
+            {no_reply, Aux#?AUX{pending = Pending}, RaAux, []}
+    end.
+
+start_action(Action, StreamId, Args, ActionFun,
+             #?AUX{actions = Actions0} = Aux, RaAux) ->
     Coordinator = self(),
     Pid = spawn_link(fun() ->
                              ActionFun(),
@@ -1134,7 +1190,36 @@ run_action(Action, StreamId, #{node := _Node,
                      end),
     Effects = [{monitor, process, aux, Pid}],
     Actions = Actions0#{Pid => {StreamId, Action, Args}},
-    {no_reply, Aux#aux{actions = Actions}, RaAux, Effects}.
+    {no_reply, Aux#?AUX{actions = Actions}, RaAux, Effects}.
+
+%% Start the next queued action, if any and a slot is free. Actions whose
+%% stream has since been deleted are dropped rather than started (running one
+%% would leave an orphaned osiris member behind).
+start_pending(#?AUX{actions = Actions,
+                   pending = Pending0,
+                   max_concurrency = Max} = Aux, RaAux) ->
+    case map_size(Actions) < Max of
+        false ->
+            {no_reply, Aux, RaAux, []};
+        true ->
+            case queue:out(Pending0) of
+                {empty, _} ->
+                    {no_reply, Aux, RaAux, []};
+                {{value, {Action, StreamId, Args, ActionFun}}, Pending} ->
+                    Aux1 = Aux#?AUX{pending = Pending},
+                    case stream_exists(StreamId, RaAux) of
+                        true ->
+                            start_action(Action, StreamId, Args, ActionFun,
+                                         Aux1, RaAux);
+                        false ->
+                            start_pending(Aux1, RaAux)
+                    end
+            end
+    end.
+
+stream_exists(StreamId, RaAux) ->
+    #?MODULE{streams = Streams} = ra_aux:machine_state(RaAux),
+    is_map_key(StreamId, Streams).
 
 wrap_reply(From, Reply) ->
     [{reply, From, {wrap_reply, Reply}}].
@@ -1163,18 +1248,36 @@ phase_start_replica(StreamId, #{epoch := Epoch,
                 {error, Reason} ->
                     ?LOG_WARNING("~ts: Error while starting replica for ~ts on node ~ts in ~b : ~W",
                                  [?MODULE, maps:get(name, Conf1), Node, Epoch, Reason, 10]),
-                    maybe_sleep(Reason),
-                    send_action_failed(StreamId, starting, Args)
+                    send_action_failed(StreamId, starting, Args, backoff_class(Reason))
             catch _:Error ->
                     ?LOG_WARNING("~ts: Error while starting replica for ~ts on node ~ts in ~b : ~W",
                                  [?MODULE, maps:get(name, Conf1), Node, Epoch, Error, 10]),
-                    maybe_sleep(Error),
-                    send_action_failed(StreamId, starting, Args)
+                    send_action_failed(StreamId, starting, Args, backoff_class(Error))
             end
     end.
 
 send_action_failed(StreamId, Action, Arg) ->
-  send_self_command({action_failed, StreamId, Arg#{action => Action}}).
+    send_action_failed(StreamId, Action, Arg, none).
+
+send_action_failed(StreamId, Action, Arg, Backoff) ->
+    send_self_command({action_failed, StreamId,
+                       Arg#{action => Action, backoff => Backoff}}).
+
+%% Classify a failed replica/stop/delete action so the state machine knows how
+%% to retry it (writer starts never come here - they pass 'none' explicitly to
+%% re-elect immediately):
+%%   nodeup - the node is unreachable, wait for {nodeup, _} rather than polling
+%%   short  - retry after a (jittered) delay via the retry_reconcile timer
+%% The default is 'short': any unrecognised failure (e.g.
+%% {{shutdown, writer_unavailable}, _} mid start_replica, {{badrpc, _}, _},
+%% {shutdown, {gen_server, _}}) is paced rather than re-driven immediately,
+%% which would hot-loop.
+backoff_class({{nodedown, _}, _}) ->
+    nodeup;
+backoff_class({error, nodedown}) ->
+    nodeup;
+backoff_class(_) ->
+    short.
 
 send_self_command(Cmd) ->
     ra:pipeline_command({?MODULE, node()}, Cmd, no_correlation, normal),
@@ -1191,12 +1294,11 @@ phase_delete_member(StreamId, #{node := Node} = Arg, Conf) ->
                                             [?MODULE, StreamId, Node]),
                             send_self_command({member_deleted, StreamId, Arg});
                         _ ->
-                            send_action_failed(StreamId, deleting, Arg)
+                            send_action_failed(StreamId, deleting, Arg, none)
                     catch _:E ->
                               ?LOG_WARNING("~ts: Error while deleting member for ~ts : on node ~ts ~W",
                                                  [?MODULE, StreamId, Node, E, 10]),
-                              maybe_sleep(E),
-                              send_action_failed(StreamId, deleting, Arg)
+                              send_action_failed(StreamId, deleting, Arg, backoff_class(E))
                     end;
                 false ->
                     %% node is no longer a cluster member, we return success to avoid
@@ -1221,19 +1323,16 @@ phase_stop_member(StreamId, #{node := Node, epoch := Epoch} = Arg0, Conf) ->
                         Err ->
                             ?LOG_WARNING("~ts: failed to get tail of member ~ts on ~ts in ~b Error: ~w",
                                                [?MODULE, StreamId, Node, Epoch, Err]),
-                            maybe_sleep(Err),
-                            send_action_failed(StreamId, stopping, Arg0)
+                            send_action_failed(StreamId, stopping, Arg0, backoff_class(Err))
                     catch _:Err ->
                             ?LOG_WARNING("~ts: failed to get tail of member ~ts on ~ts in ~b Error: ~w",
                                                [?MODULE, StreamId, Node, Epoch, Err]),
-                            maybe_sleep(Err),
-                            send_action_failed(StreamId, stopping, Arg0)
+                            send_action_failed(StreamId, stopping, Arg0, backoff_class(Err))
                     end
             catch _:Err ->
                       ?LOG_WARNING("~ts: failed to stop member ~ts ~w Error: ~w",
                                          [?MODULE, StreamId, Node, Err]),
-                      maybe_sleep(Err),
-                      send_action_failed(StreamId, stopping, Arg0)
+                      send_action_failed(StreamId, stopping, Arg0, backoff_class(Err))
             end
     end.
 
@@ -1411,9 +1510,9 @@ filter_command(_Meta, {delete_stream, _StreamId, #{}}, undefined) ->
     %% Attempting to delete a stream which does not exist. Reply 'ok' to the
     %% caller so that this action is idempotent.
     {reply, ok};
-filter_command(#{machine_version := Vsn},
+filter_command(_Meta,
                {new_stream, _StreamId, #{}},
-               #stream{members = Members}) when ?V7_OR_MORE(Vsn) ->
+               #stream{members = Members}) ->
     MaybeLeader = [Pid || _Node := #member{state = {running, _, Pid},
                                            role = {writer, _}} <- Members],
     case MaybeLeader of
@@ -1460,12 +1559,17 @@ update_stream0(#{system_time := _} = Meta,
             conf = Conf,
             members = Members,
             reply_to = maps:get(from, Meta, undefined)};
-update_stream0(#{machine_version := MacVer} = Meta,
+update_stream0(Meta,
                {restart_stream, _StreamId, Options},
-               #stream{members = Members0} = Stream0)
-  when MacVer >= 4 ->
+               #stream{members = Members0} = Stream0) ->
     Preferred = maps:get(preferred_leader_node, Options, undefined),
-    Members = maps:map(fun (N, M) when N == Preferred ->
+    Members = maps:map(fun (_N, #member{target = deleted} = M) ->
+                               %% never resurrect a member that is being deleted:
+                               %% flipping it back to 'stopped' could leave two
+                               %% writers and crash find_leader/1 with a
+                               %% case_clause
+                               M;
+                           (N, M) when N == Preferred ->
                                M#member{preferred = true,
                                         target = stopped};
                            (_N, M) ->
@@ -1550,6 +1654,25 @@ update_stream0(#{system_time := _Ts},
                                [?MODULE, Args, Member]),
             Stream0
     end;
+update_stream0(_Meta,
+               {member_started, _StreamId,
+                #{index := Idx, pid := Pid}},
+               #stream{members = Members0} = Stream0) ->
+    %% The stream epoch has advanced since this 'start' action was issued: a
+    %% re-election raced the in-flight start (the clause above only matches when
+    %% the command and stream epochs are equal). Clear the stale 'starting'
+    %% marker so the member becomes actionable again and can be stopped and
+    %% restarted in the current epoch. Without this the member would remain
+    %% stuck with current = {starting, _} until the next coordinator leader
+    %% change ran fail_active_actions/2.
+    Node = node(Pid),
+    case Members0 of
+        #{Node := #member{current = {starting, Idx}} = Member0} ->
+            Member = Member0#member{current = undefined},
+            Stream0#stream{members = Members0#{Node => Member}};
+        _ ->
+            Stream0
+    end;
 update_stream0(#{system_time := _Ts},
                {member_deleted, _StreamId, #{node := Node}},
                #stream{nodes = Nodes,
@@ -1575,7 +1698,6 @@ update_stream0(Meta,
                   tail := Tail}},
                #stream{epoch = Epoch,
                        target = Target,
-                       nodes = Nodes,
                        members = Members0} = Stream0) ->
     IsLeaderInCurrent = case find_leader(Members0) of
                             {{_Node, #member{role = {writer, Epoch},
@@ -1616,46 +1738,13 @@ update_stream0(Meta,
                              Member0#member{state = {stopped, StoppedEpoch, Tail},
                                             current = undefined}
                      end,
-
-            Members1 = Members0#{Node => Member},
-
-            StoppedInCurrent =
-                maps:filter(fun (_N, #member{state = {stopped, E, _T},
-                                             target = running})
-                                  when E == Epoch ->
-                                    true;
-                                (_, _) ->
-                                    false
-                            end, Members1),
-            case is_quorum(length(Nodes), map_size(StoppedInCurrent)) of
+            Stream1 = Stream0#stream{members = Members0#{Node => Member}},
+            Candidates = stopped_in_epoch(Stream1),
+            case is_quorum(length(Stream1#stream.nodes), map_size(Candidates)) of
                 true ->
-                    %% select leader
-                    NewWriterNode = select_leader(Meta, StoppedInCurrent),
-                    NextEpoch = Epoch + 1,
-                    Members = maps:map(
-                                fun (N, #member{state = {stopped, E, _}} = M)
-                                      when E == Epoch ->
-                                        case NewWriterNode of
-                                            N ->
-                                                %% new leader
-                                                M#member{role = {writer, NextEpoch},
-                                                         preferred = false,
-                                                         state = {ready, NextEpoch}};
-                                            _ ->
-                                                M#member{role = {replica, NextEpoch},
-                                                         preferred = false,
-                                                         state = {ready, NextEpoch}}
-                                        end;
-                                    (_N, #member{target = deleted} = M) ->
-                                        M;
-                                    (_N, M) ->
-                                        M#member{role = {replica, NextEpoch},
-                                                 preferred = false}
-                                end, Members1),
-                    Stream0#stream{epoch = NextEpoch,
-                                   members = Members};
+                    promote_writer(Meta, Candidates, Stream1);
                 false ->
-                    Stream0#stream{members = Members1}
+                    Stream1
             end;
         _Member ->
             Stream0
@@ -1717,12 +1806,9 @@ update_stream0(#{system_time := _Ts},
         #{DownNode := #member{role = {writer, E},
                               state = {running, E, Pid}} = Member} ->
             Members1 = Members0#{DownNode => Member#member{state = {down, E}}},
-            %% leader is down, set all members that should be running to stopped
-            Members = maps:map(fun (_, #member{target = running} = M) ->
-                                       M#member{target = stopped};
-                                   (_, M) ->
-                                       M
-                               end, Members1),
+            %% leader is down: set all running members to stopped (and wake any
+            %% timed-parked members) so they take part in the re-election
+            Members = set_running_to_stopped(Members1),
             Stream0#stream{members = Members};
         #{DownNode := #member{role = {replica, _},
                               state = {running, _, Pid}} = Member}
@@ -1745,13 +1831,21 @@ update_stream0(#{system_time := _Ts},
 update_stream0(#{system_time := _Ts},
                {down, _Pid, _Reason}, undefined) ->
     undefined;
-update_stream0(#{system_time := _Ts} = _Meta,
+update_stream0(_Meta,
                {nodeup, Node},
                #stream{members = Members0} = Stream0) ->
     Members = maps:map(
                 fun (N, #member{current = {sleeping, nodeup}} = M)
                       when N == Node ->
                         M#member{current = undefined};
+                    (N, #member{state = {disconnected, E, Pid}} = M)
+                      when N == Node ->
+                        %% the node hosting this disconnected replica is back:
+                        %% resume treating the member as running. The process
+                        %% monitor re-issued in the 'nodeup' apply clause will
+                        %% deliver a DOWN and trigger a restart if the process
+                        %% did not survive the disconnection.
+                        M#member{state = {running, E, Pid}};
                     (_, M) ->
                         M
                 end, Members0),
@@ -1766,20 +1860,10 @@ update_stream0(_Meta, {update_config, _StreamId, Conf},
 update_stream0(_Meta, _Cmd, undefined) ->
     undefined.
 
-inform_listeners_eol(Vsn,
-                     #stream{target = deleted,
-                             listeners = Listeners,
-                             queue_ref = QRef})
-  when Vsn =< 1 ->
-    lists:map(fun(Pid) ->
-                      {send_msg, Pid,
-                       {queue_event, QRef, eol},
-                       cast}
-              end, maps:keys(Listeners));
-inform_listeners_eol(Vsn,
+inform_listeners_eol(_Vsn,
                         #stream{target    = deleted,
                                 listeners = Listeners,
-                                queue_ref = QRef}) when ?V2_OR_MORE(Vsn) ->
+                                queue_ref = QRef}) ->
     LPidsMap = maps:fold(fun({P, _}, _V, Acc) ->
                             Acc#{P => ok}
                          end, #{}, Listeners),
@@ -1803,33 +1887,8 @@ eval_listeners(_MachineVersion,
     %% if the Members have not changed don't evaluate as this is an
     %% expensive operation when there are many listeners
     {Stream, Effects0};
-eval_listeners(MachineVersion, #stream{listeners = Listeners0,
-                                       queue_ref = QRef,
-                                       members = Members} = Stream,
-               _OldStream, Effects0)
-  when MachineVersion =< 1 ->
-    case find_leader(Members) of
-        {{_LeaderNode, #member{state = {running, _, LeaderPid}}},
-         _Replicas} ->
-            %% a leader is running, check all listeners to see if any of them
-            %% has not been notified of the current leader pid
-            {Listeners, Effects} =
-                maps:fold(fun(_, P, Acc) when P == LeaderPid ->
-                                  Acc;
-                             (LPid, _, {L, Acc}) ->
-                                  {L#{LPid => LeaderPid},
-                                   [{send_msg, LPid,
-                                     {queue_event, QRef,
-                                      {stream_leader_change, LeaderPid}},
-                                     cast} | Acc]}
-                          end, {Listeners0, Effects0}, Listeners0),
-            {Stream#stream{listeners = Listeners}, Effects};
-        _ ->
-            {Stream, Effects0}
-    end;
-eval_listeners(Vsn, #stream{listeners = Listeners0} = Stream0,
-               _OldStream, Effects0)
-  when ?V2_OR_MORE(Vsn) ->
+eval_listeners(_MachineVersion, #stream{listeners = Listeners0} = Stream0,
+               _OldStream, Effects0) ->
     %% Iterating over stream listeners.
     %% Returning the new map of listeners and the effects (notification of changes)
     {Listeners1, Effects1} =
@@ -1922,22 +1981,135 @@ eval_retention(#{index := Idx} = Meta,
     {Stream#stream{members = maps:merge(Members, Updated)}, Effs ++ Effects0}.
 
 
+%% Level-triggered safety net (v8+): a stream that should be running can settle
+%% into a state with no usable writer (for example after members are removed one
+%% by one while a majority of nodes are unavailable). Nothing would then drive
+%% the edge-triggered election in the 'member_stopped' handler, so before
+%% evaluating a stream we give it a chance to elect a writer from a stopped
+%% quorum.
+recover_leaderless_stream(Meta,
+                          #stream{target = running,
+                                  nodes = Nodes,
+                                  members = Members} = Stream)
+  when map_size(Members) > 0 ->
+    case leaderless_and_recoverable(Stream) of
+        true ->
+            %% put the surviving members back to a running target so they
+            %% qualify as election candidates
+            Runnable = maps:map(fun (_, #member{target = deleted} = M) ->
+                                        M;
+                                    (_, M) ->
+                                        M#member{target = running}
+                                end, Members),
+            RunnableStream = Stream#stream{members = Runnable},
+            Candidates = stopped_in_epoch(RunnableStream),
+            case is_quorum(length(Nodes), map_size(Candidates)) of
+                true ->
+                    promote_writer(Meta, Candidates, RunnableStream);
+                false ->
+                    %% not enough stopped members yet, keep the stream as-is
+                    Stream
+            end;
+        false ->
+            Stream
+    end;
+recover_leaderless_stream(_Meta, Stream) ->
+    Stream.
+
+%% True when no writer is making progress, nothing is mid-action, and at least
+%% one member is stopped in the current epoch to elect from.
+leaderless_and_recoverable(#stream{epoch = Epoch, members = Members}) ->
+    Ms = maps:values(Members),
+    NoWriter = not lists:any(fun (#member{target = deleted}) ->
+                                     false;
+                                 (M) ->
+                                     is_active_writer(M)
+                             end, Ms),
+    Settled = not lists:any(fun (#member{target = deleted}) ->
+                                    false;
+                                (#member{current = C}) ->
+                                    C =/= undefined
+                            end, Ms),
+    Electable = lists:any(fun (#member{state = {stopped, E, _}}) ->
+                                  E == Epoch;
+                              (_) ->
+                                  false
+                          end, Ms),
+    NoWriter andalso Settled andalso Electable.
+
+is_active_writer(#member{role = {writer, _}, state = {running, _, _}}) ->
+    true;
+is_active_writer(#member{role = {writer, _}, state = {ready, _}}) ->
+    true;
+is_active_writer(#member{}) ->
+    false.
+
+%% The members eligible to become the next writer: those stopped in the current
+%% epoch that are meant to be running.
+stopped_in_epoch(#stream{epoch = Epoch, members = Members}) ->
+    maps:filter(fun (_, #member{state = {stopped, E, _}, target = running})
+                      when E == Epoch ->
+                        true;
+                    (_, _) ->
+                        false
+                end, Members).
+
+%% Advance to the next epoch, promoting one of the candidates (which must be a
+%% quorum of members stopped in the current epoch) to writer and demoting the
+%% rest to replicas. Start latches left over from the previous epoch are dropped
+%% (v8+) so they cannot wedge the new epoch.
+promote_writer(Meta, Candidates,
+               #stream{epoch = Epoch, members = Members0} = Stream) ->
+    Winner = select_leader(Meta, Candidates),
+    Next = Epoch + 1,
+    Members = maps:map(
+                fun (N, #member{state = {stopped, E, _}} = M)
+                      when E == Epoch ->
+                        Role = case N of
+                                   Winner -> {writer, Next};
+                                   _ -> {replica, Next}
+                               end,
+                        M#member{role = Role,
+                                 preferred = false,
+                                 state = {ready, Next}};
+                    (_, #member{target = deleted,
+                                current = {starting, _}} = M) ->
+                        %% clear a stale start latch so the member can be deleted
+                        %% rather than blocking on an action that never completes
+                        M#member{current = undefined};
+                    (_, #member{target = deleted} = M) ->
+                        M;
+                    (_, #member{current = {starting, _}} = M) ->
+                        %% a start from a previous epoch will never complete
+                        %% against the new epoch: drop the latch and demote so
+                        %% the member is re-driven instead of blocking future
+                        %% re-elections
+                        M#member{role = {replica, Next},
+                                 preferred = false,
+                                 current = undefined};
+                    (_, M) ->
+                        M#member{role = {replica, Next},
+                                 preferred = false}
+                end, Members0),
+    Stream#stream{epoch = Next, members = Members}.
+
 %% this function should be idempotent,
 %% it should modify the state such that it won't issue duplicate
 %% actions when called again
-evaluate_stream(#{index := Idx} = Meta,
-                #stream{id = StreamId,
-                        reply_to = From,
-                        epoch = Epoch,
-                        mnesia = {MnesiaTag, MnesiaEpoch},
-                        members = Members0} = Stream0, Effs0) ->
+evaluate_stream(#{index := Idx} = Meta, #stream{} = Stream00, Effs0) ->
+    #stream{id = StreamId,
+            reply_to = From,
+            epoch = Epoch,
+            mnesia = {MnesiaTag, MnesiaEpoch},
+            members = Members0} = Stream0 = recover_leaderless_stream(Meta, Stream00),
     case find_leader(Members0) of
         {{LeaderNode, #member{state = LState,
                               target = deleted,
                               current = undefined} = Writer0},
          Replicas}
            when LState =/= deleted ->
-             Action = {aux, {delete_member, StreamId, LeaderNode,
+             Args = Meta#{node => LeaderNode, epoch => Epoch},
+             Action = {aux, {delete_member, StreamId, Args,
                              make_writer_conf(LeaderNode, Stream0)}},
              Writer = Writer0#member{current = {deleting, Idx}},
              Effs = [Action | Effs0],
@@ -2125,8 +2297,16 @@ fail_active_actions(Streams, Exclude) ->
 
 fail_action(_StreamId, _, #member{current = undefined}) ->
     ok;
+fail_action(_StreamId, _, #member{current = {sleeping, RetryAt}})
+  when is_integer(RetryAt) ->
+    %% parked on a timer: the retry_reconcile timer (re-armed on leader change)
+    %% owns re-driving it, so do not fail it here
+    ok;
 fail_action(StreamId, Node, #member{role = {_, E},
                                     current = {Action, Idx}}) ->
+    %% this also covers a member parked as {sleeping, nodeup}: re-driving it on
+    %% leader change is the backstop for a {nodeup, Node} that may have been
+    %% delivered during the leadership gap and therefore missed
     ?LOG_DEBUG("~ts: failing stale action to trigger retry. "
                      "Stream ID: ~ts, node: ~w, action: ~w",
                      [?MODULE, StreamId, node(), Action]),
@@ -2136,6 +2316,138 @@ fail_action(StreamId, Node, #member{role = {_, E},
                          index => Idx,
                          node => Node,
                          epoch => E}}).
+
+%% v8+ retry backoff (Option B): instead of the action worker sleeping before
+%% reporting a failure, the state machine parks the failed member until a
+%% deterministic retry time and re-drives it from a single, coalesced timer.
+
+parked_tree(#?MODULE{parked = undefined}) ->
+    %% states written before v8 carry no parked structure
+    gb_trees:empty();
+parked_tree(#?MODULE{parked = Parked}) ->
+    Parked.
+
+backoff_ms(short) ->
+    ?ACTION_RETRY_SHORT_MS.
+
+%% Deterministic per-member jitter (same on every replica, so apply/3 stays
+%% deterministic) that spreads simultaneously-parked members across the retry
+%% window instead of waking them all on the same reconcile.
+retry_jitter(StreamId, Node) ->
+    erlang:phash2({StreamId, Node}, ?ACTION_RETRY_JITTER_MS).
+
+%% Delay (ms) until the earliest parked retry is due. The tree is ordered by
+%% {RetryAtMs, StreamId, Node}, so the smallest key is the next retry.
+retry_reconcile_delay(Parked, Now) ->
+    {{RetryAt, _StreamId, _Node}, _} = gb_trees:smallest(Parked),
+    max(0, RetryAt - Now).
+
+%% Park a member whose action just failed so evaluate_stream leaves it alone
+%% until it should be retried. Only parks when this failure actually cleared the
+%% member's current action (matching action and index); writer starts and other
+%% immediate retries use the 'none' class and are not parked.
+%%
+%% A 'nodeup' failure (the node is down) parks the member as {sleeping, nodeup}
+%% and emits a node monitor so it is re-driven by the {nodeup, Node} command
+%% when the node returns, rather than polling a dead node on a timer. A 'short'
+%% failure parks as {sleeping, RetryAt} and is re-driven by the retry_reconcile
+%% timer.
+maybe_park_action(Meta,
+                  {action_failed, StreamId, #{node := Node,
+                                              index := Idx,
+                                              action := Action} = Map},
+                  Stream0, #stream{members = Members} = Stream1, Parked) ->
+    case maps:get(backoff, Map, none) of
+        none ->
+            {Stream1, Parked, []};
+        Class ->
+            case Stream0 of
+                #stream{members = #{Node := #member{current = {A, I}}}}
+                  when A == Action andalso I == Idx ->
+                    #{Node := M} = Members,
+                    park_action(Class, Node, StreamId, M, Members, Meta,
+                                Stream1, Parked);
+                _ ->
+                    %% the failure did not clear a matching action (stale or
+                    %% already superseded), so there is nothing to park
+                    {Stream1, Parked, []}
+            end
+    end;
+maybe_park_action(_Meta, _Cmd, _Stream0, Stream1, Parked) ->
+    {Stream1, Parked, []}.
+
+park_action(nodeup, Node, _StreamId, M, Members, _Meta, Stream1, Parked) ->
+    %% wait for the node to come back rather than polling; the node monitor
+    %% ensures the {nodeup, Node} command is delivered when it does
+    M1 = M#member{current = {sleeping, nodeup}},
+    {Stream1#stream{members = Members#{Node => M1}}, Parked,
+     [{monitor, node, Node}]};
+park_action(short, Node, StreamId, M, Members, Meta, Stream1, Parked) ->
+    RetryAt = maps:get(system_time, Meta) + backoff_ms(short)
+              + retry_jitter(StreamId, Node),
+    M1 = M#member{current = {sleeping, RetryAt}},
+    Parked1 = gb_trees:enter({RetryAt, StreamId, Node}, [], Parked),
+    Effs = [{timer, retry_reconcile,
+             retry_reconcile_delay(Parked1, maps:get(system_time, Meta))}],
+    {Stream1#stream{members = Members#{Node => M1}}, Parked1, Effs}.
+
+%% Fired by the retry_reconcile timer: wake every parked member whose retry is
+%% due, re-driving each affected stream, then re-arm the timer for the next one.
+reconcile_retries(#{system_time := Now} = Meta,
+                  #?MODULE{streams = Streams0,
+                           monitors = Monitors0} = State0) ->
+    {Parked, Streams1, Dirty} =
+        expire_parked(parked_tree(State0), Now, Streams0, #{}),
+    {Streams, Monitors, Effs0} =
+        maps:fold(
+          fun (StreamId, _, {Ss, Mons, Effs}) ->
+                  case Ss of
+                      #{StreamId := S0} ->
+                          {S1, Effs1} = evaluate_stream(Meta, S0, Effs),
+                          {Mons1, Effs2} = ensure_monitors(S1, Mons, Effs1),
+                          {Ss#{StreamId => S1}, Mons1, Effs2};
+                      _ ->
+                          {Ss, Mons, Effs}
+                  end
+          end, {Streams1, Monitors0, []}, Dirty),
+    Effs = case gb_trees:is_empty(Parked) of
+               true ->
+                   Effs0;
+               false ->
+                   [{timer, retry_reconcile,
+                     retry_reconcile_delay(Parked, Now)} | Effs0]
+           end,
+    return(Meta, State0#?MODULE{streams = Streams,
+                                monitors = Monitors,
+                                parked = Parked}, ok, Effs).
+
+%% Walk the parked tree from the earliest retry, clearing every due member back
+%% to an actionable state. member.current is authoritative: an entry whose
+%% member is no longer parked at exactly this retry time is stale and dropped.
+expire_parked(Parked, Now, Streams, Dirty) ->
+    case gb_trees:is_empty(Parked) of
+        true ->
+            {Parked, Streams, Dirty};
+        false ->
+            case gb_trees:smallest(Parked) of
+                {{RetryAt, _StreamId, _Node}, _} when RetryAt > Now ->
+                    %% earliest retry is not due yet, so neither is any other
+                    {Parked, Streams, Dirty};
+                {{RetryAt, StreamId, Node} = Key, _} ->
+                    Parked1 = gb_trees:delete(Key, Parked),
+                    case Streams of
+                        #{StreamId := #stream{members = #{Node := #member{current = {sleeping, RetryAt}} = M} = Members} = Stream} ->
+                            Members1 = Members#{Node =>
+                                                M#member{current = undefined}},
+                            Streams1 = Streams#{StreamId =>
+                                                Stream#stream{members = Members1}},
+                            expire_parked(Parked1, Now, Streams1,
+                                          Dirty#{StreamId => ok});
+                        _ ->
+                            expire_parked(Parked1, Now, Streams, Dirty)
+                    end
+            end
+    end.
 
 ensure_monitors(#stream{id = StreamId,
                         members = Members}, Monitors, Effects) ->
@@ -2277,12 +2589,24 @@ maybe_sleep({error, _}) ->
 maybe_sleep(_) ->
     ok.
 
+%% Trigger a re-election: mark running members to be stopped so their tails can
+%% be collected and a new writer elected. A member parked on the retry timer
+%% ({sleeping, RetryAt}) is woken here so it joins this stop phase immediately
+%% rather than waiting for its timer; the stale parked-tree entry is dropped on
+%% the next reconcile. A member parked on {sleeping, nodeup} is left alone: its
+%% node is down, so it cannot be stopped until the node returns.
 set_running_to_stopped(Members) ->
     maps:map(fun (_, #member{target = running} = M) ->
-                     M#member{target = stopped};
+                     wake_timed_sleep(M#member{target = stopped});
                  (_, M) ->
-                     M
+                     wake_timed_sleep(M)
              end, Members).
+
+wake_timed_sleep(#member{current = {sleeping, RetryAt}} = M)
+  when is_integer(RetryAt) ->
+    M#member{current = undefined};
+wake_timed_sleep(M) ->
+    M.
 
 update_target(#member{target = deleted} = Member, _) ->
     %% A deleted member can never transition to another state
@@ -2349,6 +2673,8 @@ machine_version(4 = From, 5, #?MODULE{single_active_consumer = Sac0} = State) ->
 machine_version(6, 7, #?MODULE{monitors = Monitors0} = State) ->
     Monitors = maps:filter(fun(_Key, Value) -> Value =/= sac end, Monitors0),
     {State#?MODULE{monitors = Monitors}, []};
+machine_version(7, 8, State) ->
+    {State#?MODULE{parked = gb_trees:empty()}, []};
 machine_version(From, To, State) ->
     ?LOG_INFO("Stream coordinator machine version changes from ~tp to ~tp, no state changes required.",
                     [From, To]),
@@ -2486,30 +2812,20 @@ maps_to_list(M) ->
 ra_local_query(QueryFun) ->
     ra:local_query({?MODULE, node()}, QueryFun, infinity).
 
-sac_handle_connection_down(Meta, SacState, Pid, Reason, Vsn) when ?V5_OR_MORE(Vsn) ->
-    ?SAC_CURRENT:handle_connection_down(Meta, Pid, Reason, SacState);
-sac_handle_connection_down(_Meta, SacState, Pid, _Reason, _Vsn) ->
-    ?SAC_V4:handle_connection_down(Pid, SacState).
+sac_apply(_Mod, Meta, Cmd, State) ->
+    ?SAC_CURRENT:apply(Meta, Cmd, State).
 
-sac_presume_connection_down(#{machine_version := Vsn} = Meta, Pid, SacState) ->
-    Mod = sac_module(Meta),
-    case Meta of
-        #{machine_version := Vsn} when ?V5_OR_MORE(Vsn) ->
-            Mod:presume_connection_down(Meta, Pid, SacState);
-        _ ->
-            Mod:presume_connection_down(Pid, SacState)
-    end.
+sac_ensure_monitors(_Mod, Meta, Cmd, State, Monitors, Effects) ->
+    ?SAC_CURRENT:ensure_monitors(Meta, Cmd, State, Monitors, Effects).
 
-sac_handle_node_reconnected(#{machine_version := Vsn} = Meta, Node,
-                            Sac, Effects) ->
-    case ?V5_OR_MORE(Vsn) of
-        true ->
-            SacMod = sac_module(Meta),
-            SacMod:handle_node_reconnected(Node,
-                                           Sac, Effects);
-        false ->
-            {Sac, Effects}
-    end.
+sac_handle_connection_down(Meta, SacState, Pid, Reason, _Vsn) ->
+    ?SAC_CURRENT:handle_connection_down(Meta, Pid, Reason, SacState).
+
+sac_presume_connection_down(Meta, Pid, SacState) ->
+    ?SAC_CURRENT:presume_connection_down(Meta, Pid, SacState).
+
+sac_handle_node_reconnected(Meta, Node, Sac, Effects) ->
+    ?SAC_CURRENT:handle_node_reconnected(Meta, Node, Sac, Effects).
 
 sac_make_purge_nodes(Nodes) ->
     rabbit_stream_sac_coordinator:make_purge_nodes(Nodes).
@@ -2520,10 +2836,8 @@ sac_make_update_conf(Conf) ->
 sac_check_conf_change(SacState) ->
     rabbit_stream_sac_coordinator:check_conf_change(SacState).
 
-sac_list_nodes(State, Vsn) when ?V5_OR_MORE(Vsn) ->
-    rabbit_stream_sac_coordinator:list_nodes(sac_state(State));
-sac_list_nodes(_, _) ->
-    [].
+sac_list_nodes(State, _Vsn) ->
+    rabbit_stream_sac_coordinator:list_nodes(sac_state(State)).
 
 maybe_update_replica_conf(Conf) ->
     case rabbit_feature_flags:is_enabled('rabbitmq_4.3.0') of

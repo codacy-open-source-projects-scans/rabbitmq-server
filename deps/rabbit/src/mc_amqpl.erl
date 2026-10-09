@@ -27,7 +27,9 @@
          message/4,
          from_basic_message/1,
          to_091/2,
-         from_091/2
+         from_091/2,
+         is_convertible/1,
+         is_representable/2
         ]).
 
 -import(rabbit_misc,
@@ -37,11 +39,19 @@
 
 -define(HEADER_GUESS_SIZE, 100). %% see determine_persist_to/2
 -define(AMQP10_TYPE, <<"amqp-1.0">>).
--define(AMQP10_PROPERTIES_HEADER, <<"x-amqp-1.0-properties">>).
--define(AMQP10_APP_PROPERTIES_HEADER, <<"x-amqp-1.0-app-properties">>).
--define(AMQP10_MESSAGE_ANNOTATIONS_HEADER, <<"x-amqp-1.0-message-annotations">>).
--define(AMQP10_FOOTER, <<"x-amqp-1.0-footer">>).
 -define(CLASS_ID, 60).
+-define(IS_BODY_SECTION(S),
+        is_record(S, 'v1_0.data') orelse
+        is_record(S, 'v1_0.amqp_sequence') orelse
+        is_record(S, 'v1_0.amqp_value')).
+
+%% AMQP 1.0 types with no AMQP 0-9-1 equivalent.
+-define(IS_UNCONVERTIBLE(V),
+        (is_tuple(V) andalso tuple_size(V) >= 1 andalso
+         (element(1, V) =:= as_is orelse
+          element(1, V) =:= char orelse
+          element(1, V) =:= uuid orelse
+          element(1, V) =:= described))).
 
 -opaque state() :: #content{}.
 
@@ -71,9 +81,7 @@ convert_from(mc_amqp, Sections, _Env) ->
          (#'v1_0.application_properties'{} = S, Acc) ->
               setelement(4, Acc, S);
          (BodySect, Acc)
-           when is_record(BodySect, 'v1_0.data') orelse
-                is_record(BodySect, 'v1_0.amqp_sequence') orelse
-                is_record(BodySect, 'v1_0.amqp_value') ->
+           when ?IS_BODY_SECTION(BodySect) ->
               Body = element(5, Acc),
               setelement(5, Acc, [BodySect | Body]);
          (Body = {amqp_encoded_body_and_footer, _}, Acc) ->
@@ -131,18 +139,17 @@ convert_from(mc_amqp, Sections, _Env) ->
     DelMode = case H of
                   #'v1_0.header'{durable = true} -> 2;
                   #'v1_0.header'{durable = false} -> 1;
-                  _ -> amqp10_map_get(symbol(<<"x-basic-delivery-mode">>), MA)
+                  _ -> undefined
               end,
     Priority = case H of
-                   #'v1_0.header'{priority = {_, P}} -> P;
-                   _ -> amqp10_map_get(symbol(<<"x-basic-priority">>), MA)
+                   #'v1_0.header'{priority = {ubyte, P}} -> P;
+                   _ -> undefined
                end,
-    %% check amqp header first for priority, ttl
     Expiration = case H of
-                     #'v1_0.header'{ttl = {_, T}} ->
+                     #'v1_0.header'{ttl = {uint, T}} ->
                          integer_to_binary(T);
                      _ ->
-                         amqp10_map_get(symbol(<<"x-basic-expiration">>), MA)
+                         undefined
                  end,
     Type = case Type0 of
                undefined ->
@@ -151,7 +158,7 @@ convert_from(mc_amqp, Sections, _Env) ->
                    Type0
            end,
 
-    Headers0 = lists:filtermap(fun({_K, {as_is, _, _}}) ->
+    Headers0 = lists:filtermap(fun({_K, V}) when ?IS_UNCONVERTIBLE(V) ->
                                        false;
                                   ({{utf8, K}, V})
                                     when ?IS_SHORTSTR_LEN(K) ->
@@ -160,13 +167,14 @@ convert_from(mc_amqp, Sections, _Env) ->
                                        false
                                end, AP),
     %% Add remaining x- message annotations as headers
-    XHeaders = lists:filtermap(fun({{symbol, <<"x-cc">>}, V}) ->
+    XHeaders = lists:filtermap(fun({{symbol, <<"x-cc">>}, V})
+                                    when not ?IS_UNCONVERTIBLE(V) ->
                                        {true, to_091(<<"CC">>, V)};
                                   ({{symbol, <<"x-opt-rabbitmq-received-time">>}, {timestamp, Ts}}) ->
                                        {true, {<<"timestamp_in_ms">>, long, Ts}};
                                   ({{symbol, <<"x-opt-deaths">>}, V}) ->
                                        convert_from_amqp_deaths(V);
-                                  ({_K, {as_is, _, _}}) ->
+                                  ({_K, V}) when ?IS_UNCONVERTIBLE(V) ->
                                        false;
                                   ({{symbol, <<"x-", _/binary>> = K}, V})
                                     when ?IS_SHORTSTR_LEN(K) ->
@@ -213,9 +221,9 @@ convert_from(mc_amqp, Sections, _Env) ->
                     app_id = unwrap_shortstr(GroupId),
                     priority = Priority,
                     correlation_id = CorrId091,
-                    content_type = unwrap(ContentType),
-                    content_encoding = unwrap(ContentEncoding),
-                    timestamp = unwrap(Timestamp)
+                    content_type = unwrap_shortstr(ContentType),
+                    content_encoding = unwrap_shortstr(ContentEncoding),
+                    timestamp = unwrap_timestamp(Timestamp)
                    },
     #content{class_id = ?CLASS_ID,
              properties = BP,
@@ -316,7 +324,6 @@ convert_to(?MODULE, Content, _Env) ->
 convert_to(mc_amqp, #content{payload_fragments_rev = PFR} = Content, Env) ->
     #content{properties = Props} = prepare(read, Content),
     #'P_basic'{message_id = MsgId0,
-               expiration = Expiration,
                delivery_mode = DelMode,
                headers = Headers0,
                user_id = UserId,
@@ -334,25 +341,42 @@ convert_to(mc_amqp, #content{payload_fragments_rev = PFR} = Content, Env) ->
                       _ ->
                           Timestamp * 1000
                   end,
-
     Headers = case Headers0 of
                   undefined -> [];
                   _ -> Headers0
               end,
+
+    Ttl = case rabbit_basic:parse_expiration(Props) of
+              {ok, Val} ->
+                  Val;
+              {error, _} ->
+                  undefined
+          end,
     %% TODO: only add header section if at least one of the fields
     %% needs to be set
-    Ttl = case Expiration of
-              undefined ->
-                  undefined;
-              _ ->
-                  %% Channel already checked for valid integer.
-                  binary_to_integer(Expiration)
-          end,
-
     H = #'v1_0.header'{durable = DelMode =:= 2,
                        ttl = wrap(uint, Ttl),
                        %% TODO: check Priority is a ubyte?
                        priority = wrap(ubyte, Priority)},
+
+    %% x- headers are stored as message annotations
+    MAC0 = lists:filtermap(
+             fun({<<"x-", _/binary>> = K, T, V}) ->
+                     %% All message annotation keys need to be either a symbol or ulong
+                     %% but 0.9.1 field-table names are always strings.
+                     {true, {{symbol, K}, from_091(T, V)}};
+                ({<<"CC">>, T = array, V}) ->
+                     %% Special case the 0.9.1 CC header into 1.0 message annotations because
+                     %% 1.0 application properties must not contain list or array values.
+                     {true, {{symbol, <<"x-cc">>}, from_091(T, V)}};
+                (_) ->
+                     false
+             end, Headers),
+    %% `type' doesn't have a direct equivalent so adding as
+    %% a message annotation here
+    MAC = map_add(symbol, <<"x-basic-type">>, utf8, Type, MAC0),
+    MA = #'v1_0.message_annotations'{content = MAC},
+
     ReplyTo = case ReplyTo0 of
                   undefined ->
                       undefined;
@@ -372,74 +396,33 @@ convert_to(mc_amqp, #content{payload_fragments_rev = PFR} = Content, Env) ->
                 _ ->
                     wrap(utf8, MsgId0)
             end,
-    P = case amqp10_section_header(?AMQP10_PROPERTIES_HEADER, Headers) of
-            undefined ->
-                #'v1_0.properties'{message_id = MsgId,
-                                   user_id = wrap(binary, UserId),
-                                   to = undefined,
-                                   % subject = wrap(utf8, RKey),
-                                   reply_to = ReplyTo,
-                                   correlation_id = CorrId,
-                                   content_type = wrap(symbol, ContentType),
-                                   content_encoding = wrap(symbol, ContentEncoding),
-                                   creation_time = wrap(timestamp, ConvertedTs),
-                                   %% this is semantically not the best idea but you
-                                   %% could imagine these having similar behaviour
-                                   group_id = wrap(utf8, AppId)
-                                  };
-            V10Prop ->
-                V10Prop
-        end,
+    P = #'v1_0.properties'{message_id = MsgId,
+                           user_id = wrap(binary, UserId),
+                           to = undefined,
+                           reply_to = ReplyTo,
+                           correlation_id = CorrId,
+                           content_type = wrap(symbol, ContentType),
+                           content_encoding = wrap(symbol, ContentEncoding),
+                           creation_time = wrap(timestamp, ConvertedTs),
+                           %% this is semantically not the best idea but you
+                           %% could imagine these having similar behaviour
+                           group_id = wrap(utf8, AppId)},
 
-    AP = case amqp10_section_header(?AMQP10_APP_PROPERTIES_HEADER, Headers) of
-             undefined ->
-                 %% non x- headers are stored as application properties when the type allows
-                 APC = [{wrap(utf8, K), from_091(T, V)}
-                        || {K, T, V} <- Headers,
-                           supported_header_value_type(T),
-                           not mc_util:is_x_header(K)],
-                 #'v1_0.application_properties'{content = APC};
-             A ->
-                 A
-         end,
+    %% non x- headers are stored as application properties when the type allows
+    APC = [{wrap(utf8, K), from_091(T, V)} || {K, T, V} <- Headers,
+                                              supported_header_value_type(T),
+                                              not mc_util:is_x_header(K)],
+    AP = #'v1_0.application_properties'{content = APC},
 
-    %% x- headers are stored as message annotations
-    MA = case amqp10_section_header(?AMQP10_MESSAGE_ANNOTATIONS_HEADER, Headers) of
-             undefined ->
-                 MAC0 = lists:filtermap(
-                          fun({<<"x-", _/binary>> = K, T, V}) ->
-                                  %% All message annotation keys need to be either a symbol or ulong
-                                  %% but 0.9.1 field-table names are always strings.
-                                  {true, {{symbol, K}, from_091(T, V)}};
-                             ({<<"CC">>, T = array, V}) ->
-                                  %% Special case the 0.9.1 CC header into 1.0 message annotations because
-                                  %% 1.0 application properties must not contain list or array values.
-                                  {true, {{symbol, <<"x-cc">>}, from_091(T, V)}};
-                             (_) ->
-                                  false
-                          end, Headers),
-                 %% `type' doesn't have a direct equivalent so adding as
-                 %% a message annotation here
-                 MAC = map_add(symbol, <<"x-basic-type">>, utf8, Type, MAC0),
-                 #'v1_0.message_annotations'{content = MAC};
-             Section ->
-                 Section
-         end,
+    PayloadFragments = lists:reverse(PFR),
     BodySections = case Type of
                        ?AMQP10_TYPE ->
-                           amqp10_framing:decode_bin(
-                             iolist_to_binary(lists:reverse(PFR)));
+                           amqp10_body_sections(PayloadFragments);
                        _ ->
-                           [#'v1_0.data'{content = lists:reverse(PFR)}]
+                           [#'v1_0.data'{content = PayloadFragments}]
                    end,
-    Tail = case amqp10_section_header(?AMQP10_FOOTER, Headers) of
-               undefined ->
-                   BodySections;
-               #'v1_0.footer'{} = Footer ->
-                   BodySections ++ [Footer]
-           end,
 
-    Sections = [H, MA, P, AP | Tail],
+    Sections = [H, MA, P, AP | BodySections],
     mc_amqp:convert_from(mc_amqp, Sections, Env);
 convert_to(_TargetProto, _Content, _Env) ->
     not_implemented.
@@ -598,28 +581,38 @@ deaths_to_headers(Deaths, Headers0) ->
     rabbit_misc:set_table_value(Headers0, <<"x-death">>, array, Infos).
 
 convert_from_amqp_deaths({array, map, Maps}) ->
-    L = lists:map(
-          fun({map, KvList}) ->
-                  {Ttl, KvList1} = case KvList of
-                                       [{{symbol, <<"ttl">>}, {uint, Ttl0}} | Tail] ->
-                                           {Ttl0, Tail};
-                                       _ ->
-                                           {undefined, KvList}
-                                   end,
-                  [
-                   {{symbol, <<"queue">>}, {utf8, Queue}},
-                   {{symbol, <<"reason">>}, {symbol, Reason}},
-                   {{symbol, <<"count">>}, {ulong, Count}},
-                   {{symbol, <<"first-time">>}, {timestamp, FirstTime}},
-                   {{symbol, <<"last-time">>}, {timestamp, _LastTime}},
-                   {{symbol, <<"exchange">>}, {utf8, Exchange}},
-                   {{symbol, <<"routing-keys">>}, {array, utf8, RKeys0}}
-                  ] = KvList1,
-                  RKeys = [Key || {utf8, Key} <- RKeys0],
-                  death_table(Queue, Reason, Exchange, RKeys, Count, FirstTime, Ttl)
-          end, Maps),
+    L = lists:filtermap(fun convert_death_entry/1, Maps),
     {true, {<<"x-death">>, array, L}};
 convert_from_amqp_deaths(_IgnoreUnknownValue) ->
+    false.
+
+convert_death_entry({map, KvList0}) ->
+    {Ttl, KvList} = case KvList0 of
+                        [{{symbol, <<"ttl">>}, {uint, Ttl0}} | Tail] ->
+                            {Ttl0, Tail};
+                        _ ->
+                            {undefined, KvList0}
+                    end,
+    case {lists:keyfind({symbol, <<"queue">>}, 1, KvList),
+          lists:keyfind({symbol, <<"reason">>}, 1, KvList),
+          lists:keyfind({symbol, <<"count">>}, 1, KvList),
+          lists:keyfind({symbol, <<"first-time">>}, 1, KvList),
+          lists:keyfind({symbol, <<"exchange">>}, 1, KvList),
+          lists:keyfind({symbol, <<"routing-keys">>}, 1, KvList)} of
+        {{_, {utf8, Queue}},
+         {_, {symbol, Reason}},
+         {_, {ulong, Count}},
+         {_, {timestamp, FirstTime}},
+         {_, {utf8, Exchange}},
+         {_, {array, utf8, RKeys0}}} ->
+            RKeys = [Key || {utf8, Key} <- RKeys0],
+            {true, death_table(Queue, Reason, Exchange, RKeys, Count, FirstTime, Ttl)};
+        %% Clients can set x-opt-deaths, so a malformed entry must not
+        %% fail the conversion.
+        _ ->
+            false
+    end;
+convert_death_entry(_NotAMap) ->
     false.
 
 death_table({{QName, Reason},
@@ -711,7 +704,7 @@ amqp10_map_get(K, Tuples) ->
         false ->
             undefined;
         {_, V}  ->
-            unwrap(V)
+            unwrap_shortstr(V)
     end.
 
 symbol(T) -> {symbol, T}.
@@ -721,14 +714,42 @@ unwrap(undefined) ->
 unwrap({timestamp, V}) ->
     V div 1000;
 unwrap({_Type, V}) ->
-    V.
+    V;
+unwrap(_Other) ->
+    undefined.
 
-unwrap_shortstr({utf8, V})
-  when is_binary(V) andalso
+unwrap_timestamp({timestamp, V}) ->
+    V div 1000;
+unwrap_timestamp(_Other) ->
+    undefined.
+
+unwrap_shortstr({Type, V})
+  when (Type =:= utf8 orelse Type =:= symbol) andalso
+       is_binary(V) andalso
        ?IS_SHORTSTR_LEN(V) ->
     V;
 unwrap_shortstr(_) ->
     undefined.
+
+is_convertible(V) ->
+    not ?IS_UNCONVERTIBLE(V).
+
+is_representable(Key, Value) ->
+    is_binary(Key) andalso ?IS_SHORTSTR_LEN(Key) andalso is_convertible_deep(Value).
+
+is_convertible_deep(V) when ?IS_UNCONVERTIBLE(V) ->
+    false;
+is_convertible_deep({map, M}) ->
+    lists:all(fun({K, V}) ->
+                      map_key_binary(K) =/= undefined andalso
+                      is_convertible_deep(V)
+              end, M);
+is_convertible_deep({list, L}) ->
+    lists:all(fun is_convertible_deep/1, L);
+is_convertible_deep({array, _T, L}) ->
+    lists:all(fun is_convertible_deep/1, L);
+is_convertible_deep(_) ->
+    true.
 
 to_091(Key, {utf8, V}) -> {Key, longstr, V};
 to_091(Key, {symbol, V}) -> {Key, longstr, V};
@@ -752,27 +773,43 @@ to_091(Key, null) -> {Key, void, undefined};
 to_091(Key, {list, L}) ->
     to_091_array(Key, L);
 to_091(Key, {map, M}) ->
-    T = lists:filtermap(fun({K, V}) when element(1, K) =:= as_is orelse
-                                         element(1, V) =:= as_is ->
-                                false;
-                           ({K, V}) ->
-                                {true, to_091(unwrap(K), V)}
-                        end, M),
-    {Key, table, T};
+    {Key, table, to_091_map_fields(M)};
 to_091(Key, {array, _T, L}) ->
     to_091_array(Key, L).
 
 to_091_array(Key, L) ->
-    A = lists:filtermap(fun({as_is, _, _}) ->
-                                false;
-                           (V) ->
-                                {true, to_091(V)}
-                        end, L),
-    {Key, array, A}.
+    {Key, array, to_091_array_elements(L)}.
+
+to_091_array_elements(L) ->
+    lists:filtermap(fun(V) when ?IS_UNCONVERTIBLE(V) ->
+                             false;
+                        (V) ->
+                             {true, to_091(V)}
+                     end, L).
+
+to_091_map_fields(M) ->
+    lists:filtermap(fun({_K, V}) when ?IS_UNCONVERTIBLE(V) ->
+                             false;
+                        ({K, V}) ->
+                             case map_key_binary(K) of
+                                 K1 when is_binary(K1) ->
+                                     {true, to_091(K1, V)};
+                                 undefined ->
+                                     false
+                             end
+                     end, M).
+
+map_key_binary({Type, K1})
+  when (Type =:= utf8 orelse Type =:= symbol),
+       is_binary(K1), ?IS_SHORTSTR_LEN(K1) ->
+    K1;
+map_key_binary(_) ->
+    undefined.
 
 to_091({utf8, V}) -> {longstr, V};
 to_091({symbol, V}) -> {longstr, V};
 to_091({long, V}) -> {long, V};
+to_091({ulong, V}) -> {long, V}; %% TODO: we could try to constrain this
 to_091({byte, V}) -> {byte, V};
 to_091({ubyte, V}) -> {unsignedbyte, V};
 to_091({short, V}) -> {short, V};
@@ -789,9 +826,11 @@ to_091(false) -> {bool, false};
 to_091(undefined) -> {void, undefined};
 to_091(null) -> {void, undefined};
 to_091({list, L}) ->
-    {array, [to_091(V) || V <- L]};
+    {array, to_091_array_elements(L)};
 to_091({map, M}) ->
-    {table, [to_091(unwrap(K), V) || {K, V} <- M]}.
+    {table, to_091_map_fields(M)};
+to_091({array, _T, L}) ->
+    {array, to_091_array_elements(L)}.
 
 message_id({uuid, UUID}, _HKey, H0) ->
     {H0, mc_util:uuid_to_urn_string(UUID)};
@@ -807,6 +846,8 @@ message_id({utf8, S}, HKey, H0) ->
             {[{HKey, longstr, S} | H0], undefined}
     end;
 message_id(undefined, _HKey, H) ->
+    {H, undefined};
+message_id(_Other, _HKey, H) ->
     {H, undefined}.
 
 essential_properties(#content{} = C) ->
@@ -814,7 +855,12 @@ essential_properties(#content{} = C) ->
                priority = Priority,
                timestamp = TimestampRaw,
                headers = Headers} = Props = C#content.properties,
-    {ok, MsgTTL} = rabbit_basic:parse_expiration(Props),
+    TTL = case rabbit_basic:parse_expiration(Props) of
+              {ok, Exp} ->
+                  Exp;
+              {error, _} ->
+                  undefined
+          end,
     Timestamp = case TimestampRaw of
                     undefined ->
                         undefined;
@@ -832,7 +878,7 @@ essential_properties(#content{} = C) ->
     maps_put_truthy(
       ?ANN_PRIORITY, Priority,
       maps_put_truthy(
-        ttl, MsgTTL,
+        ttl, TTL,
         maps_put_truthy(
           ?ANN_TIMESTAMP, Timestamp,
           maps_put_falsy(
@@ -853,14 +899,30 @@ is_internal_header(<<"x-death">>) ->
 is_internal_header(_) ->
     false.
 
-amqp10_section_header(Header, Headers) ->
-    case lists:keyfind(Header, 1, Headers) of
-        {_, _, Data} when is_binary(Data) ->
-            [Section] = amqp10_framing:decode_bin(Data),
-            Section ;
-        _ ->
-            undefined
+amqp10_body_sections(Payload) ->
+    try amqp10_framing:decode_bin(iolist_to_binary(Payload)) of
+        Sections ->
+            case is_body_sections(Sections) of
+                true ->
+                    Sections;
+                false ->
+                    [#'v1_0.data'{content = Payload}]
+            end
+    catch _:_ ->
+              [#'v1_0.data'{content = Payload}]
     end.
+
+is_body_sections([Section | Rest]) when ?IS_BODY_SECTION(Section) ->
+    is_body_sections_tail(Rest);
+is_body_sections(_) ->
+    false.
+
+is_body_sections_tail([]) ->
+    true;
+is_body_sections_tail([#'v1_0.footer'{}]) ->
+    true;
+is_body_sections_tail(Sections) ->
+    is_body_sections(Sections).
 
 amqp_encoded_binary(Section) ->
     iolist_to_binary(amqp10_framing:encode_bin(Section)).

@@ -6,7 +6,6 @@
 %%
 
 -module(rabbit_queue_type).
--feature(maybe_expr, enable).
 
 -behaviour(rabbit_registry_class).
 
@@ -53,6 +52,7 @@
          deliver/4,
          settle/5,
          credit/6,
+         assign_deferred/4,
          dequeue/5,
          fold_state/3,
          is_policy_applicable/2,
@@ -79,7 +79,8 @@
          added_to_rabbit_registry/2,
          removed_from_rabbit_registry/1,
          known_queue_type_names/0,
-         known_queue_type_modules/0
+         known_queue_type_modules/0,
+         validate_default_queue_type/1
         ]).
 
 -type queue_name() :: rabbit_amqqueue:name().
@@ -107,6 +108,7 @@
     %% fully to the queue
     {settled, queue_name(), [correlation()]} |
     {rejected, queue_name(), reject_reason(), [correlation()]} |
+    {queue_deleted, queue_name()} |
     {deliver, rabbit_types:ctag(), boolean(), [rabbit_amqqueue:qmsg()]} |
     {block | unblock, QueueName :: term()} |
     credit_reply_action().
@@ -147,6 +149,7 @@
                          user := rabbit_types:username()}.
 
 -type delivery_options() :: #{correlation => correlation(),
+                              report_deleted_queues => boolean(),
                               atom() => term()}.
 
 -type settle_op() :: complete |
@@ -248,6 +251,17 @@
                  Drain :: boolean(), queue_state()) ->
     {queue_state(), actions()}.
 
+-optional_callbacks([assign_deferred/4]).
+
+%% Claim, for a consumer, the messages that were deferred (via
+%% x-opt-deferral-token) under the given tokens. Only supported by quorum
+%% queues. The call is fire-and-forget and says nothing about link credit:
+%% claimed messages arrive as normal deliveries, ahead of the ready backlog,
+%% as the consumer's credit allows.
+-callback assign_deferred(queue_name(), rabbit_types:ctag(), Tokens :: [binary()],
+                          queue_state()) ->
+    {queue_state(), actions()}.
+
 -callback dequeue(amqqueue:amqqueue(), NoAck :: boolean(), LimiterPid :: pid(),
                   rabbit_types:ctag(),
                   Timeout :: non_neg_integer() | infinity | undefined,
@@ -312,11 +326,19 @@
 -spec discover(binary() | atom()) -> queue_type().
 discover(<<"undefined">>) ->
     fallback();
+discover(<<>>) ->
+    fallback();
 discover(undefined) ->
     fallback();
 discover(TypeDescriptor) ->
-    {ok, TypeModule} = rabbit_registry:lookup_type_module(queue, TypeDescriptor),
-    TypeModule.
+    case rabbit_registry:lookup_type_module(queue, TypeDescriptor) of
+        {ok, TypeModule} ->
+            TypeModule;
+        {error, not_found} ->
+            rabbit_misc:protocol_error(
+              precondition_failed, "unknown queue type '~ts'",
+              [rabbit_data_coercion:to_binary(TypeDescriptor)])
+    end.
 
 -spec short_alias_of(TypeDescriptor) -> Ret when
       TypeDescriptor :: {utf8, binary()} | atom() | binary(),
@@ -664,9 +686,34 @@ deliver(Qs, Message, Options, State) ->
     try
         deliver0(Qs, Message, Options, State)
     catch
+        %% A queue was deleted before it could be delivered to.
+        %% See rabbitmq/rabbitmq-server#17645 for one such example.
+        %%
+        %% Only `get_ctx_with/3' raises this, before `deliver0/4' calls any
+        %% queue type's `deliver/3', so the retry cannot duplicate a delivery.
+        exit:{target_queue_not_found, QName} ->
+            case deliver(without_queue(QName, Qs), Message, Options, State) of
+                {ok, State1, Actions} ->
+                    {ok, State1, deleted_queue_actions(QName, Options) ++ Actions};
+                Err ->
+                    Err
+            end;
         exit:Reason ->
             {error, Reason}
     end.
+
+without_queue(QName, Qs) ->
+    lists:filter(fun(Elem) ->
+                         {Q, _BKeys} = queue_binding_keys(Elem),
+                         amqqueue:get_name(Q) =/= QName
+                 end, Qs).
+
+deleted_queue_actions(QName, #{report_deleted_queues := true}) ->
+    [{queue_deleted, QName}];
+deleted_queue_actions(QName, #{correlation := Corr}) ->
+    [{settled, QName, [Corr]}];
+deleted_queue_actions(_QName, _Options) ->
+    [].
 
 deliver0(Qs, Message0, Options, stateless) ->
     ByTypeAndBindingKeys =
@@ -762,6 +809,22 @@ credit(QName, CTag, DeliveryCount, Credit, Drain, Ctxs) ->
                                   Drain, State0),
     {ok, set_ctx(QName, Ctx#ctx{state = State}, Ctxs), Actions}.
 
+-spec assign_deferred(queue_name(), rabbit_types:ctag(), [binary()], state()) ->
+    {ok, state(), actions()}.
+assign_deferred(QName, CTag, Tokens, Ctxs) ->
+    case get_ctx(QName, Ctxs, undefined) of
+        undefined ->
+            {ok, Ctxs, []};
+        #ctx{state = State0, module = Mod} = Ctx ->
+            case erlang:function_exported(Mod, assign_deferred, 4) of
+                true ->
+                    {State, Actions} = Mod:assign_deferred(QName, CTag, Tokens, State0),
+                    {ok, set_ctx(QName, Ctx#ctx{state = State}, Ctxs), Actions};
+                false ->
+                    {ok, Ctxs, []}
+            end
+    end.
+
 -spec dequeue(amqqueue:amqqueue(), boolean(),
               pid(), rabbit_types:ctag(), state()) ->
     {ok, non_neg_integer(), term(), state()}  |
@@ -816,6 +879,8 @@ get_ctx_with(Q, #?STATE{ctxs = Contexts}, InitState) ->
                 #ctx{module = Mod,
                      state = QState}
             else
+                {error, not_found} ->
+                    exit({target_queue_not_found, Ref});
                 {error, Reason} ->
                     exit({Reason, Ref})
             end;
@@ -858,6 +923,38 @@ known_queue_type_names() ->
     {QueueTypes, _} = lists:unzip(Registered),
     lists:map(fun(X) -> atom_to_binary(X) end, QueueTypes).
 
+-spec validate_default_queue_type(Value) -> Ret when
+      Value :: any(),
+      Ret :: ok | {error, binary()}.
+validate_default_queue_type(undefined) -> ok;
+validate_default_queue_type(null) -> ok;
+validate_default_queue_type(nil) -> ok;
+validate_default_queue_type(<<"undefined">>) -> ok;
+validate_default_queue_type(<<>>) ->
+    {error, <<"default_queue_type must not be an empty string">>};
+validate_default_queue_type(Value) when is_binary(Value); is_atom(Value) ->
+    ValBin = rabbit_data_coercion:to_binary(Value),
+    try discover(Value) of
+        QueueType when is_atom(QueueType) ->
+            case is_enabled(QueueType) of
+                true ->
+                    ok;
+                false ->
+                    Msg = rabbit_data_coercion:to_binary(
+                            rabbit_misc:format(
+                              "queue type ~ts is not enabled", [ValBin])),
+                    {error, Msg}
+            end
+    catch _:_ ->
+              Msg = rabbit_data_coercion:to_binary(
+                      rabbit_misc:format("~ts is not a valid queue type", [ValBin])),
+              {error, Msg}
+    end;
+validate_default_queue_type(Other) ->
+    Msg = rabbit_data_coercion:to_binary(
+            rabbit_misc:format("~tp is not a valid default_queue_type value", [Other])),
+    {error, Msg}.
+
 inject_dqt(VHost) when ?is_vhost(VHost) ->
     inject_dqt(vhost:to_map(VHost));
 inject_dqt(VHost) when is_list(VHost) ->
@@ -871,6 +968,7 @@ inject_dqt(M) when is_map(M) ->
         nil -> default();
         <<"undefined">> -> default();
         "undefined" -> default();
+        <<>> -> default();
         Valid -> Valid
     end,
     NQT = short_alias_of(DQT),
@@ -911,15 +1009,24 @@ get_consumer_timeout(#{timeout := Timeout}, _Q)
     Timeout;
 get_consumer_timeout(_, Q) ->
     case rabbit_queue_type_util:args_policy_lookup(<<"consumer-timeout">>,
-                                                   fun (X, Y) ->
-                                                           erlang:min(X, Y)
-                                                   end, Q) of
+                                                   fun erlang:min/2, Q) of
         undefined ->
-            %% strict assertion, it is not valid to unset the consumer_timeout
-            %% environment variable or set it to an invalid value
-            {ok, MS} = application:get_env(rabbit, consumer_timeout),
-            true = is_integer(MS),
-            MS;
+            case application:get_env(rabbit, consumer_timeout) of
+                {ok, MS} when is_integer(MS) ->
+                    MS;
+                {ok, Other} ->
+                    %% Non-integer values (e.g. undefined) are not valid.
+                    %% Default to 24 hours.
+                    ?LOG_WARNING("consumer_timeout is set to an invalid value: ~tp, "
+                                 "defaulting to 86400000ms (24 hours)",
+                                 [Other]),
+                    86_400_000;
+                undefined ->
+                    %% The application default in rabbit.app is 1800000, so this
+                    %% branch is unreachable in practice unless explicitly configured.
+                    %% Default to 24 hours
+                    86_400_000
+            end;
         Val when is_integer(Val) ->
             Val
     end.
@@ -999,7 +1106,7 @@ queue_vm_ets() ->
                 end,
                 {[], []}, rabbit_registry:lookup_all(queue)).
 
-table_lookup(Tbl, Key, Default) 
+table_lookup(Tbl, Key, Default)
   when is_list(Tbl) andalso
        is_binary(Key) ->
     case rabbit_misc:table_lookup(Tbl, Key) of

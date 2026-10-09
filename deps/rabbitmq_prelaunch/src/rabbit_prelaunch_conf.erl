@@ -9,16 +9,12 @@
 -export([setup/1,
          get_config_state/0,
          generate_config_from_cuttlefish_files/3,
+         find_cuttlefish_schemas/1,
          decrypt_config/1]).
 
 %% Only used in tests.
 -export([decrypt_config/2]).
 
-%% These can be removed when we only support OTP-26+.
--ignore_xref([{user_drv, whereis_group, 0},
-              {group, interfaces, 1},
-              {user_drv, interfaces, 1}]).
--dialyzer({nowarn_function, [get_input_iodevice/0]}).
 
 setup(Context) ->
     ?LOG_DEBUG(
@@ -126,12 +122,7 @@ set_default_config() ->
                 {schedule_ms_limit, 0},
                 {heap_word_limit, 0},
                 {busy_port, false},
-                {busy_dist_port, true}]},
-              {mnesia,
-               [
-                {dump_log_write_threshold, 5000},
-                {dump_log_time_threshold, 90000}
-               ]}
+                {busy_dist_port, true}]}
               | OsirisConfig
              ],
     %% Don't apply any defaults for values already set in the init flags.
@@ -401,9 +392,13 @@ do_list_schemas_in_app(App, SchemaDir) ->
         {ok, Files} ->
             ?LOG_DEBUG("  [x] ~ts", [App],
                        #{domain => ?RMQLOG_DOMAIN_PRELAUNCH}),
+            %% Match `.schema` exactly so cuttlefish 3.8.0+ partial files
+            %% (`.partial`) and other sidecars (editor swapfiles, OS
+            %% metadata) stay out of `cuttlefish_schema:files/1`.
             [filename:join(SchemaDir, File)
              || [C | _] = File <- Files,
-                C =/= $.];
+                C =/= $.,
+                filename:extension(File) =:= ".schema"];
         error ->
             ?LOG_DEBUG(
               "  [ ] ~ts (no readable schema dir)", [App],
@@ -447,36 +442,10 @@ apply_erlang_term_based_config([]) ->
     ok.
 
 apply_app_env_vars(App, [{Var, Value} | Rest]) ->
-    log_app_env_var(Var, Value),
     ok = application:set_env(App, Var, Value, [{persistent, true}]),
     apply_app_env_vars(App, Rest);
 apply_app_env_vars(_, []) ->
     ok.
-
-log_app_env_var(password = Var, _) ->
-    ?LOG_DEBUG("    - ~ts = ********", [Var],
-               #{domain => ?RMQLOG_DOMAIN_PRELAUNCH});
-log_app_env_var(Var, Value) when is_list(Value) ->
-    %% To redact sensitive entries,
-    %% e.g. {password,"********"} for stream replication over TLS
-    Redacted = redact_env_var(Value),
-    ?LOG_DEBUG("    - ~ts = ~tp", [Var, Redacted],
-               #{domain => ?RMQLOG_DOMAIN_PRELAUNCH});
-log_app_env_var(Var, Value) ->
-    ?LOG_DEBUG("    - ~ts = ~tp", [Var, Value],
-               #{domain => ?RMQLOG_DOMAIN_PRELAUNCH}).
-
-redact_env_var(Value) when is_list(Value) ->
-    redact_env_var(Value, []);
-redact_env_var(Value) ->
-    Value.
-
-redact_env_var([], Acc) ->
-    lists:reverse(Acc);
-redact_env_var([{password, _Value} | Rest], Acc) ->
-    redact_env_var(Rest, Acc ++ [{password, "********"}]);
-redact_env_var([AppVar | Rest], Acc) ->
-    redact_env_var(Rest, [AppVar | Acc]).
 
 %% -------------------------------------------------------------------
 %% Config decryption.
@@ -598,28 +567,9 @@ get_passphrase(ConfigEntryDecoder) ->
 %% This function will not work when either -oldshell or -noinput
 %% options are passed to erl.
 get_input_iodevice() ->
-    case erlang:function_exported(user_drv, whereis_group, 0) of
-        true ->
-            case user_drv:whereis_group() of
-                undefined -> user;
-                IoDevice -> IoDevice
-            end;
-        %% Necessary for OTP versions before OTP-26.
-        false ->
-            case whereis(user) of
-                undefined ->
-                    user;
-                User ->
-                    case group:interfaces(User) of
-                        [] ->
-                            user;
-                        [{user_drv, Drv}] ->
-                            case user_drv:interfaces(Drv) of
-                                []                          -> user;
-                                [{current_group, IoDevice}] -> IoDevice
-                            end
-                    end
-            end
+    case user_drv:whereis_group() of
+        undefined -> user;
+        IoDevice  -> IoDevice
     end.
 
 disable_kernel_overlapping_partitions() ->

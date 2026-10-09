@@ -34,15 +34,24 @@
 -import(rabbit_ct_helpers, [await_condition/1]).
 
 -define(WAIT, 5000).
+-define(SUB_ENTRY_BATCH_VALIDATION_MAX, 200).
+%% Below ?DEFAULT_INITIAL_FRAME_MAX, so a frame the default ceiling
+%% would accept is rejected once this setting is applied.
+-define(CUSTOM_INITIAL_FRAME_MAX, 4096).
 
 all() ->
-    [{group, single_node}, {group, single_node_1}, {group, cluster}].
+    [{group, single_node}, {group, single_node_1},
+     {group, single_node_initial_frame_max}, {group, cluster}].
 
 groups() ->
     [{single_node, [],
       [test_stream,
        test_stream_tls,
        test_publish_v2,
+       sub_entry_batch_validation,
+       sub_entry_batch_validation_fail_fast_partial_write,
+       credit_accounting_after_sub_entry_batch_rejection,
+       publish_v2_no_filter_value_to_unknown_publisher,
        test_super_stream_creation_deletion,
        test_gc_consumers,
        test_gc_publishers,
@@ -62,9 +71,14 @@ groups() ->
        close_connection_on_consumer_update_timeout,
        set_filter_size,
        vhost_queue_limit,
+       vhost_connection_limit,
+       user_connection_limit,
+       node_connection_limit,
        connection_should_be_closed_on_token_expiry,
        should_receive_metadata_update_after_update_secret,
        store_offset_requires_read_access,
+       metadata_requires_read_or_write_access,
+       route_partitions_require_read_or_write_access,
        offset_lag_calculation,
        test_super_stream_duplicate_partitions,
        authentication_error_should_close_with_delay,
@@ -72,8 +86,11 @@ groups() ->
        sasl_anonymous,
        test_publisher_with_too_long_reference_errors,
        test_consumer_with_too_long_reference_errors,
+       declare_publisher_max_reached,
+       subscribe_max_reached,
        subscribe_unsubscribe_should_create_events,
        oversized_frame_rejected_pre_auth,
+       oversized_frame_rejected_pre_auth_below_configured_ceiling,
        oversized_frame_rejected_post_auth,
        oversized_frame_rejected_after_tune_negotiation,
        frame_max_clamped_when_client_negotiates_higher,
@@ -82,13 +99,16 @@ groups() ->
        sac_subscription_with_partition_index_conflict_should_return_error,
        test_metadata_with_advertised_hints,
        test_connection_properties_with_advertised_hints,
+       test_advertised_endpoint,
        test_resolve_offset_spec
       ]},
      %% Run `test_global_counters` on its own so the global metrics are
      %% initialised to 0 for each testcase
      {single_node_1, [], [test_global_counters]},
+     {single_node_initial_frame_max, [],
+      [oversized_frame_rejected_pre_auth_custom_initial_frame_max]},
      {cluster, [], [test_stream, test_stream_tls, test_metadata, java,
-                    test_resolve_offset_spec]}].
+                    test_resolve_offset_spec, node_endpoints_fallback]}].
 
 init_per_suite(Config) ->
     case rabbit_ct_helpers:is_mixed_versions() of
@@ -140,6 +160,21 @@ init_per_group(Group, Config)
                                                   500}]})
        end]
       ++ ExtraSetupSteps
+      ++ rabbit_ct_broker_helpers:setup_steps());
+init_per_group(single_node_initial_frame_max, Config) ->
+    Config1 = rabbit_ct_helpers:set_config(
+                Config, [{rmq_nodes_clustered, false},
+                         {rabbitmq_ct_tls_verify, verify_none},
+                         {rabbitmq_stream, verify_none}
+                        ]),
+    rabbit_ct_helpers:run_setup_steps(
+      Config1,
+      [fun(StepConfig) ->
+               rabbit_ct_helpers:merge_app_env(StepConfig,
+                                               {rabbitmq_stream,
+                                                [{initial_frame_max,
+                                                  ?CUSTOM_INITIAL_FRAME_MAX}]})
+       end]
       ++ rabbit_ct_broker_helpers:setup_steps());
 init_per_group(cluster = Group, Config) ->
     Config1 = rabbit_ct_helpers:set_config(
@@ -197,13 +232,43 @@ init_per_testcase(vhost_queue_limit = TestCase, Config) ->
     ok = rabbit_ct_broker_helpers:set_vhost_limit(Config, 0, <<"/">>, max_queues, QueueCount + 5),
     rabbit_ct_helpers:testcase_started(Config, TestCase);
 
+init_per_testcase(vhost_connection_limit = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:set_vhost_limit(Config, 0, <<"/">>, max_connections, 2),
+    rabbit_ct_helpers:testcase_started(Config, TestCase);
+
+init_per_testcase(user_connection_limit = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:set_user_limits(Config, <<"guest">>, #{max_connections => 1}),
+    rabbit_ct_helpers:testcase_started(Config, TestCase);
+
+init_per_testcase(node_connection_limit = TestCase, Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env, [rabbitmq_stream, max_connections, 0]),
+    rabbit_ct_helpers:testcase_started(Config, TestCase);
+
 init_per_testcase(store_offset_requires_read_access = TestCase, Config) ->
+  ok = rabbit_ct_broker_helpers:add_user(Config, <<"test">>),
+  rabbit_ct_helpers:testcase_started(Config, TestCase);
+
+init_per_testcase(metadata_requires_read_or_write_access = TestCase, Config) ->
+  ok = rabbit_ct_broker_helpers:add_user(Config, <<"test">>),
+  rabbit_ct_helpers:testcase_started(Config, TestCase);
+
+init_per_testcase(route_partitions_require_read_or_write_access = TestCase, Config) ->
   ok = rabbit_ct_broker_helpers:add_user(Config, <<"test">>),
   rabbit_ct_helpers:testcase_started(Config, TestCase);
 
 init_per_testcase(unauthorized_vhost_access_should_close_with_delay = TestCase, Config) ->
   ok = rabbit_ct_broker_helpers:add_user(Config, <<"other">>),
   rabbit_ct_helpers:testcase_started(Config, TestCase);
+
+init_per_testcase(sub_entry_batch_validation = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config,
+                                      0,
+                                      application,
+                                      set_env,
+                                      [rabbitmq_stream,
+                                       max_uncompressed_sub_entry_batch_size,
+                                       ?SUB_ENTRY_BATCH_VALIDATION_MAX]),
+    rabbit_ct_helpers:testcase_started(Config, TestCase);
 
 init_per_testcase(TestCase, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TestCase).
@@ -235,7 +300,23 @@ end_per_testcase(vhost_queue_limit = TestCase, Config) ->
                                      clear,
                                      [<<"/">>, <<"guest">>]),
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
+
+end_per_testcase(vhost_connection_limit = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:clear_vhost_limit(Config, 0, <<"/">>),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(user_connection_limit = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:clear_user_limits(Config, <<"guest">>, max_connections),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(node_connection_limit = TestCase, Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env, [rabbitmq_stream, max_connections, infinity]),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(store_offset_requires_read_access = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:delete_user(Config, <<"test">>),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(metadata_requires_read_or_write_access = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:delete_user(Config, <<"test">>),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(route_partitions_require_read_or_write_access = TestCase, Config) ->
     ok = rabbit_ct_broker_helpers:delete_user(Config, <<"test">>),
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(unauthorized_vhost_access_should_close_with_delay = TestCase, Config) ->
@@ -243,7 +324,8 @@ end_per_testcase(unauthorized_vhost_access_should_close_with_delay = TestCase, C
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(TestCase, Config)
   when TestCase =:= test_metadata_with_advertised_hints orelse
-       TestCase =:= test_connection_properties_with_advertised_hints ->
+       TestCase =:= test_connection_properties_with_advertised_hints orelse
+       TestCase =:= test_advertised_endpoint ->
     lists:foreach(fun(K) ->
                           ok = rpc(Config, 0,
                                    application,
@@ -252,6 +334,16 @@ end_per_testcase(TestCase, Config)
                   end, [?K_AD_HOST, ?K_AD_PORT,
                         ?K_AD_TLS_HOST, ?K_AD_TLS_PORT]),
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(sub_entry_batch_validation = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config,
+                                      0,
+                                      application,
+                                      set_env,
+                                      [rabbitmq_stream,
+                                       max_uncompressed_sub_entry_batch_size,
+                                       67_108_864]),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
+
 end_per_testcase(TestCase, Config) ->
     rabbit_ct_helpers:testcase_finished(Config, TestCase).
 
@@ -392,6 +484,208 @@ test_publish_v2(Config) ->
     closed = wait_for_socket_close(Transport, S, 10),
     ok.
 
+%% Covers the checks in rabbit_stream_utils:write_messages/8 for compressed
+%% sub-entry batches, and that the configured limit takes effect.
+sub_entry_batch_validation(Config) ->
+    Stream = atom_to_binary(?FUNCTION_NAME, utf8),
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = test_authenticate(Transport, S, C1),
+    C3 = test_create_stream(Transport, S, Stream, C2),
+    PublisherId = 1,
+    C4 = test_declare_publisher(Transport, S, PublisherId, Stream, C3),
+
+    Max = ?SUB_ENTRY_BATCH_VALIDATION_MAX,
+    #{stream_error_precondition_failed_total := PreconditionFailedBefore} =
+        get_global_counters(Config),
+
+    %% declared size at the limit: accepted
+    C5 = publish_sub_batch_expect(Transport, S, PublisherId, 1,
+                                  sub_batch(1, 1, 1, Max, <<"compressed">>),
+                                  publish_confirm, C4),
+    %% declared size just above the limit: rejected
+    C6 = publish_sub_batch_expect(Transport, S, PublisherId, 2,
+                                  sub_batch(2, 1, 1, Max + 1, <<"compressed">>),
+                                  publish_error, C5),
+    %% no records declared: rejected
+    C7 = publish_sub_batch_expect(Transport, S, PublisherId, 3,
+                                  sub_batch(3, 1, 0, 40, <<"compressed">>),
+                                  publish_error, C6),
+    %% more records than the uncompressed size can hold: rejected
+    C8 = publish_sub_batch_expect(Transport, S, PublisherId, 4,
+                                  sub_batch(4, 1, 100, 10, <<"compressed">>),
+                                  publish_error, C7),
+    %% unknown compression type: rejected
+    C9 = publish_sub_batch_expect(Transport, S, PublisherId, 5,
+                                  sub_batch(5, 5, 1, 40, <<"compressed">>),
+                                  publish_error, C8),
+    %% empty payload declaring uncompressed bytes: rejected
+    C10 = publish_sub_batch_expect(Transport, S, PublisherId, 6,
+                                   sub_batch(6, 1, 1, 40, <<>>),
+                                   publish_error, C9),
+    %% no ratio limit: a high compression ratio within the size limit is accepted
+    C11 = publish_sub_batch_expect(Transport, S, PublisherId, 7,
+                                   sub_batch(7, 4, Max div 4, Max, <<"tiny">>),
+                                   publish_confirm, C10),
+
+    ExpectedPreconditionFailed = PreconditionFailedBefore + 5,
+    ?awaitMatch(#{stream_error_precondition_failed_total := ExpectedPreconditionFailed},
+               get_global_counters(Config), ?WAIT),
+
+    C12 = test_delete_stream(Transport, S, Stream, C11),
+    _C13 = test_close(Transport, S, C12),
+    closed = wait_for_socket_close(Transport, S, 10),
+    ok.
+
+%% once a sub-entry batch fails validation, the rest of the publish frame
+%% is rejected as well, instead of validating and writing the remaining
+%% entries independently. This avoids a gap in the publishing ID sequence.
+sub_entry_batch_validation_fail_fast_partial_write(Config) ->
+    Stream = atom_to_binary(?FUNCTION_NAME, utf8),
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = test_authenticate(Transport, S, C1),
+    C3 = test_create_stream(Transport, S, Stream, C2),
+    PublisherId = 1,
+    C4 = test_declare_publisher(Transport, S, PublisherId, Stream, C3),
+
+    Body = <<"hello">>,
+    BodySize = byte_size(Body),
+    Valid1 = <<1:64, 0:1, BodySize:31, Body:BodySize/binary>>,
+    Invalid = sub_batch(2, 1, 1, 67_108_865, <<"compressed">>),
+    Valid2 = <<3:64, 0:1, BodySize:31, Body:BodySize/binary>>,
+
+    PublishFrame = frame({publish, PublisherId, 3, [Valid1, Invalid, Valid2]}),
+    ok = Transport:send(S, PublishFrame),
+
+    {Cmd1, C5} = receive_commands(Transport, S, C4),
+    ?assertMatch({publish_error, PublisherId,
+                 ?RESPONSE_CODE_PRECONDITION_FAILED, [2, 3]}, Cmd1),
+
+    {Cmd2, C6} = receive_commands(Transport, S, C5),
+    ?assertMatch({publish_confirm, PublisherId, [1]}, Cmd2),
+
+    C7 = test_delete_stream(Transport, S, Stream, C6),
+    _C8 = test_close(Transport, S, C7),
+    closed = wait_for_socket_close(Transport, S, 10),
+    ok.
+
+%% Credits must be debited only for entries that are
+%% actually written, not for the whole frame's declared MessageCount.
+%% Credits are returned by osiris_written events, one per entry actually
+%% written; a rejected entry never generates one, so debiting for it too
+%% would permanently leak credit and eventually block the connection.
+%%
+%% A single oversized frame, entirely rejected (the first invalid entry
+%% rejects the rest too), exceeds the default initial_credits (50000) if
+%% every entry were wrongly debited -- that would block the connection and
+%% the follow-up request below would time out.
+credit_accounting_after_sub_entry_batch_rejection(Config) ->
+    Stream = atom_to_binary(?FUNCTION_NAME, utf8),
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = test_authenticate(Transport, S, C1),
+    C3 = test_create_stream(Transport, S, Stream, C2),
+    PublisherId = 1,
+    C4 = test_declare_publisher(Transport, S, PublisherId, Stream, C3),
+
+    Invalid = sub_batch(0, 0, 0, 0, <<>>),
+    FillerCount = 50_000,
+    Filler = binary:copy(<<0:64, 0:1, 0:31>>, FillerCount),
+    MessageCount = 1 + FillerCount,
+    PublishFrame = frame({publish, PublisherId, MessageCount, [Invalid, Filler]}),
+    ok = Transport:send(S, PublishFrame),
+
+    %% the response itself is a large frame (one 8-byte ID per rejected
+    %% entry): the shared receive_commands/3 helper only retries 10 times
+    %% waiting for a full frame, which is not always enough here
+    {Cmd, C5} = receive_large_command(Transport, S, C4),
+    {publish_error, PublisherId, RespCode, RejectedIds} = Cmd,
+    ?assertEqual(?RESPONSE_CODE_PRECONDITION_FAILED, RespCode),
+    ?assertEqual(MessageCount, length(RejectedIds)),
+
+    C6 = test_declare_publisher(Transport, S, 2, Stream, C5),
+
+    C7 = test_delete_stream(Transport, S, Stream, C6),
+    _C8 = test_close(Transport, S, C7),
+    closed = wait_for_socket_close(Transport, S, 10),
+    ok.
+
+%% A publish_v2 frame with no filter value, addressed to an
+%% unknown publisher ID, used to crash the reader (function_clause) instead
+%% of returning a publish_error.
+publish_v2_no_filter_value_to_unknown_publisher(Config) ->
+    Stream = atom_to_binary(?FUNCTION_NAME, utf8),
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    Opts = [{active, false}, {mode, binary}],
+    {ok, S} = Transport:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(Transport, S, C0),
+    C2 = test_authenticate(Transport, S, C1),
+
+    UnknownPublisherId = 99,
+    Body = <<"hello">>,
+    BodySize = byte_size(Body),
+    Messages = [<<1:64, -1:16/signed, 0:1, BodySize:31, Body:BodySize/binary>>],
+    PublishFrame = frame({publish_v2, UnknownPublisherId, 1, Messages}),
+    ok = Transport:send(S, PublishFrame),
+
+    {Cmd, C3} = receive_commands(Transport, S, C2),
+    ?assertMatch({publish_error, UnknownPublisherId,
+                 ?RESPONSE_CODE_PUBLISHER_DOES_NOT_EXIST, [1]}, Cmd),
+
+    %% the connection is still alive: a subsequent request gets a normal response
+    C4 = test_create_stream(Transport, S, Stream, C3),
+    C5 = test_delete_stream(Transport, S, Stream, C4, false),
+    _C6 = test_close(Transport, S, C5),
+    closed = wait_for_socket_close(Transport, S, 10),
+    ok.
+
+publish_sub_batch_expect(Transport, S, PublisherId, Sequence, Entry, ExpectedCommand, C0) ->
+    PublishFrame = frame({publish, PublisherId, 1, [Entry]}),
+    ok = Transport:send(S, PublishFrame),
+    {Cmd, C} = receive_commands(Transport, S, C0),
+    case ExpectedCommand of
+        publish_confirm ->
+            ?assertMatch({publish_confirm, PublisherId, [Sequence]}, Cmd);
+        publish_error ->
+            ?assertMatch({publish_error, PublisherId,
+                         ?RESPONSE_CODE_PRECONDITION_FAILED, [Sequence]}, Cmd)
+    end,
+    C.
+
+sub_batch(PublishingId, CompressionType, MessageCount, UncompressedSize, Batch) ->
+    BatchSize = byte_size(Batch),
+    <<PublishingId:64, 1:1, CompressionType:3, 0:4, MessageCount:16,
+      UncompressedSize:32, BatchSize:32, Batch:BatchSize/binary>>.
+
+receive_large_command(Transport, S, C0) ->
+    receive_large_command(Transport, S, C0, 1000).
+
+receive_large_command(_Transport, _S, C0, 0) ->
+    rabbit_stream_core:next_command(C0);
+receive_large_command(Transport, S, C0, N) ->
+    case rabbit_stream_core:next_command(C0) of
+        empty ->
+            {ok, Data} = Transport:recv(S, 0, 5000),
+            C1 = rabbit_stream_core:incoming_data(Data, C0),
+            receive_large_command(Transport, S, C1, N - 1);
+        Res ->
+            Res
+    end.
 
 test_super_stream_creation_deletion(Config) ->
     T = gen_tcp,
@@ -541,6 +835,30 @@ test_metadata(Config) ->
 
     ok.
 
+%% Forces the fallback path of rabbit_stream_utils:node_endpoints/3 by
+%% passing a function name no peer exports, so every node answers `undef`
+%% and is resolved through host/0, tls_host/0, port/0 and tls_port/0. This
+%% stands in for talking to a peer that predates advertised_endpoint/1,
+%% without needing a mixed-version cluster.
+node_endpoints_fallback(Config) ->
+    Nodes = [get_node_name(Config, N) || N <- lists:seq(0, 2)],
+    lists:foreach(
+      fun(Transport) ->
+              Endpoints = rpc(Config, 0, rabbit_stream_utils, node_endpoints,
+                              [Nodes, Transport]),
+              FallbackEndpoints = rpc(Config, 0, rabbit_stream_utils,
+                                      node_endpoints,
+                                      [Nodes, Transport,
+                                       no_such_endpoint_function]),
+              ?assertEqual(Endpoints, FallbackEndpoints),
+              ?assertEqual(lists:sort(Nodes), lists:sort(maps:keys(Endpoints))),
+              maps:foreach(fun(_Node, {Host, Port}) ->
+                                   ?assert(is_binary(Host)),
+                                   ?assert(is_integer(Port))
+                           end, Endpoints)
+      end, [tcp, ssl]),
+    ok.
+
 test_gc_consumers(Config) ->
     Pid = spawn(fun() -> ok end),
     rabbit_ct_broker_helpers:rpc(Config,
@@ -589,6 +907,44 @@ oversized_frame_rejected_pre_auth(Config) ->
     FrameMax = rpc(Config, 0, application, get_env,
                    [rabbitmq_stream, frame_max, ?DEFAULT_FRAME_MAX]),
     OversizedSize = FrameMax + 1000,
+    Header = <<OversizedSize:32>>,
+    ?assertEqual(ok, gen_tcp:send(S, Header)),
+    ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
+
+%% Before a successful `open`, the pre-auth ceiling governs frames, not
+%% the configured frame_max. This size sits between the two, so only the
+%% tighter ceiling rejects it.
+oversized_frame_rejected_pre_auth_below_configured_ceiling(Config) ->
+    Port = get_stream_port(Config),
+    {ok, S} = gen_tcp:connect("localhost", Port, [{active, false}, {mode, binary}]),
+    FrameMax = rpc(Config, 0, application, get_env,
+                   [rabbitmq_stream, frame_max, ?DEFAULT_FRAME_MAX]),
+    PreAuthFrameMax = rpc(Config, 0, application, get_env,
+                          [rabbitmq_stream, initial_frame_max,
+                           ?DEFAULT_INITIAL_FRAME_MAX]),
+    ?assert(PreAuthFrameMax < FrameMax),
+    OversizedSize = PreAuthFrameMax + 1000,
+    ?assert(OversizedSize < FrameMax),
+    Header = <<OversizedSize:32>>,
+    ?assertEqual(ok, gen_tcp:send(S, Header)),
+    ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
+
+%% A frame under the default ceiling but over the configured, lower
+%% `initial_frame_max` is rejected, so the setting is honoured.
+oversized_frame_rejected_pre_auth_custom_initial_frame_max(Config) ->
+    Port = get_stream_port(Config),
+    {ok, S} = gen_tcp:connect("localhost", Port, [{active, false}, {mode, binary}]),
+    FrameMax = rpc(Config, 0, application, get_env,
+                   [rabbitmq_stream, frame_max, ?DEFAULT_FRAME_MAX]),
+    PreAuthFrameMax = rpc(Config, 0, application, get_env,
+                          [rabbitmq_stream, initial_frame_max,
+                           ?DEFAULT_INITIAL_FRAME_MAX]),
+    ?assertEqual(?CUSTOM_INITIAL_FRAME_MAX, PreAuthFrameMax),
+    OversizedSize = PreAuthFrameMax + 1000,
+    %% The default ceiling would accept this size; only the configured,
+    %% lower value rejects it.
+    ?assert(OversizedSize < ?DEFAULT_INITIAL_FRAME_MAX),
+    ?assert(OversizedSize < FrameMax),
     Header = <<OversizedSize:32>>,
     ?assertEqual(ok, gen_tcp:send(S, Header)),
     ?assertEqual(closed, wait_for_socket_close(gen_tcp, S, 1)).
@@ -826,6 +1182,124 @@ set_filter_size(Config) ->
     closed = wait_for_socket_close(Transport, S, 10),
     ok.
 
+vhost_connection_limit(Config) ->
+    T = gen_tcp,
+    Port = get_port(T, Config),
+    Opts = get_opts(T),
+
+    %% First connection
+    {ok, S1} = T:connect("localhost", Port, Opts),
+    C1_0 = rabbit_stream_core:init(0),
+    C1_1 = test_peer_properties(T, S1, C1_0),
+    C1_2 = test_authenticate(T, S1, C1_1),
+
+    %% Second connection
+    {ok, S2} = T:connect("localhost", Port, Opts),
+    C2_0 = rabbit_stream_core:init(0),
+    C2_1 = test_peer_properties(T, S2, C2_0),
+    C2_2 = test_authenticate(T, S2, C2_1),
+
+    %% Wait for connection tracking to sync
+    ?awaitMatch(2, count_connections_per_vhost(Config), 30000),
+
+    %% Third connection should fail
+    {ok, S3} = T:connect("localhost", Port, Opts),
+    C3_0 = rabbit_stream_core:init(0),
+    C3_1 = test_peer_properties(T, S3, C3_0),
+    C3_2 = test_plain_sasl_authenticate(T, S3, sasl_handshake(T, S3, C3_1), <<"guest">>),
+
+    {Tune, C3_3} = receive_commands(T, S3, C3_2),
+    {tune, ?DEFAULT_FRAME_MAX, ?DEFAULT_HEARTBEAT} = Tune,
+
+    TuneFrame = rabbit_stream_core:frame({response, 0, {tune, ?DEFAULT_FRAME_MAX, 0}}),
+    ok = T:send(S3, TuneFrame),
+
+    OpenFrame = request(3, {open, <<"/">>}),
+    ok = T:send(S3, OpenFrame),
+
+    {Cmd, _C3_4} = receive_commands(T, S3, C3_3),
+    ?assertMatch({response, 3, {open, ?RESPONSE_VHOST_ACCESS_FAILURE, _}}, Cmd),
+
+    _ = test_close(T, S1, C1_2),
+    _ = test_close(T, S2, C2_2),
+    closed = wait_for_socket_close(T, S1, 10),
+    closed = wait_for_socket_close(T, S2, 10),
+    closed = wait_for_socket_close(T, S3, 10),
+    ok.
+
+user_connection_limit(Config) ->
+    T = gen_tcp,
+    Port = get_port(T, Config),
+    Opts = get_opts(T),
+
+    %% First connection
+    {ok, S1} = T:connect("localhost", Port, Opts),
+    C1_0 = rabbit_stream_core:init(0),
+    C1_1 = test_peer_properties(T, S1, C1_0),
+    C1_2 = test_authenticate(T, S1, C1_1),
+
+    %% Wait for connection tracking to sync
+    ?awaitMatch(1, count_connections_per_vhost(Config), 30000),
+
+    %% Second connection should fail
+    {ok, S2} = T:connect("localhost", Port, Opts),
+    C2_0 = rabbit_stream_core:init(0),
+    C2_1 = test_peer_properties(T, S2, C2_0),
+    C2_2 = test_plain_sasl_authenticate(T, S2, sasl_handshake(T, S2, C2_1), <<"guest">>),
+
+    %% Read tune frame from server
+    {Tune, C2_3} = receive_commands(T, S2, C2_2),
+    {tune, ?DEFAULT_FRAME_MAX, ?DEFAULT_HEARTBEAT} = Tune,
+
+    %% Manually send tune and open frames
+    TuneFrame = rabbit_stream_core:frame({response, 0, {tune, ?DEFAULT_FRAME_MAX, 0}}),
+    ok = T:send(S2, TuneFrame),
+
+    OpenFrame = request(3, {open, <<"/">>}),
+    ok = T:send(S2, OpenFrame),
+
+    {Cmd, _C2_4} = receive_commands(T, S2, C2_3),
+    ?assertMatch({response, 3, {open, ?RESPONSE_VHOST_ACCESS_FAILURE, _}}, Cmd),
+
+    _ = test_close(T, S1, C1_2),
+    closed = wait_for_socket_close(T, S1, 10),
+    closed = wait_for_socket_close(T, S2, 10),
+    ok.
+
+node_connection_limit(Config) ->
+    T = gen_tcp,
+    Port = get_port(T, Config),
+    Opts = get_opts(T),
+
+    %% First connection should fail because limit is 0
+    {ok, S1} = T:connect("localhost", Port, Opts),
+    C1_0 = rabbit_stream_core:init(0),
+    C1_1 = test_peer_properties(T, S1, C1_0),
+    C1_2 = test_plain_sasl_authenticate(T, S1, sasl_handshake(T, S1, C1_1), <<"guest">>),
+
+    %% Read tune frame from server
+    {Tune, C1_3} = receive_commands(T, S1, C1_2),
+    {tune, ?DEFAULT_FRAME_MAX, ?DEFAULT_HEARTBEAT} = Tune,
+
+    %% Manually send tune and open frames
+    TuneFrame = rabbit_stream_core:frame({response, 0, {tune, ?DEFAULT_FRAME_MAX, 0}}),
+    ok = T:send(S1, TuneFrame),
+
+    OpenFrame = request(3, {open, <<"/">>}),
+    ok = T:send(S1, OpenFrame),
+
+    {Cmd, _C1_4} = receive_commands(T, S1, C1_3),
+    ?assertMatch({response, 3, {open, ?RESPONSE_VHOST_ACCESS_FAILURE, _}}, Cmd),
+
+    closed = wait_for_socket_close(T, S1, 10),
+    ok.
+
+count_connections_per_vhost(Config)  ->
+    rabbit_ct_broker_helpers:rpc(
+      Config, 0,
+      rabbit_connection_tracking, count_local_tracked_items_in_vhost,
+      [<<"/">>]).
+
 vhost_queue_limit(Config) ->
     T = gen_tcp,
     Port = get_port(T, Config),
@@ -999,6 +1473,151 @@ store_offset_requires_read_access(Config) ->
     closed = wait_for_socket_close(T, S, 10),
     ok.
 
+metadata_requires_read_or_write_access(Config) ->
+    Username = <<"test">>,
+    rabbit_ct_broker_helpers:set_full_permissions(Config, Username, <<"/">>),
+
+    T = gen_tcp,
+    Port = get_port(T, Config),
+    Opts = get_opts(T),
+    {ok, S} = T:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(T, S, C0),
+    C2 = test_authenticate(T, S, C1, Username),
+    FunctionName = atom_to_binary(?FUNCTION_NAME, utf8),
+    Stream1 = <<FunctionName/binary, "_1">>,
+    Stream2 = <<FunctionName/binary, "_2">>,
+    C3 = test_create_stream(T, S, Stream1, C2),
+    C4 = test_create_stream(T, S, Stream2, C3),
+
+    %% both streams are accessible
+    ok = T:send(S, request({metadata, [Stream1, Stream2]})),
+    {Cmd1, C5} = receive_commands(T, S, C4),
+    ?assertMatch({response, 1, {metadata, _, #{Stream1 := {_, _}, Stream2 := {_, _}}}}, Cmd1),
+
+    %% no read/write access anymore
+    rabbit_ct_broker_helpers:set_permissions(Config, Username, <<"/">>,
+                                             <<".*">>, <<"foobar">>, <<"foobar">>),
+    %% metadata request fails because the user has no read/write access to any stream
+    ok = T:send(S, request({metadata, [Stream1, Stream2]})),
+    {Cmd2, C6} = receive_commands(T, S, C5),
+    ?assertMatch({response, 1,
+                  {metadata, _, #{Stream1 := stream_not_allowed, Stream2 := stream_not_allowed}}}, Cmd2),
+
+    %% give read access to only stream1
+    rabbit_ct_broker_helpers:set_permissions(Config, Username, <<"/">>,
+                                             <<".*">>, <<"foobar">>, Stream1),
+    %% metadata request returns topology for only the authorized stream
+    ok = T:send(S, request({metadata, [Stream1, Stream2]})),
+    {Cmd3, C7} = receive_commands(T, S, C6),
+    {response, 1, {metadata, _, MetaMap}} = Cmd3,
+    ?assertMatch(#{Stream1 := {_, _}}, MetaMap),
+    ?assertMatch(#{Stream2 := stream_not_allowed}, MetaMap),
+
+    %% give write access to only stream1
+    rabbit_ct_broker_helpers:set_permissions(Config, Username, <<"/">>,
+                                             <<".*">>, Stream1, <<"foobar">>),
+    %% metadata request returns topology for only the authorized stream
+    ok = T:send(S, request({metadata, [Stream1, Stream2]})),
+    {Cmd4, C8} = receive_commands(T, S, C7),
+    {response, 1, {metadata, _, MetaMap}} = Cmd4,
+    ?assertMatch(#{Stream1 := {_, _}}, MetaMap),
+    ?assertMatch(#{Stream2 := stream_not_allowed}, MetaMap),
+
+    %% restore full permissions to delete the streams
+    rabbit_ct_broker_helpers:set_full_permissions(Config, Username, <<"/">>),
+    C9 = test_delete_stream(T, S, Stream1, C8, false),
+    C10 = test_delete_stream(T, S, Stream2, C9, false),
+    test_close(T, S, C10),
+    closed = wait_for_socket_close(T, S, 10),
+    ok.
+
+route_partitions_require_read_or_write_access(Config) ->
+    Username = <<"test">>,
+    rabbit_ct_broker_helpers:set_full_permissions(Config, Username, <<"/">>),
+
+    T = gen_tcp,
+    Port = get_port(T, Config),
+    Opts = get_opts(T),
+    {ok, S} = T:connect("localhost", Port, Opts),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(T, S, C0),
+    C2 = test_authenticate(T, S, C1, Username),
+    Ss = atom_to_binary(?FUNCTION_NAME, utf8),
+    Partitions = [unicode:characters_to_binary([Ss, <<"-">>, integer_to_binary(N)])
+                  || N <- lists:seq(0, 2)],
+    Bks = [integer_to_binary(N) || N <- lists:seq(0, 2)],
+
+    %% create the super stream
+    ok = T:send(S, request({create_super_stream, Ss, Partitions, Bks, #{}})),
+    {Cmd1, C3} = receive_commands(T, S, C2),
+    ?assertMatch({response, 1, {create_super_stream, ?RESPONSE_CODE_OK}}, Cmd1),
+
+    %% route and partitions should succeed with full permissions
+    RouteFrame = request({route, <<"0">>, Ss}),
+    ok = T:send(S, RouteFrame),
+    {Cmd2, C4} = receive_commands(T, S, C3),
+    ?assertMatch({response, 1, {route, ?RESPONSE_CODE_OK, _}}, Cmd2),
+
+    PartitionsFrame = request({partitions, Ss}),
+    ok = T:send(S, PartitionsFrame),
+    {Cmd3, C5} = receive_commands(T, S, C4),
+    ?assertMatch({response, 1, {partitions, ?RESPONSE_CODE_OK, Partitions}}, Cmd3),
+
+    %% remove read access
+    rabbit_ct_broker_helpers:set_permissions(Config, Username, <<"/">>,
+                                             <<".*">>, <<".*">>, <<"foobar">>),
+
+    %% route should succeed, it requires write access and has it
+    %% (route is used by producers to route messages)
+    ok = T:send(S, RouteFrame),
+    {Cmd4, C6} = receive_commands(T, S, C5),
+    ?assertMatch({response, 1, {route, ?RESPONSE_CODE_OK, _}}, Cmd4),
+
+    %% partitions should succeed, it requires read or write
+    %% (partitions is used by both producers and consumers)
+    ok = T:send(S, PartitionsFrame),
+    {Cmd5, C7} = receive_commands(T, S, C6),
+    ?assertEqual({response, 1, {partitions, ?RESPONSE_CODE_OK, Partitions}}, Cmd5),
+
+    %% remove write access
+    rabbit_ct_broker_helpers:set_permissions(Config, Username, <<"/">>,
+                                             <<".*">>, <<"foobar">>, <<".*">>),
+
+    %% route should fail, it needs write access
+    ok = T:send(S, RouteFrame),
+    {Cmd6, C8} = receive_commands(T, S, C7),
+    ?assertMatch({response, 1, {route, ?RESPONSE_CODE_ACCESS_REFUSED, _}}, Cmd6),
+
+    %% partitions should succeed, it requires read or write
+    ok = T:send(S, PartitionsFrame),
+    {Cmd7, C9} = receive_commands(T, S, C8),
+    ?assertEqual({response, 1, {partitions, ?RESPONSE_CODE_OK, Partitions}}, Cmd7),
+
+    %% remove read and write access
+    rabbit_ct_broker_helpers:set_permissions(Config, Username, <<"/">>,
+                                             <<".*">>, <<"foobar">>, <<"foobar">>),
+
+    %% route should fail, it needs write access
+    ok = T:send(S, RouteFrame),
+    {Cmd8, C10} = receive_commands(T, S, C9),
+    ?assertMatch({response, 1, {route, ?RESPONSE_CODE_ACCESS_REFUSED, _}}, Cmd8),
+
+    %% partitions should fail, it requires read or write
+    ok = T:send(S, PartitionsFrame),
+    {Cmd9, C11} = receive_commands(T, S, C10),
+    ?assertEqual({response, 1, {partitions, ?RESPONSE_CODE_ACCESS_REFUSED, []}}, Cmd9),
+
+    %% restore full permissions to delete the super stream
+    rabbit_ct_broker_helpers:set_full_permissions(Config, Username, <<"/">>),
+    ok = T:send(S, request({delete_super_stream, Ss})),
+    {Cmd10, C12} = receive_commands(T, S, C11),
+    ?assertMatch({response, 1, {delete_super_stream, ?RESPONSE_CODE_OK}}, Cmd10),
+
+    test_close(T, S, C12),
+    closed = wait_for_socket_close(T, S, 10),
+    ok.
+
 offset_lag_calculation(Config) ->
     FunctionName = atom_to_binary(?FUNCTION_NAME, utf8),
     Port = get_port(gen_tcp, Config),
@@ -1115,7 +1734,7 @@ unauthorized_vhost_access_should_close_with_delay(Config) ->
     C2 = test_plain_sasl_authenticate(T, S, sasl_handshake(T, S, C1), User),
     Start = erlang:monotonic_time(millisecond),
     R = do_tune(T, S, C2),
-    ?assertMatch({{response,_,{open,12}}, _}, R),
+    ?assertMatch({{response,_,{open, 12, _}}, _}, R),
     End = erlang:monotonic_time(millisecond),
     %% the stream reader module defines the delay (3 seconds)
     ?assert(End - Start > 2_000),
@@ -1178,6 +1797,64 @@ test_consumer_with_too_long_reference_errors(Config) ->
 
   C4 = lists:foldl(fun({SubId, Ref, ExpectedResponseCode}, CAcc) ->
      F = request({subscribe, SubId, Stream, first, 1, #{<<"name">> => Ref}}),
+     ok = T:send(S, F),
+     {Cmd, CNext} = receive_commands(T, S, CAcc),
+     ?assertMatch({response, 1, {subscribe, ExpectedResponseCode}}, Cmd),
+     CNext
+   end, C3, Tests),
+
+  C5 = test_delete_stream(T, S, Stream, C4),
+  test_close(T, S, C5),
+  ok.
+
+declare_publisher_max_reached(Config) ->
+  FunctionName = atom_to_binary(?FUNCTION_NAME, utf8),
+  T = gen_tcp,
+  Port = get_port(T, Config),
+  Opts = get_opts(T),
+  {ok, S} = T:connect("localhost", Port, Opts),
+  C0 = rabbit_stream_core:init(0),
+  ConnectionName = FunctionName,
+  C1 = test_peer_properties(T, S, #{<<"connection_name">> => ConnectionName}, C0),
+  C2 = test_authenticate(T, S, C1),
+
+  Stream = FunctionName,
+  C3 = test_create_stream(T, S, Stream, C2),
+
+  Tests = [{Id, ?RESPONSE_CODE_OK} || Id <- lists:seq(0, 255)] ++
+          [{0, ?RESPONSE_CODE_PRECONDITION_FAILED}],
+
+  C4 = lists:foldl(fun({PubId, ExpectedResponseCode}, CAcc) ->
+     F = request({declare_publisher, PubId, <<>>, Stream}),
+     ok = T:send(S, F),
+     {Cmd, CNext} = receive_commands(T, S, CAcc),
+     ?assertMatch({response, 1, {declare_publisher, ExpectedResponseCode}}, Cmd),
+     CNext
+   end, C3, Tests),
+
+  C5 = test_delete_stream(T, S, Stream, C4),
+  test_close(T, S, C5),
+  ok.
+
+subscribe_max_reached(Config) ->
+  FunctionName = atom_to_binary(?FUNCTION_NAME, utf8),
+  T = gen_tcp,
+  Port = get_port(T, Config),
+  Opts = get_opts(T),
+  {ok, S} = T:connect("localhost", Port, Opts),
+  C0 = rabbit_stream_core:init(0),
+  ConnectionName = FunctionName,
+  C1 = test_peer_properties(T, S, #{<<"connection_name">> => ConnectionName}, C0),
+  C2 = test_authenticate(T, S, C1),
+
+  Stream = FunctionName,
+  C3 = test_create_stream(T, S, Stream, C2),
+
+  Tests = [{Id, ?RESPONSE_CODE_OK} || Id <- lists:seq(0, 255)] ++
+          [{0, ?RESPONSE_CODE_PRECONDITION_FAILED}],
+
+  C4 = lists:foldl(fun({SubId, ExpectedResponseCode}, CAcc) ->
+     F = request({subscribe, SubId, Stream, first, 10, #{}}),
      ok = T:send(S, F),
      {Cmd, CNext} = receive_commands(T, S, CAcc),
      ?assertMatch({response, 1, {subscribe, ExpectedResponseCode}}, Cmd),
@@ -1335,6 +2012,38 @@ test_metadata_with_advertised_hints(Config) ->
               _ = test_close(Transport, S, C5),
               closed = wait_for_socket_close(Transport, S, 10)
       end, Transports),
+    ok.
+
+test_advertised_endpoint(Config) ->
+    lists:foreach(
+      fun(Transport) ->
+              {ExpectedHostFun, ExpectedPortFun, KH, KP} =
+                  case Transport of
+                      tcp -> {host, port, ?K_AD_HOST, ?K_AD_PORT};
+                      ssl -> {tls_host, tls_port, ?K_AD_TLS_HOST, ?K_AD_TLS_PORT}
+                  end,
+              AssertAgreement =
+                  fun() ->
+                          ExpectedHost = rpc(Config, 0, rabbit_stream,
+                                             ExpectedHostFun, []),
+                          ExpectedPort = rpc(Config, 0, rabbit_stream,
+                                             ExpectedPortFun, []),
+                          ?assertEqual({ExpectedHost, ExpectedPort},
+                                       rpc(Config, 0, rabbit_stream,
+                                          advertised_endpoint, [Transport]))
+                  end,
+
+              AssertAgreement(),
+
+              AdHost = rand:bytes(20),
+              AdPort = rand:uniform(65535),
+              rpc(Config, 0, application, set_env, [rabbitmq_stream, KH, AdHost]),
+              rpc(Config, 0, application, set_env, [rabbitmq_stream, KP, AdPort]),
+              AssertAgreement(),
+
+              rpc(Config, 0, application, set_env, [rabbitmq_stream, KH, undefined]),
+              rpc(Config, 0, application, set_env, [rabbitmq_stream, KP, undefined])
+      end, [tcp, ssl]),
     ok.
 
 test_connection_properties_with_advertised_hints(Config) ->

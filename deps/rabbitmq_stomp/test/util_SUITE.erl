@@ -16,8 +16,10 @@
 all() -> [
     longstr_field,
     message_properties,
+    message_properties_strips_reserved_headers,
     message_headers,
     minimal_message_headers_with_no_custom,
+    headers_reserved_names_cannot_be_overridden,
     headers_post_process,
     headers_post_process_noop_replyto,
     headers_post_process_noop2,
@@ -38,7 +40,9 @@ all() -> [
     consumer_tag_destination,
     consumer_tag_invalid,
     parse_valid_message_id,
-    parse_invalid_message_id
+    parse_invalid_message_id,
+    subscription_queue_name_matches_4_3,
+    subscription_queue_name_from_header
     ].
 
 
@@ -84,6 +88,19 @@ message_properties(_) ->
                 headers          = [{<<"str">>, longstr, <<"foo">>},
                                     {<<"int">>, longstr, <<"123">>}]
               } =
+        rabbit_stomp_util:message_properties(#stomp_frame{headers = Headers}).
+
+message_properties_strips_reserved_headers(_) ->
+    Headers = #{
+                <<"message-id">> => <<"forged-message-id">>,
+                <<"ack">> => <<"forged-ack">>,
+                <<"subscription">> => <<"forged-subscription">>,
+                <<"redelivered">> => <<"forged-redelivered">>,
+                <<"destination">> => <<"forged-destination">>,
+                <<"str">> => <<"foo">>
+              },
+
+    #'P_basic'{headers = [{<<"str">>, longstr, <<"foo">>}]} =
         rabbit_stomp_util:message_properties(#stomp_frame{headers = Headers}).
 
 message_headers(_) ->
@@ -134,6 +151,29 @@ minimal_message_headers_with_no_custom(_) ->
                ],
 
     [] = lists:subtract(Headers, Expected).
+
+%% A publisher (STOMP or AMQP) controls #'P_basic'.headers, so it must not
+%% be able to override the server-generated message-id/ack/subscription/
+%% redelivered/destination seen by a STOMP consumer.
+headers_reserved_names_cannot_be_overridden(_) ->
+    Properties = #'P_basic'{
+      headers = [{<<"message-id">>, longstr, <<"forged-message-id">>},
+                 {<<"ack">>, longstr, <<"forged-ack">>},
+                 {<<"subscription">>, longstr, <<"forged-subscription">>},
+                 {<<"redelivered">>, longstr, <<"forged-redelivered">>},
+                 {<<"destination">>, longstr, <<"forged-destination">>}]},
+
+    Headers = rabbit_stomp_util:headers(
+                "session123", <<"T_orders">>, 42,
+                <<>>, <<"routing-key">>, true,
+                Properties, client, "1.2"),
+
+    ExpectedMessageId = <<"T_orders@@session123@@42">>,
+    #{<<"message-id">> := ExpectedMessageId,
+      <<"ack">> := ExpectedMessageId,
+      <<"subscription">> := <<"orders">>,
+      <<"redelivered">> := true,
+      <<"destination">> := <<"/queue/routing-key">>} = Headers.
 
 headers_post_process(_) ->
     Headers  = [{<<"header1">>, <<"1">>},
@@ -238,3 +278,26 @@ parse_valid_message_id(_) ->
 parse_invalid_message_id(_) ->
     {error, invalid_message_id} =
         rabbit_stomp_util:parse_message_id(<<"blah">>).
+
+subscription_queue_name_matches_4_3(_) ->
+    Frame = #stomp_frame{headers = #{}},
+    lists:foreach(
+      fun({Destination, Id, Expected}) ->
+              ?assertEqual(Expected,
+                           rabbit_stomp_util:subscription_queue_name(Destination, Id, Frame))
+      end,
+      [{<<"ascii">>, <<"d1">>, <<"stomp-subscription-XDrH2Y3c7_jz3DjSx7MIBA">>},
+       {<<"a/b">>, <<"d4">>, <<"stomp-subscription-V_WQzD3fcIsVt-6i0_pvfw">>},
+       {<<"日本"/utf8>>, <<"идентификатор"/utf8>>,
+        <<"stomp-subscription-FhsDeJnFyW6rGZ3dHA4aQA">>}]).
+
+subscription_queue_name_from_header(_) ->
+    Name = fun(Value) ->
+                   rabbit_stomp_util:subscription_queue_name(
+                     <<"dest">>, <<"id">>,
+                     #stomp_frame{headers = #{<<"x-queue-name">> => Value}})
+           end,
+    ?assertEqual(<<"queue-name">>, Name(<<"queue-\r\nname">>)),
+    ?assertMatch(<<"stomp-subscription-", _/binary>>, Name(<<>>)),
+    ?assertMatch(<<"stomp-subscription-", _/binary>>, Name(<<" ">>)),
+    ?assertMatch(<<"stomp-subscription-", _/binary>>, Name(<<"\r\n">>)).

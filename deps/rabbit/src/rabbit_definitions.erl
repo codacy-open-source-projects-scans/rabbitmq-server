@@ -48,7 +48,7 @@
          should_skip_if_unchanged/0
         ]).
 
--export([all_definitions/0]).
+-export([all_definitions/0, fold_queues/3, fold_bindings/3]).
 -export([
   list_users/0, list_vhosts/0, list_permissions/0, list_topic_permissions/0,
   list_runtime_parameters/0, list_global_runtime_parameters/0, list_policies/0,
@@ -295,6 +295,47 @@ all_definitions() ->
         bindings          => Bs,
         exchanges         => Xs
     }.
+
+-spec fold_queues(Scope, Fun, Acc) -> Acc when
+      Scope :: all | {vhost, vhost:name()},
+      Fun :: fun((Queue :: map(), Acc) -> Acc),
+      Acc :: term().
+%% @doc Folds over exported queues as definition maps, optionally restricted to
+%% a single virtual host, without materialising the full queue list. Exclusive
+%% queues are skipped, as they cannot be restored. See also `list_queues/0`.
+fold_queues(Scope, Fun, Acc) ->
+    rabbit_db_queue:fold(
+      fun(Q, Acc0) ->
+              case amqqueue:get_exclusive_owner(Q) of
+                  none ->
+                      #resource{virtual_host = VHost} = amqqueue:get_name(Q),
+                      case Scope of
+                          all            -> Fun(queue_definition(Q), Acc0);
+                          {vhost, VHost} -> Fun(queue_definition(Q), Acc0);
+                          _              -> Acc0
+                      end;
+                  _ ->
+                      Acc0
+              end
+      end, Acc).
+
+-spec fold_bindings(Scope, Fun, Acc) -> Acc when
+      Scope :: all | {vhost, vhost:name()},
+      Fun :: fun((Binding :: map(), Acc) -> Acc),
+      Acc :: term().
+%% @doc Folds over exported (explicit) bindings as definition maps, optionally
+%% restricted to a single virtual host, without materialising the full binding
+%% list. Uses the projection-based fold so the streaming callback runs in the
+%% calling process rather than the Khepri server process. See also `list_bindings/0`.
+fold_bindings(Scope, Fun, Acc) ->
+    rabbit_db_binding:fold_projection(
+      fun(#binding{source = #resource{virtual_host = VHost}} = Binding, Acc0) ->
+              case Scope of
+                  all            -> Fun(binding_definition(Binding), Acc0);
+                  {vhost, VHost} -> Fun(binding_definition(Binding), Acc0);
+                  _              -> Acc0
+              end
+      end, Acc).
 
 -spec has_configured_definitions_to_load() -> boolean().
 has_configured_definitions_to_load() ->
@@ -806,6 +847,8 @@ add_vhost(VHost, ActingUser) ->
     case rabbit_vhost:put_vhost(Name, Description, Tags, DefaultQueueType, IsTracingEnabled, ActingUser) of
         ok ->
             ok;
+        {error, invalid_queue_type, DQT1} ->
+            throw({error, invalid_queue_type_message(DQT1)});
         {error, _} = Err1 ->
             throw(Err1)
     end,
@@ -815,9 +858,18 @@ add_vhost(VHost, ActingUser) ->
     case rabbit_vhost:update_metadata(Name, Metadata, ActingUser) of
         ok ->
             ok;
+        {error, invalid_queue_type, DQT2} ->
+            throw({error, invalid_queue_type_message(DQT2)});
         {error, _} = Err2 ->
             throw(Err2)
     end.
+
+-spec invalid_queue_type_message(any()) -> binary().
+invalid_queue_type_message(<<>>) ->
+    <<"default_queue_type must not be an empty string">>;
+invalid_queue_type_message(DQT) ->
+    rabbit_data_coercion:to_binary(
+      rabbit_misc:format("~ts is not a valid queue type", [DQT])).
 
 add_permission(Permission, ActingUser) ->
     rabbit_auth_backend_internal:set_permissions(maps:get(user,      Permission, undefined),
@@ -934,8 +986,20 @@ add_binding_int(Binding, Source, Destination, ActingUser) ->
             throw(Err)
     end.
 
+%% destination_type is a binary from JSON, or an atom from all_definitions/0 (CLI erlang export/import).
 dest_type(Binding) ->
-    rabbit_data_coercion:to_atom(maps:get(destination_type, Binding, undefined)).
+    case maps:get(destination_type, Binding, undefined) of
+        <<"queue">>    -> queue;
+        <<"exchange">> -> exchange;
+        queue          -> queue;
+        exchange       -> exchange;
+        Other          -> throw({error, invalid_destination_type_message(Other)})
+    end.
+
+-spec invalid_destination_type_message(any()) -> binary().
+invalid_destination_type_message(Other) ->
+    rabbit_data_coercion:to_utf8_binary(
+      rabbit_misc:format("~tp is not a valid binding destination_type", [Other])).
 
 r(Type, Props) -> r(Type, name, Props).
 
@@ -1062,11 +1126,7 @@ exchange_definition(#exchange{name = #resource{virtual_host = VHost, name = Name
       <<"arguments">> => rabbit_misc:amqp_table(Args)}.
 
 list_queues() ->
-    %% exclude exclusive queues, they cannot be restored
-    [queue_definition(Q) || Q <- lists:filter(fun(Q0) ->
-                                                amqqueue:get_exclusive_owner(Q0) =:= none
-                                              end,
-                                              rabbit_amqqueue:list())].
+    lists:reverse(fold_queues(all, fun(Q, Acc) -> [Q | Acc] end, [])).
 
 queue_definition(Q) ->
     #resource{virtual_host = VHost, name = Name} = amqqueue:get_name(Q),
@@ -1104,7 +1164,7 @@ vhost_definition(VHost) ->
     Name = vhost:get_name(VHost),
     #{
         <<"name">> => Name,
-        <<"limits">> => vhost:get_limits(VHost),
+        <<"limits">> => maps:from_list(vhost:get_limits(VHost)),
         <<"metadata">> => vhost:get_metadata(VHost)
     }.
 
@@ -1174,7 +1234,7 @@ is_internal_parameter(Param) ->
     Name = rabbit_data_coercion:to_list(pget(name, Param)),
     %% if global parameter name starts with an "internal", consider it to be internal
     %% and exclude it from definition export
-    string:left(Name, length(?INTERNAL_GLOBAL_PARAM_PREFIX)) =:= ?INTERNAL_GLOBAL_PARAM_PREFIX.
+    string:prefix(Name, ?INTERNAL_GLOBAL_PARAM_PREFIX) =/= nomatch.
 
 list_policies() ->
     [policy_definition(P) || P <- rabbit_policy:list()].

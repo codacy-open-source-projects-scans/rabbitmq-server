@@ -11,7 +11,8 @@
 
 -export([
     resolve_resource_server_from_audience/1,
-    new_resource_server/1
+    new_resource_server/1,
+    normalize_scope_pattern_syntax_value/1
 ]).
 
 -spec new_resource_server(resource_server_id()) -> resource_server().
@@ -20,11 +21,13 @@ new_resource_server(ResourceServerId) ->
         id = ResourceServerId,
         resource_server_type = undefined,
         verify_aud = true,
+        require_exp = true,
         scope_prefix = erlang:iolist_to_binary([ResourceServerId, <<".">>]),
         additional_scopes_key = undefined,
         preferred_username_claims = ?DEFAULT_PREFERRED_USERNAME_CLAIMS,
         scope_aliases = undefined,
-        oauth_provider_id = root
+        oauth_provider_id = root,
+        scope_pattern_syntax = wildcard
     }.
 
 -spec resolve_resource_server_from_audience(binary() | list() | none) ->
@@ -76,6 +79,8 @@ get_root_resource_server() ->
         get_env(resource_server_type),
     VerifyAud =
         get_boolean_env(verify_aud, true),
+    RequireExp =
+        get_boolean_env(require_exp, true),
     AdditionalScopesKey =
         get_env(extra_scopes_source),
     DefaultScopePrefix =
@@ -90,16 +95,19 @@ get_root_resource_server() ->
             undefined -> root;
             DefaultOauthProviderId -> DefaultOauthProviderId
         end,
+    ScopePatternSyntax = get_scope_pattern_syntax_env(),
 
     #resource_server{
         id = ResourceServerId,
         resource_server_type = ResourceServerType,
         verify_aud = VerifyAud,
-        scope_prefix = ScopePrefix,
+        require_exp = RequireExp,
+        scope_prefix = ScopePrefix,         
         additional_scopes_key = AdditionalScopesKey,
         preferred_username_claims = PreferredUsernameClaims,
         scope_aliases = ScopeAliases,
-        oauth_provider_id = OAuthProviderId
+        oauth_provider_id = OAuthProviderId,
+        scope_pattern_syntax = ScopePatternSyntax
     }.
 
 -spec get_resource_server(resource_server_id()) -> resource_server() | undefined.
@@ -133,6 +141,9 @@ get_resource_server(ResourceServerId, RootResourseServer) when
     VerifyAud =
         proplists:get_value(verify_aud, ResourceServerProps,
             RootResourseServer#resource_server.verify_aud),
+    RequireExp =
+        proplists:get_value(require_exp, ResourceServerProps,
+            RootResourseServer#resource_server.require_exp),
     AdditionalScopesKey =
         proplists:get_value(extra_scopes_source, ResourceServerProps,
             RootResourseServer#resource_server.additional_scopes_key),
@@ -146,16 +157,25 @@ get_resource_server(ResourceServerId, RootResourseServer) when
     OAuthProviderId =
         proplists:get_value(oauth_provider_id, ResourceServerProps,
             RootResourseServer#resource_server.oauth_provider_id),
+    ScopePatternSyntax =
+        case proplists:get_value(scope_pattern_syntax, ResourceServerProps, undefined) of
+            undefined ->
+                RootResourseServer#resource_server.scope_pattern_syntax;
+            V ->
+                normalize_scope_pattern_syntax_value(V)
+        end,
 
     #resource_server{
         id = ResourceServerId,
         resource_server_type = ResourceServerType,
         verify_aud = VerifyAud,
+        require_exp = RequireExp,
         scope_prefix = ScopePrefix,
         additional_scopes_key = AdditionalScopesKey,
         preferred_username_claims = PreferredUsernameClaims,
         scope_aliases = ScopeAliases,
-        oauth_provider_id = OAuthProviderId
+        oauth_provider_id = OAuthProviderId,
+        scope_pattern_syntax = ScopePatternSyntax
     }.
 
 -spec find_audience(binary() | list(), list()) ->
@@ -238,3 +258,14 @@ get_boolean_value(Key, Proplist, Def) ->
     end.
 intersection(List1, List2) ->
     [I || I <- List1, lists:member(I, List2)].
+
+-spec get_scope_pattern_syntax_env() -> scope_pattern_syntax().
+get_scope_pattern_syntax_env() ->
+    normalize_scope_pattern_syntax_value(get_env(scope_pattern_syntax, wildcard)).
+
+-spec normalize_scope_pattern_syntax_value(term()) -> scope_pattern_syntax().
+normalize_scope_pattern_syntax_value(wildcard) -> wildcard;
+normalize_scope_pattern_syntax_value(regex) -> regex;
+normalize_scope_pattern_syntax_value(<<"wildcard">>) -> wildcard;
+normalize_scope_pattern_syntax_value(<<"regex">>) -> regex;
+normalize_scope_pattern_syntax_value(_) -> wildcard.

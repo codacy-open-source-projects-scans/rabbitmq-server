@@ -10,13 +10,14 @@
 -include_lib("kernel/include/logger.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("amqp10_common/include/amqp10_types.hrl").
+-include_lib("amqp10_common/include/amqp10_sole_conn.hrl").
 -include("rabbit_amqp.hrl").
 -include("rabbit_amqp_metrics.hrl").
 -include("rabbit_amqp_reader.hrl").
 
 -export([init/1,
-         info/2,
          mainloop/2,
+         local_connections/0,
          set_credential/2,
          notify_session_ending/3]).
 
@@ -29,18 +30,26 @@
          handle_other/2,
          ensure_stats_timer/1]).
 
+-ifdef(TEST).
+-export([check_node_connection_limit/1,
+         i/2]).
+-endif.
+
 -import(rabbit_amqp_util, [protocol_error/3]).
 
 -define(IS_RUNNING(State), State#v1.connection_state =:= running).
+-define(FENCE_TIMEOUT, 30_000).
 
 unpack_from_0_9_1(
   {Sock, PendingRecv, SupPid, Buf, BufLen, ProxySocket,
-   ConnectionName, Host, PeerHost, Port, PeerPort, ConnectedAt, StatsTimer},
+   ConnectionName, Host, PeerHost, Port, PeerPort, ConnectedAt, StatsTimer,
+   RanchRef},
   Parent) ->
     logger:update_process_metadata(#{connection => ConnectionName}),
     #v1{parent           = Parent,
         websocket        = false,
         sock             = Sock,
+        ranch_ref        = RanchRef,
         callback         = {frame_header, sasl},
         pending_recv     = PendingRecv,
         helper_sup       = SupPid,
@@ -173,6 +182,14 @@ handle_other(emit_stats, State) ->
     emit_stats(State);
 handle_other(ensure_stats_timer, State) ->
     ensure_stats_timer(State);
+handle_other({'EXIT', _Pid, sole_conn_enforcement}, State0) ->
+    case ?IS_RUNNING(State0) of
+        true  ->
+            Error = rabbit_sole_conn:close_existing_connection_error(),
+            close(Error, State0);
+        false ->
+            stop
+    end;
 handle_other({'EXIT', Parent, Reason}, State = #v1{parent = Parent}) ->
     ReasonString = rabbit_misc:format("broker forced connection closure with reason '~w'",
                                       [Reason]),
@@ -308,17 +325,14 @@ handle_session_exit(ChannelNum, SessionPid, Reason, State0) ->
             true ->
                 State;
             false ->
-                R = case Reason of
-                        {RealReason, Trace} ->
-                            error_frame(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                                        "Session error: ~tp~n~tp",
-                                        [RealReason, Trace]);
-                        _ ->
-                            error_frame(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                                        "Session error: ~tp",
-                                        [Reason])
-                    end,
-                handle_exception(State, ChannelNum, R)
+                Detail = case Reason of
+                             {RealReason, Trace} ->
+                                 rabbit_misc:format("Session error: ~tp~n~tp",
+                                                     [RealReason, Trace]);
+                             _ ->
+                                 rabbit_misc:format("Session error: ~tp", [Reason])
+                         end,
+                handle_exception(State, ChannelNum, internal_error_frame(), Detail)
         end,
     maybe_close(S).
 
@@ -341,18 +355,54 @@ error_frame(Condition, Fmt, Args) ->
     #'v1_0.error'{condition = Condition,
                   description = {utf8, Description}}.
 
-handle_exception(State = #v1{connection_state = closed}, Channel,
-                 #'v1_0.error'{description = {utf8, Desc}}) ->
-    ?LOG_ERROR("Error on AMQP 1.0 connection ~tp (~tp), channel number ~b:~n~tp",
-               [self(), closed, Channel, Desc]),
-    State;
-handle_exception(State = #v1{connection_state = CS}, Channel,
-                 Error = #'v1_0.error'{description = {utf8, Desc}})
-  when ?IS_RUNNING(State) orelse CS =:= closing ->
-    ?LOG_ERROR("Error on AMQP 1.0 connection ~tp (~tp), channel number ~b:~n~tp",
-               [self(), CS, Channel, Desc]),
+%% An error whose description is safe to send to the peer: it carries no
+%% internal reason or stacktrace. Callers that catch an internal error log
+%% the caught detail themselves via handle_exception/4.
+internal_error_frame() ->
+    #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
+                  description = {utf8, <<"internal error">>}}.
+
+%% "A valid frame header cannot be formed from the incoming byte stream." [2.8.16]
+framing_error(State, Channel, Fmt, Args) ->
+    Error = error_frame(?V_1_0_CONNECTION_ERROR_FRAMING_ERROR, Fmt, Args),
+    handle_exception(State, Channel, Error).
+
+handle_exception(State, Channel, Error = #'v1_0.error'{description = {utf8, Desc}}) ->
+    handle_exception(State, Channel, Error, Desc);
+handle_exception(State, Channel, Error) ->
+    handle_exception(State, Channel, Error, "").
+
+handle_exception(State = #v1{connection_state = CS}, _Channel,
+                 Error = #'v1_0.error'{description =
+                                       {utf8, <<"Connection forced: ", Explanation/binary>>}},
+                 _Detail)
+  when (?IS_RUNNING(State)) orelse CS =:= closing ->
+    %% Only ever raised by terminate/2 when the connection is deliberately
+    %% closed by an operator or by the broker itself (e.g. rabbitmqctl
+    %% close_connection, the management UI, maintenance mode draining, or
+    %% a node-wide shutdown) - never a client protocol violation, so this
+    %% does not warrant `error'-level logging. Mirrors the equivalent
+    %% AMQP 0-9-1 handling for `connection_forced' in
+    %% rabbit_reader:log_hard_error/3.
+    ?LOG_WARNING("Closing AMQP 1.0 connection ~tp: ~ts", [self(), Explanation]),
     close(Error, State);
-handle_exception(State, _Channel, Error) ->
+handle_exception(State = #v1{connection_state = closed}, Channel, _Error, Detail) ->
+    ?LOG_ERROR("Error on AMQP 1.0 connection ~tp (~tp), channel number ~b:~n~ts",
+               [self(), closed, Channel, Detail]),
+    State;
+handle_exception(State = #v1{connection_state = CS}, Channel, Error, Detail)
+  when (?IS_RUNNING(State)) orelse CS =:= closing ->
+    ?LOG_ERROR("Error on AMQP 1.0 connection ~tp (~tp), channel number ~b:~n~ts",
+               [self(), CS, Channel, Detail]),
+    close(Error, State);
+handle_exception(State, Channel, Error = #'v1_0.error'{description = Desc}, Detail) ->
+    case Desc =:= {utf8, Detail} of
+        true ->
+            ok;
+        false ->
+            ?LOG_ERROR("Error on AMQP 1.0 connection ~tp (~tp), channel number ~b:~n~ts",
+                       [self(), State#v1.connection_state, Channel, Detail])
+    end,
     silent_close_delay(),
     throw({handshake_error, State#v1.connection_state, Error}).
 
@@ -360,6 +410,8 @@ is_connection_frame(#'v1_0.open'{})  -> true;
 is_connection_frame(#'v1_0.close'{}) -> true;
 is_connection_frame(_)               -> false.
 
+handle_frame(_Mode, _Channel, <<>>, State) ->
+    State;
 handle_frame(Mode, Channel, Body, State) ->
     try
         handle_frame0(Mode, Channel, Body, State)
@@ -374,13 +426,21 @@ handle_frame(Mode, Channel, Body, State) ->
                                ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
                                "Access for user '~ts' was refused: insufficient permissions",
                                [Username]));
+        _:{inet_error, closed} ->
+            %% Most commonly hit replying to a peer-initiated close: the
+            %% peer's socket is already gone (e.g. it disconnected right
+            %% after sending its own close frame, before we could reply
+            %% with ours). There is nobody left to notify and nothing more
+            %% useful to do, so this does not warrant a full "Reader
+            %% error" stack trace at error level.
+            ?LOG_INFO("AMQP 1.0 connection ~tp: could not reply, "
+                      "peer's socket already closed", [self()]),
+            State#v1{connection_state = closed};
         _:Reason:Trace ->
             handle_exception(State,
                              Channel,
-                             error_frame(
-                               ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                               "Reader error: ~tp~n~tp",
-                               [Reason, Trace]))
+                             internal_error_frame(),
+                             rabbit_misc:format("Reader error: ~tp~n~tp", [Reason, Trace]))
     end.
 
 handle_frame0(amqp, Channel, _Body,
@@ -428,13 +488,15 @@ handle_connection_frame(
                channel_max = ClientChannelMax,
                idle_time_out = IdleTimeout,
                hostname = Hostname,
-               properties = Properties},
+               properties = Properties,
+               desired_capabilities = DesiredCaps},
   #v1{connection_state = waiting_open,
       connection = Connection = #v1_connection{
                                    name = ConnectionName,
                                    user = User = #user{username = Username},
                                    auth_mechanism = {Mechanism, _Mod}
                                   },
+      ranch_ref = RanchRef,
       helper_sup = HelperSupPid,
       sock = Sock} = State0) ->
     Vhost = vhost(Hostname),
@@ -442,117 +504,168 @@ handle_connection_frame(
                                      vhost => Vhost,
                                      user => Username}),
     ok = check_user_loopback(State0),
+    %% Enforced before per-vhost and per-user limits for efficiency.
+    ok = check_node_connection_limit(RanchRef),
     ok = check_vhost_exists(Vhost, State0),
     ok = check_vhost_alive(Vhost),
     ok = rabbit_access_control:check_vhost_access(User, Vhost, {socket, Sock}, #{}),
     ok = check_vhost_connection_limit(Vhost, Username),
     ok = check_user_connection_limit(Username),
-    Timer = maybe_start_credential_expiry_timer(User),
-    rabbit_core_metrics:auth_attempt_succeeded(<<>>, Username, amqp10),
-    notify_auth(user_authentication_success, Username, State0),
-    ?LOG_INFO(
-       "Connection from AMQP 1.0 container '~ts': user '~ts' authenticated "
-       "using SASL mechanism ~s and granted access to vhost '~ts'",
-       [ContainerId, Username, Mechanism, Vhost]),
+    IsJms = is_jms_client(Properties),
+    ok = khepri_fence(IsJms), 
 
-    OutgoingMaxFrameSize = case ClientMaxFrame of
-                               undefined ->
-                                   unlimited;
-                               {uint, Bytes}
-                                 when Bytes >= ?MIN_MAX_FRAME_1_0_SIZE ->
-                                   Bytes;
-                               {uint, Bytes} ->
-                                   protocol_error(
-                                     ?V_1_0_AMQP_ERROR_FRAME_SIZE_TOO_SMALL,
-                                     "max_frame_size (~w) < minimum maximum frame size (~w)",
-                                     [Bytes, ?MIN_MAX_FRAME_1_0_SIZE])
-                           end,
-    SendTimeoutSec =
-    case IdleTimeout of
-        undefined ->
-            0;
-        {uint, Interval} ->
-            if Interval =:= 0 ->
-                   0;
-               Interval < 1000 ->
-                   %% "If a peer can not, for any reason support a proposed idle timeout, then it SHOULD
-                   %% close the connection using a close frame with an error explaining why. There is no
-                   %% requirement for peers to support arbitrarily short or long idle timeouts." [2.4.5]
-                   %% rabbit_heartbeat does not want to support sub-second timeouts.
-                   protocol_error(
-                     ?V_1_0_AMQP_ERROR_NOT_ALLOWED,
-                     "idle-time-out (~b ms) < minimum idle-time-out (1000 ms)",
-                     [Interval]);
-               Interval >= 1000 ->
-                   Interval div 1000
-            end
-    end,
-    {ok, ReceiveTimeoutSec} = application:get_env(rabbit, heartbeat),
-    ReceiveTimeoutMillis = ReceiveTimeoutSec * 1000,
-    Reader = self(),
-    ReceiveFun = fun() -> Reader ! heartbeat_timeout end,
-    SendFun = heartbeat_send_fun(Reader, State0),
-    %% TODO: only start heartbeat receive timer at next next frame
-    Heartbeater = rabbit_heartbeat:start(
-                    HelperSupPid, Sock, ConnectionName,
-                    SendTimeoutSec, SendFun,
-                    ReceiveTimeoutSec, ReceiveFun),
-    {ok, IncomingMaxFrameSize} = application:get_env(rabbit, frame_max),
-    {ok, SessionMax} = application:get_env(rabbit, session_max_per_connection),
-    %% "The channel-max value is the highest channel number that can be used on the connection.
-    %% This value plus one is the maximum number of sessions that can be simultaneously active
-    %% on the connection." [2.7.1]
-    ChannelMax = SessionMax - 1,
-    %% Assert config is valid.
-    true = ChannelMax >= 0 andalso ChannelMax =< 16#ff_ff,
-    EffectiveChannelMax = case ClientChannelMax of
-                              undefined ->
-                                  ChannelMax;
-                              {ushort, N} ->
-                                  min(N, ChannelMax)
+    OfferedCaps0 = [%% https://docs.oasis-open.org/amqp/linkpair/v1.0/cs01/linkpair-v1.0-cs01.html#_Toc51331306
+                    <<"LINK_PAIR_V1_0">>,
+                    %% https://docs.oasis-open.org/amqp/anonterm/v1.0/cs01/anonterm-v1.0-cs01.html#doc-anonymous-relay
+                    <<"ANONYMOUS-RELAY">>,
+                    %% [schdmsg-v1.0-wd02] §2.1, [amqp-bindmap-jms-v1.0-wd10] §9
+                    %% Offered for the whole connection instead of per link: a sending link often targets an exchange
+                    %% or the anonymous relay, so which queues a message reaches, and therefore whether they support
+                    %% a delivery delay, is only known per message at routing time. Queue types that do not support
+                    %% delivery delays enqueue the message immediately.
+                    <<"DELAYED_DELIVERY">>,
+                    %% amqp-bindmap-jms-v1.0-wd10 §8
+                    <<"SHARED-SUBS">>],
+    {map, Props0} = server_properties(),
+
+    HasSoleCap = rabbit_amqp_util:has_capability(?CAP_SOLE_CONN, DesiredCaps) andalso
+                 rabbit_sole_conn:is_feature_enabled(),
+    {SoleConnPlcy, OfferedCaps, Props} =
+        case HasSoleCap of
+            true  ->
+                {sole_conn_enforcement_policy(Properties),
+                 [?CAP_SOLE_CONN | OfferedCaps0],
+                 [{?SOLE_CONN_DETECTION_POLICY, ?SOLE_CONN_DETECTION_POLICY_WEAK}
+                  | Props0]};
+            false ->
+                {none, OfferedCaps0, Props0}
+        end,
+
+    case rabbit_sole_conn:acquire(SoleConnPlcy, Vhost, ContainerId, Username, self()) of
+        {error, refuse_connection} ->
+            %% "If the enforcing container has not already sent the open
+            %% for the connection, it MUST add the property
+            %% amqp:connection-establishment-failed to the properties field
+            %% of open having boolean value true." [sole conn 3.2.1]
+            Props1 = [{?AMQP_ERROR_CONNECTION_ESTABLISHMENT_FAILED, true} | Props],
+            Open = #'v1_0.open'{
+                      container_id = {utf8, rabbit_nodes:cluster_name()},
+                      offered_capabilities = amqp10_util:capabilities_from_list(OfferedCaps),
+                      properties = {map, Props1}},
+
+            ok = send_on_channel0(State0, Open, amqp10_framing),
+
+            %% The enforcing container MUST then immediately send a close"
+            %% [sole conn 3.2.1]
+            State = State0#v1{connection_state = closing},
+            Error = rabbit_sole_conn:refuse_connection_error(),
+            close(Error, State);
+        _ ->
+            Timer = maybe_start_credential_expiry_timer(User),
+            rabbit_core_metrics:auth_attempt_succeeded(<<>>, Username, amqp10),
+            notify_auth(user_authentication_success, Username, State0),
+            ?LOG_INFO(
+               "Connection from AMQP 1.0 container '~ts': user '~ts' authenticated "
+               "using SASL mechanism ~s and granted access to vhost '~ts'",
+               [ContainerId, Username, Mechanism, Vhost]),
+
+            OutgoingMaxFrameSize = case ClientMaxFrame of
+                                       undefined ->
+                                           unlimited;
+                                       {uint, Bytes}
+                                         when Bytes >= ?MIN_MAX_FRAME_1_0_SIZE ->
+                                           Bytes;
+                                       {uint, Bytes} ->
+                                           protocol_error(
+                                             ?V_1_0_AMQP_ERROR_FRAME_SIZE_TOO_SMALL,
+                                             "max_frame_size (~w) < minimum maximum frame size (~w)",
+                                             [Bytes, ?MIN_MAX_FRAME_1_0_SIZE])
+                                   end,
+            SendTimeoutSec =
+            case IdleTimeout of
+                undefined ->
+                    0;
+                {uint, Interval} ->
+                    if Interval =:= 0 ->
+                           0;
+                       Interval < 1000 ->
+                           %% "If a peer can not, for any reason support a proposed idle timeout, then it SHOULD
+                           %% close the connection using a close frame with an error explaining why. There is no
+                           %% requirement for peers to support arbitrarily short or long idle timeouts." [2.4.5]
+                           %% rabbit_heartbeat does not want to support sub-second timeouts.
+                           protocol_error(
+                             ?V_1_0_AMQP_ERROR_NOT_ALLOWED,
+                             "idle-time-out (~b ms) < minimum idle-time-out (1000 ms)",
+                             [Interval]);
+                       Interval >= 1000 ->
+                           Interval div 1000
+                    end
+            end,
+            {ok, ReceiveTimeoutSec} = application:get_env(rabbit, heartbeat),
+            ReceiveTimeoutMillis = ReceiveTimeoutSec * 1000,
+            Reader = self(),
+            ReceiveFun = fun() -> Reader ! heartbeat_timeout end,
+            SendFun = heartbeat_send_fun(Reader, State0),
+            %% TODO: only start heartbeat receive timer at next next frame
+            Heartbeater = rabbit_heartbeat:start(
+                            HelperSupPid, Sock, ConnectionName,
+                            SendTimeoutSec, SendFun,
+                            ReceiveTimeoutSec, ReceiveFun),
+            {ok, IncomingMaxFrameSize} = application:get_env(rabbit, frame_max),
+            {ok, SessionMax} = application:get_env(rabbit, session_max_per_connection),
+            %% "The channel-max value is the highest channel number that can be used on the connection.
+            %% This value plus one is the maximum number of sessions that can be simultaneously active
+            %% on the connection." [2.7.1]
+            ChannelMax = SessionMax - 1,
+            %% Assert config is valid.
+            true = ChannelMax >= 0 andalso ChannelMax =< 16#ff_ff,
+            EffectiveChannelMax = case ClientChannelMax of
+                                      undefined ->
+                                          ChannelMax;
+                                      {ushort, N} ->
+                                          min(N, ChannelMax)
+                                  end,
+            State1 = State0#v1{connection_state = running,
+                               connection = Connection#v1_connection{
+                                              container_id = ContainerId,
+                                              vhost = Vhost,
+                                              incoming_max_frame_size = IncomingMaxFrameSize,
+                                              outgoing_max_frame_size = OutgoingMaxFrameSize,
+                                              channel_max = EffectiveChannelMax,
+                                              properties = Properties,
+                                              is_jms = IsJms,
+                                              timeout = ReceiveTimeoutMillis,
+                                              credential_timer = Timer},
+                               heartbeater = Heartbeater},
+            State = start_writer(State1),
+            HostnameVal = case Hostname of
+                              undefined -> undefined;
+                              null -> undefined;
+                              {utf8, Val} -> Val
                           end,
-    State1 = State0#v1{connection_state = running,
-                       connection = Connection#v1_connection{
-                                      container_id = ContainerId,
-                                      vhost = Vhost,
-                                      incoming_max_frame_size = IncomingMaxFrameSize,
-                                      outgoing_max_frame_size = OutgoingMaxFrameSize,
-                                      channel_max = EffectiveChannelMax,
-                                      properties = Properties,
-                                      timeout = ReceiveTimeoutMillis,
-                                      credential_timer = Timer},
-                       heartbeater = Heartbeater},
-    State = start_writer(State1),
-    HostnameVal = case Hostname of
-                      undefined -> undefined;
-                      null -> undefined;
-                      {utf8, Val} -> Val
-                  end,
-    ?LOG_DEBUG(
-       "AMQP 1.0 connection.open frame: hostname = ~ts, extracted vhost = ~ts, idle-time-out = ~p",
-       [HostnameVal, Vhost, IdleTimeout]),
+            ?LOG_DEBUG(
+               "AMQP 1.0 connection.open frame: hostname = ~ts, extracted vhost = ~ts, idle-time-out = ~p",
+               [HostnameVal, Vhost, IdleTimeout]), 
 
-    Infos = infos(?CONNECTION_EVENT_KEYS, State),
-    ok = rabbit_core_metrics:connection_created(
-           proplists:get_value(pid, Infos),
-           Infos),
-    ok = rabbit_event:notify(connection_created, Infos),
-    ok = maybe_emit_stats(State),
-    ok = rabbit_amqp1_0:register_connection(self()),
-    Caps = [%% https://docs.oasis-open.org/amqp/linkpair/v1.0/cs01/linkpair-v1.0-cs01.html#_Toc51331306
-            <<"LINK_PAIR_V1_0">>,
-            %% https://docs.oasis-open.org/amqp/anonterm/v1.0/cs01/anonterm-v1.0-cs01.html#doc-anonymous-relay
-            <<"ANONYMOUS-RELAY">>],
-    Open = #'v1_0.open'{
-              channel_max = {ushort, EffectiveChannelMax},
-              max_frame_size = {uint, IncomingMaxFrameSize},
-              %% "the value in idle-time-out SHOULD be half the peer's actual timeout threshold" [2.4.5]
-              idle_time_out = {uint, ReceiveTimeoutMillis div 2},
-              container_id = {utf8, rabbit_nodes:cluster_name()},
-              offered_capabilities = rabbit_amqp_util:capabilities(Caps),
-              properties = server_properties()},
-    ok = send_on_channel0(State, Open, amqp10_framing),
-    State;
+            Infos = infos(?CONNECTION_EVENT_KEYS, State),
+            ok = rabbit_core_metrics:connection_created(
+                   proplists:get_value(pid, Infos),
+                   Infos),
+            ok = rabbit_event:notify(connection_created, Infos),
+            ok = maybe_emit_stats(State),
+            ok = register_connection(self()),
+
+            Open = #'v1_0.open'{
+                      channel_max = {ushort, EffectiveChannelMax},
+                      max_frame_size = {uint, IncomingMaxFrameSize},
+                      %% "the value in idle-time-out SHOULD be half the peer's actual timeout threshold" [2.4.5]
+                      idle_time_out = {uint, ReceiveTimeoutMillis div 2},
+                      container_id = {utf8, rabbit_nodes:cluster_name()},
+                      offered_capabilities = amqp10_util:capabilities_from_list(OfferedCaps),
+                      properties = {map, Props}},
+            ok = send_on_channel0(State, Open, amqp10_framing),
+            State
+    end;
 handle_connection_frame(#'v1_0.close'{}, State0) ->
     State = State0#v1{connection_state = closing},
     close(undefined, State).
@@ -643,24 +756,40 @@ handle_input(Handshake = <<"AMQP",0,1,0,0>>,
               %% sending any other frames." [2.4.1]
               connection_state = waiting_open},
     switch_callback(State, {frame_header, amqp}, 8);
-handle_input(Header = <<Size:32, DOff:8, Type:8, Channel:16>>,
-             State0 = #v1{callback = {frame_header, Mode}})
-  when DOff >= 2 ->
-    case {Mode, Type} of
-        {amqp, 0} -> ok;
-        {sasl, 1} -> ok;
-        _ -> throw({bad_1_0_header_type, Header, Mode})
-    end,
+handle_input(<<Size:32, DOff:8, Type:8, Channel:16>>,
+             #v1{callback = {frame_header, Mode}} = State0) ->
     MaxFrameSize = State0#v1.connection#v1_connection.incoming_max_frame_size,
-    State = if Size =:= 8 ->
+    ExpectedType = case Mode of
+                       amqp -> 0;
+                       sasl -> 1
+                   end,
+    State = if Size < 8 ->
+                   %% "The frame is malformed if the size is less than the size
+                   %% of the frame header (8 bytes)." [2.3.1]
+                   framing_error(State0, Channel,
+                                 "frame size (~b bytes) < minimum frame size (8 bytes)",
+                                 [Size]);
+               Size > MaxFrameSize ->
+                   framing_error(State0, Channel,
+                                 "frame size (~b bytes) > maximum frame size (~b bytes)",
+                                 [Size, MaxFrameSize]);
+               DOff < 2 ->
+                   %% "Due to the mandatory 8-byte frame header, the frame is
+                   %% malformed if the value is less than 2." [2.3.1]
+                   framing_error(State0, Channel,
+                                 "data offset (~b) < minimum data offset (2)",
+                                 [DOff]);
+               DOff * 4 > Size ->
+                   framing_error(State0, Channel,
+                                 "data offset (~b bytes) > frame size (~b bytes)",
+                                 [DOff * 4, Size]);
+               Type =/= ExpectedType ->
+                   framing_error(State0, Channel,
+                                 "unexpected frame type ~b in ~s mode (expected ~b)",
+                                 [Type, Mode, ExpectedType]);
+               Size =:= 8 ->
                    %% heartbeat
                    State0;
-               Size > MaxFrameSize ->
-                   Err = error_frame(
-                           ?V_1_0_CONNECTION_ERROR_FRAMING_ERROR,
-                           "frame size (~b bytes) > maximum frame size (~b bytes)",
-                           [Size, MaxFrameSize]),
-                   handle_exception(State0, Channel, Err);
                true ->
                    switch_callback(State0, {frame_body, Mode, DOff, Channel}, Size - 8)
             end,
@@ -720,7 +849,7 @@ heartbeat_send_fun(_, #v1{websocket = false,
                           sock = Sock}) ->
     fun() ->
             Frame = amqp10_binary_generator:build_heartbeat_frame(),
-            catch rabbit_net:send(Sock, Frame)
+            try rabbit_net:send(Sock, Frame) catch _:_ -> ok end
     end.
 
 auth_mechanism_to_module(TypeBin, Sock) ->
@@ -831,7 +960,8 @@ send_to_new_session(
                                   vhost = Vhost,
                                   user = User,
                                   container_id = ContainerId,
-                                  name = ConnName},
+                                  name = ConnName,
+                                  is_jms = IsJms},
       writer = WriterPid} = State) ->
     ChildArgs = [WriterPid,
                  ChannelNum,
@@ -840,6 +970,7 @@ send_to_new_session(
                  Vhost,
                  ContainerId,
                  ConnName,
+                 IsJms,
                  BeginFrame],
     case rabbit_amqp_session_sup:start_session(SessionSup, ChildArgs) of
         {ok, SessionPid} ->
@@ -852,6 +983,38 @@ vhost({utf8, <<"vhost:", VHost/binary>>}) ->
     VHost;
 vhost(_) ->
     application:get_env(rabbit, default_vhost, <<"/">>).
+
+is_jms_client({map, Properties}) ->
+    %% Qpid JMS client advertises `product = QpidJMS`.
+    case proplists:get_value({symbol, <<"product">>}, Properties) of
+        {utf8, Product} ->
+            string:find(string:lowercase(Product), <<"jms">>) =/= nomatch;
+        _ ->
+            false
+    end;
+is_jms_client(_) ->
+    false.
+
+%% A JMS client may resume, reconfigure or unsubscribe a durable or shared
+%% topic subscription that the same client created earlier through a
+%% connection on another node. The rabbitmq_jms plugin reconciles such
+%% subscriptions using local Khepri projection reads, which on a follower
+%% that lags the leader can miss the queue and bindings created elsewhere.
+%% Block once here, at connection open, until this node has caught up with
+%% the metadata store leader, so that every subscription operation on this
+%% connection observes the client's own prior writes.
+khepri_fence(true) ->
+    case rabbit_khepri:fence(?FENCE_TIMEOUT) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            protocol_error(
+              ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
+              "failed to synchronise with the metadata store: ~tp",
+              [Reason])
+    end;
+khepri_fence(false) ->
+    ok.
 
 check_user_loopback(#v1{connection = #v1_connection{user = #user{username = Username},
                                                     peer_host = PeerHost}} = State) ->
@@ -884,6 +1047,27 @@ check_vhost_alive(Vhost) ->
             protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
                            "AMQP 1.0 connection failed: virtual host '~s' is down",
                            [Vhost])
+    end.
+
+-spec check_node_connection_limit(ranch:ref() | undefined) -> ok.
+check_node_connection_limit(undefined) ->
+    %% AMQP-over-WebSockets connections won't have an associated Ranch listener
+    ok;
+check_node_connection_limit(RanchRef) ->
+    case application:get_env(rabbit, connection_max, infinity) of
+        infinity ->
+            ok;
+        Limit when is_integer(Limit), Limit >= 0 ->
+            #{active_connections := ActiveConns} = ranch:info(RanchRef),
+            case ActiveConns > Limit of
+                false ->
+                    ok;
+                true ->
+                    protocol_error(
+                      ?V_1_0_AMQP_ERROR_RESOURCE_LIMIT_EXCEEDED,
+                      "connection refused: node connection limit (~p) is reached",
+                      [Limit])
+            end
     end.
 
 check_vhost_connection_limit(Vhost, Username) ->
@@ -934,15 +1118,15 @@ set_credential0(Cred,
                                             credential_timer = NewTimer}}
             catch _:Reason ->
                       Error = error_frame(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
-                                          "access to vhost ~s failed for new credential: ~p",
-                                          [Vhost, Reason]),
-                      handle_exception(State, 0, Error)
+                                          "access to vhost '~ts' failed for new credential",
+                                          [Vhost]),
+                      handle_exception(State, 0, Error,
+                                        rabbit_misc:format("~tp", [Reason]))
             end;
         Err ->
             Error = error_frame(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
-                                "credential update failed: ~p",
-                                [Err]),
-            handle_exception(State, 0, Error)
+                                "credential update failed", []),
+            handle_exception(State, 0, Error, rabbit_misc:format("~tp", [Err]))
     end.
 
 maybe_start_credential_expiry_timer(User) ->
@@ -968,21 +1152,15 @@ maybe_start_credential_expiry_timer(User) ->
 silent_close_delay() ->
     timer:sleep(?SILENT_CLOSE_DELAY).
 
-%% This function is deprecated.
-%% It could be called in 3.13 / 4.0 mixed version clusters by the old 3.13 CLI command
-%% rabbitmqctl list_amqp10_connections
-%%
-%% rabbitmqctl list_connections
-%% listing AMQP 1.0 connections in 4.0 uses rabbit_reader:info/2 instead.
--spec info(rabbit_types:connection(), rabbit_types:info_keys()) ->
-    rabbit_types:infos().
-info(Pid, InfoItems) ->
-    case gen_server:call(Pid, {info, InfoItems}, infinity) of
-        {ok, InfoList} ->
-            InfoList;
-        {error, Reason} ->
-            throw(Reason)
-    end.
+-spec local_connections() -> [pid()].
+local_connections() ->
+    pg:which_groups(pg_scope()).
+
+register_connection(Pid) ->
+    pg:join(pg_scope(), Pid, Pid).
+
+pg_scope() ->
+    rabbit:pg_local_scope(amqp_connection).
 
 infos(Items, State) ->
     [{Item, i(Item, State)} || Item <- Items].
@@ -1045,12 +1223,7 @@ i(SockStat, #v1{sock = Sock})
        SockStat =:= send_oct;
        SockStat =:= send_cnt;
        SockStat =:= send_pend ->
-    case rabbit_net:getstat(Sock, [SockStat]) of
-        {ok, [{SockStat, Val}]} ->
-            Val;
-        {error, _} ->
-            ''
-    end;
+    rabbit_net:getstat_or_zero(Sock, SockStat);
 i(ssl, #v1{sock = Sock}) -> rabbit_net:is_ssl(Sock);
 i(SSL, #v1{sock = Sock, proxy_socket = ProxySock})
   when SSL =:= ssl_protocol;
@@ -1061,6 +1234,7 @@ i(SSL, #v1{sock = Sock, proxy_socket = ProxySock})
 i(Cert, #v1{sock = Sock})
   when Cert =:= peer_cert_issuer;
        Cert =:= peer_cert_subject;
+       Cert =:= peer_cert_serial_number;
        Cert =:= peer_cert_validity ->
     rabbit_ssl:cert_info(Cert, Sock);
 i(client_properties, #v1{connection = #v1_connection{properties = Props}}) ->
@@ -1070,7 +1244,9 @@ i(client_properties, #v1{connection = #v1_connection{properties = Props}}) ->
         undefined ->
             [];
         {map, Fields} ->
-            [mc_amqpl:to_091(Key, TypeVal) || {{symbol, Key}, TypeVal} <- Fields]
+            [mc_amqpl:to_091(Key, TypeVal)
+             || {{symbol, Key}, TypeVal} <- Fields,
+                mc_amqpl:is_representable(Key, TypeVal)]
     end;
 i(channels, #v1{tracked_channels = Channels}) ->
     maps:size(Channels);
@@ -1116,3 +1292,13 @@ ignore_maintenance({map, Properties}) ->
       Properties);
 ignore_maintenance(_) ->
     false.
+
+sole_conn_enforcement_policy({map, List}) ->
+    case lists:keyfind(?SOLE_CONN_ENFORCEMENT_POLICY, 1, List) of
+        {_, ?SOLE_CONN_ENFORCEMENT_POLICY_CLOSE_EXISTING} ->
+            close_existing;
+        _ ->
+            refuse_connection
+    end;
+sole_conn_enforcement_policy(undefined) ->
+    refuse_connection.

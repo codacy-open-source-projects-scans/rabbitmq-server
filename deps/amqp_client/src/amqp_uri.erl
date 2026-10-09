@@ -20,21 +20,30 @@
 -spec remove_credentials(URI :: string() | binary()) -> string().
 remove_credentials(URI) ->
     UriString = rabbit_data_coercion:to_list(URI),
-    Props = uri_parser:parse(UriString,
-                             [{host, undefined}, {path, undefined},
-                              {port, undefined}, {'query', []}]),
-    PortPart = case proplists:get_value(port, Props) of
-                   undefined -> "";
-                   Port      -> rabbit_misc:format(":~B", [Port])
-               end,
-    PGet = fun(K, P) -> case proplists:get_value(K, P) of
-                            undefined -> "";
-                            R         -> R
-                        end
-           end,
-    rabbit_misc:format(
-      "~ts://~ts~ts~ts", [proplists:get_value(scheme, Props), PGet(host, Props),
-                      PortPart,                           PGet(path, Props)]).
+    case uri_parser:parse(UriString,
+                          [{host, undefined}, {path, undefined},
+                           {port, undefined}, {'query', []}]) of
+        {error, _} ->
+            %% `uri_parser:parse/2` cannot parse a structurally malformed URI.
+            %% Since this function is used to sanitize a URI before logging it,
+            %% and is therefore routinely called on invalid input, fall back to
+            %% a best-effort strip of the `user:password@` userinfo rather than
+            %% crashing.
+            re:replace(UriString, "://[^@/]*@", "://", [{return, list}]);
+        Props ->
+            PortPart = case proplists:get_value(port, Props) of
+                           undefined -> "";
+                           Port      -> rabbit_misc:format(":~B", [Port])
+                       end,
+            PGet = fun(K, P) -> case proplists:get_value(K, P) of
+                                    undefined -> "";
+                                    R         -> R
+                                end
+                   end,
+            rabbit_misc:format(
+              "~ts://~ts~ts~ts", [proplists:get_value(scheme, Props), PGet(host, Props),
+                              PortPart,                           PGet(path, Props)])
+    end.
 
 %% @spec (Uri) -> {ok, #amqp_params_network{} | #amqp_params_direct{}} |
 %%                {error, {Info, Uri}}
@@ -52,9 +61,11 @@ remove_credentials(URI) ->
 %%
 %% The extra parameters that may be specified are channel_max,
 %% frame_max, heartbeat and auth_mechanism (the latter can appear more
-%% than once).  The extra parameters that may be specified for an SSL
+%% than once, and must be one of plain, amqplain, external or crdemo).
+%% The extra parameters that may be specified for an SSL
 %% connection are cacertfile, certfile, keyfile, verify,
-%% fail_if_no_peer_cert, password, and depth.
+%% fail_if_no_peer_cert, password, depth, server_name_indication,
+%% and customize_hostname_check.
 -type parse_result() :: {ok, #amqp_params_network{}} |
                         {ok, #amqp_params_direct{}} |
                         {error, {any(), string()}}.
@@ -176,11 +187,13 @@ build_ssl_broker(ParsedUri, DefaultVHost) ->
                       [{fun find_path_parameter/1, cacertfile},
                        {fun find_path_parameter/1, certfile},
                        {fun find_path_parameter/1, keyfile},
-                       {fun find_atom_parameter/1, verify},
+                       {fun find_verify_parameter/1, verify},
                        {fun find_boolean_parameter/1, fail_if_no_peer_cert},
                        {fun find_identity_parameter/1, password},
                        {fun find_sni_parameter/1, server_name_indication},
-                       {fun find_integer_parameter/1, depth}]],
+                       {fun find_integer_parameter/1, depth},
+                       {fun find_customize_hostname_check_parameter/1,
+                        customize_hostname_check}]],
           []),
     Params1 = Params0#amqp_params_network{ssl_options = SSLOptions},
     amqp_ssl:maybe_enhance_ssl_options(Params1).
@@ -240,6 +253,13 @@ find_sni_parameter("disable") ->
 find_sni_parameter(Value) ->
     find_identity_parameter(Value).
 
+%% The value is a fun and cannot be expressed in a URI, so only the
+%% OTP-provided HTTPS match fun is exposed.
+find_customize_hostname_check_parameter("https") ->
+    return([{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]);
+find_customize_hostname_check_parameter(Value) ->
+    fail({unsupported_customize_hostname_check, Value}).
+
 find_identity_parameter(Value) -> return(Value).
 
 find_integer_parameter(Value) ->
@@ -254,10 +274,9 @@ find_boolean_parameter(Value) ->
         _       -> fail({require_boolean, Value})
     end.
 
-find_atom_parameter(Value) ->
-    try return(list_to_existing_atom(Value))
-    catch error:badarg -> fail({invalid_atom_parameter, Value})
-    end.
+find_verify_parameter("verify_peer") -> return(verify_peer);
+find_verify_parameter("verify_none") -> return(verify_none);
+find_verify_parameter(Value)         -> fail({invalid_verify_parameter, Value}).
 
 mechanisms(ParsedUri) ->
     Query = proplists:get_value('query', ParsedUri),
@@ -265,16 +284,20 @@ mechanisms(ParsedUri) ->
                      []    -> ["plain", "amqplain"];
                      Mechs -> Mechs
                  end,
-    [case [safe_mechanism_token(T) || T <- string:tokens(Mech, ":")] of
-         [F]    -> fun (R, P, S) -> amqp_auth_mechanisms:F(R, P, S) end;
-         [M, F] -> fun (R, P, S) -> M:F(R, P, S) end;
-         L      -> throw({not_mechanism, L})
-     end || Mech <- Mechanisms].
+    [mechanism(Mech) || Mech <- Mechanisms].
 
-safe_mechanism_token(T) ->
-    try list_to_existing_atom(T)
-    catch error:badarg -> throw({unknown_mechanism, T})
+mechanism(Mech) ->
+    case string:split(Mech, ":", all) of
+        [Name]                         -> mechanism_fun(Name, Mech);
+        ["amqp_auth_mechanisms", Name] -> mechanism_fun(Name, Mech);
+        _                              -> throw({unknown_mechanism, Mech})
     end.
+
+mechanism_fun("plain",    _Mech) -> fun amqp_auth_mechanisms:plain/3;
+mechanism_fun("amqplain", _Mech) -> fun amqp_auth_mechanisms:amqplain/3;
+mechanism_fun("external", _Mech) -> fun amqp_auth_mechanisms:external/3;
+mechanism_fun("crdemo",   _Mech) -> fun amqp_auth_mechanisms:crdemo/3;
+mechanism_fun(_Name,       Mech) -> throw({unknown_mechanism, Mech}).
 
 %% --=: Plain state monad implementation start :=--
 run_state_monad(FunList, State) ->

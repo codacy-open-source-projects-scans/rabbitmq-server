@@ -69,7 +69,7 @@ login(<<"GET">>, Req, State) ->
                                         <<>>, Req), State};
                 _ -> {ok, cowboy_req:reply(405, Req), State}
             end;
-        {Type, Value} -> 
+        {Type, Value} ->
             redirect_to_home_with_cookie(?OAUTH2_BOOTSTRAP_PATH, Type, Value, Req, State)
     end;
 
@@ -124,7 +124,7 @@ handleAccessToken(Req0, AccessToken, State) ->
 redirect_to_home_with_cookie(CookiePath, CookieName, CookieValue, Req=#{scheme := Scheme}, State) ->
     CookieSettings0 = #{
         http_only => true,
-        path => CookiePath,
+        path => rabbit_mgmt_util:prefixed_path(CookiePath),
         max_age => 30,
         same_site => strict
     },

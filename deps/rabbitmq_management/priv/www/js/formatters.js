@@ -18,7 +18,16 @@ const CONSUMER_OWNER_FORMATTERS = [
         }
     }},
     {order: 100, formatter: function(consumer) {
-        return link_channel(consumer.channel_details.name);
+        var cd = consumer.channel_details;
+        if (cd.name) {
+            return link_channel(cd.name);
+        }
+        // Consumers of other protocols (AMQP 1.0, MQTT, STOMP) belong
+        // directly to a connection.
+        if (cd.connection_name) {
+            return link_conn(cd.connection_name);
+        }
+        return UNKNOWN_REPR;
     }}
 ];
 
@@ -42,8 +51,6 @@ function fmt_string(str, unknown) {
 }
 
 function fmt_si_prefix(num0, max0, binary, allow_fractions) {
-    if (num == 0) return 0;
-
     var thousand = binary ? 1024 : 1000;
     function f(n, m, p) {
         if (m > thousand) return f(n / thousand, m / thousand, p + 1);
@@ -92,10 +99,16 @@ function fmt_date0(d) {
 }
 
 function fmt_timestamp(ts) {
+    if (ts == undefined) {
+        return UNKNOWN_REPR;
+    }
     return fmt_date(new Date(ts));
 }
 
 function fmt_timestamp_mini(ts) {
+    if (ts == undefined) {
+        return UNKNOWN_REPR;
+    }
     return fmt_date_mini(new Date(ts));
 }
 
@@ -158,7 +171,7 @@ function fmt_features_short(obj) {
 function fmt_activity_status(obj, unknown) {
     if (unknown == undefined) unknown = UNKNOWN_REPR;
     if (obj == undefined) return unknown;
-    return obj.replace('_', ' ');
+    return fmt_escape_html(obj.replace('_', ' '));
 }
 
 function short_conn(name) {
@@ -177,11 +190,14 @@ function args_to_features(obj) {
     var res = {};
     for (var k in obj.arguments) {
         if (k in KNOWN_ARGS) {
-            res[k] = fmt_escape_feature(obj.arguments[k]);
+            // Exclude SAC which is the only boolean feature
+            if (obj.arguments[k] !== false) {
+                res[k] = obj.arguments[k];
+            }
         }
         else {
             if (res.arguments == undefined) res.arguments = {};
-            res.arguments[fmt_escape_html(k)] = fmt_escape_html(obj.arguments[k]);
+            res.arguments[fmt_escape_html(k)] = obj.arguments[k];
         }
     }
     if (obj.exclusive) {
@@ -457,7 +473,7 @@ function fmt_plugins_small(node) {
     for (var i = 0; i < node.applications.length; i++) {
         var application = node.applications[i];
         if (jQuery.inArray(application.name, node.enabled_plugins) != -1 ) {
-            plugins.push(application.name);
+            plugins.push(fmt_escape_html_one_line(application.name));
         }
     }
     return '<abbr title="Enabled plugins: ' + plugins.join(", ") + '">' +
@@ -478,7 +494,7 @@ function get_plugins_list(node) {
 function fmt_rabbit_version(applications) {
     for (var i in applications) {
         if (applications[i].name == 'rabbit') {
-            return applications[i].version;
+            return fmt_escape_html(applications[i].version);
         }
     }
     return 'unknown';
@@ -492,15 +508,6 @@ function fmt_strip_tags(txt) {
         return "";
     }
     return ("" + txt).replace(/<(?:.|\n)*?>/gm, '');
-}
-
-function fmt_escape_feature(txt) {
-    // Exclude SAC which is the only boolean feature
-    if(txt === false) {
-        return undefined;
-    } else {
-        return fmt_escape_html0(txt).replace(/\n/g, '<br/>');
-    }
 }
 
 function fmt_escape_html(txt) {
@@ -522,7 +529,8 @@ function fmt_escape_html0(txt) {
     return ("" + txt).replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/\"/g, '&quot;');
+        .replace(/\"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function fmt_maybe_wrap(txt, encoding) {
@@ -553,12 +561,12 @@ function fmt_object_state(obj) {
     if (obj.state == undefined) return '';
 
     var colour = 'green';
-    var text = obj.state;
+    var text = fmt_escape_html(obj.state);
     var explanation;
 
     if (obj.idle_since !== undefined) {
         colour = 'grey';
-        explanation = 'Idle since ' + obj.idle_since;
+        explanation = 'Idle since ' + fmt_escape_html_one_line(obj.idle_since);
         text = 'idle';
     }
     // Only connections can be 'blocked' or 'blocking'
@@ -578,7 +586,7 @@ function fmt_object_state(obj) {
         colour = 'yellow';
         var terminated_by = "";
         if (obj.terminated_by) {
-            terminated_by = " by \"" + String(obj.terminated_by) + "\"";
+            terminated_by = " by \"" + fmt_escape_html_one_line(obj.terminated_by) + "\"";
         }
         explanation = 'The queue is being deleted' + terminated_by + ".";
     }
@@ -929,9 +937,8 @@ function paginate_ui(pages, context, label){
     res +=' </table>' ;
     res += '<p id="filter-truncate"><span class="updatable">';
     res += '<span><label for="'+ context +'-pagesize"> Displaying ' + pages.item_count + '  item'+ ((pages.item_count > 1) ? 's' : '' ) + ' , page size up to: </label> ';
-    res +=       ' <input id="'+ context +'-pagesize" data-page-start="1" class="pagination_class shortinput pagination_class_input" type="text" ';
-    res +=   'value = "' +  fmt_page_size_request(context, pages.page_size) +'"';
-    res +=   'onkeypress = "return isNumberKey(event)"> </input></span></p>';
+    res +=       ' <input id="'+ context +'-pagesize" data-page-start="1" class="pagination_class shortinput pagination_class_input pagination_class_pagesize_input" type="text" ';
+    res +=   'value = "' +  fmt_page_size_request(context, pages.page_size) +'"> </input></span></p>';
     res += '</tr>';
     res += '</div>';
     res += '</div>';
@@ -1072,7 +1079,7 @@ function fmt_vhost_state(vhost){
         var node_state = cluster_state[node];
         if(cluster_state[node] == "stopped" || cluster_state[node] == "nodedown"){
             non_ok_count++;
-            down_nodes.push(node);
+            down_nodes.push(fmt_escape_html_one_line(node));
         } else if(cluster_state[node] == "running"){
             ok_count++;
         }

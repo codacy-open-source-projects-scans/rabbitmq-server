@@ -13,11 +13,21 @@ endef
 DEPS = rabbit_common rabbit
 LOCAL_DEPS = ssl crypto public_key inets
 ## We need the Cowboy's test utilities
-TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers amqp_client ct_helper trust_store_http proper
+## `rabbitmq_web_mqtt` is a test-only dependency that's
+## needed for testing Trust Store's effects on that plugin's listeners.
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers amqp_client ct_helper trust_store_http proper rabbitmq_web_mqtt
 dep_ct_helper = git https://github.com/extend/ct_helper.git master
 
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
 
+PLT_APPS += rabbitmq_cli $(ELIXIR_ERL_EBIN)
+
+ELIXIR = system
+
 include ../../rabbitmq-components.mk
 include ../../erlang.mk
+
+ELIXIR_ERL_EBIN := $(shell dirname $$(elixir -e 'IO.puts(:code.which(:elixir_erl))' 2>/dev/null))
+DIALYZER_PLT_OPTS += -pa $(ELIXIR_ERL_EBIN)
+DIALYZER_OPTS += -pa $(ELIXIR_ERL_EBIN)

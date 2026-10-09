@@ -48,11 +48,11 @@
 
 -behaviour(gen_server2).
 
--export([start_link/10, start_link/11, do/2, do/3, do_flow/3, flush/1, shutdown/1]).
--export([send_command/2]).
+-export([start_link/10, start_link/11, flush/1, shutdown/1]).
+-export([send_command/2, message_too_large/4]).
 -export([list/0, info_keys/0, info/1, info/2, info_all/0, info_all/1,
          emit_info_all/4, info_local/1]).
--export([refresh_config_local/0, ready_for_close/1]).
+-export([refresh_config_local/0]).
 -export([refresh_interceptors/0]).
 -export([force_event_refresh/1]).
 -export([update_user_state/2]).
@@ -64,6 +64,7 @@
 
 %% Internal
 -export([list_local/0, emit_info_local/3]).
+-export([is_local/1]).
 -export([get_vhost/1, get_user/1]).
 %% For testing
 -export([build_topic_variable_map/3]).
@@ -108,6 +109,7 @@
           consumer_timeout,
           authz_context,
           max_consumers,  % taken from rabbit.consumer_max_per_channel
+          max_tx_messages,  % taken from rabbit.channel_tx_message_max
           %% defines how ofter gc will be executed
           writer_gc_threshold,
           msg_interceptor_ctx :: rabbit_msg_interceptor:context()
@@ -167,14 +169,23 @@
              interceptor_state,
              queue_states,
              tick_timer,
-             publishing_mode = false :: boolean()
+             publishing_mode = false :: boolean(),
+             %% for clients that do not respond to a `basic.cancel` with a `basic.cancel_ok`
+             pending_consumer_cancels = #{} :: #{rabbit_types:ctag() => reference()}
             }).
 
 -define(QUEUE, lqueue).
 
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
 
+%% A transaction's publishes are buffered in the channel process until
+%% tx.commit, with none of the credit-flow backpressure that applies
+%% outside a transaction; this bounds that buffer.
+-define(MAX_CHANNEL_TX_MESSAGES, 10_000).
+
 -define(REFRESH_TIMEOUT, 15000).
+
+-define(CONSUMER_CANCEL_OK_TIMEOUT, 10_000).
 
 -define(STATISTICS_KEYS,
         [reductions,
@@ -262,27 +273,6 @@ start_link(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
       ?MODULE, [Channel, ReaderPid, WriterPid, ConnPid, ConnName,
                 User, VHost, Capabilities, CollectorPid, Limiter, AmqpParams], []).
 
--spec do(pid(), rabbit_framing:amqp_method_record()) -> 'ok'.
-
-do(Pid, Method) ->
-    rabbit_channel_common:do(Pid, Method).
-
--spec do
-        (pid(), rabbit_framing:amqp_method_record(),
-         rabbit_types:'maybe'(rabbit_types:content())) ->
-            'ok'.
-
-do(Pid, Method, Content) ->
-    rabbit_channel_common:do(Pid, Method, Content).
-
--spec do_flow
-        (pid(), rabbit_framing:amqp_method_record(),
-         rabbit_types:'maybe'(rabbit_types:content())) ->
-            'ok'.
-
-do_flow(Pid, Method, Content) ->
-    rabbit_channel_common:do_flow(Pid, Method, Content).
-
 -spec flush(pid()) -> 'ok'.
 
 flush(Pid) ->
@@ -298,6 +288,12 @@ shutdown(Pid) ->
 send_command(Pid, Msg) ->
     gen_server2:cast(Pid,  {command, Msg}).
 
+-spec message_too_large(pid(), rabbit_framing:amqp_method_record(),
+                        non_neg_integer(), pos_integer()) -> 'ok'.
+
+message_too_large(Pid, Method, Size, MaxMessageSize) ->
+    gen_server2:cast(Pid, {message_too_large, Method, Size, MaxMessageSize}).
+
 -spec list() -> [pid()].
 
 list() ->
@@ -307,7 +303,9 @@ list() ->
 -spec list_local() -> [pid()].
 
 list_local() ->
-    pg_local:get_members(rabbit_channels).
+    try pg:which_groups(pg_scope())
+    catch error:badarg -> []
+    end.
 
 -spec info_keys() -> rabbit_types:info_keys().
 
@@ -397,11 +395,6 @@ refresh_interceptors() ->
       list_local()),
     ok.
 
--spec ready_for_close(pid()) -> 'ok'.
-
-ready_for_close(Pid) ->
-    rabbit_channel_common:ready_for_close(Pid).
-
 -spec force_event_refresh(reference()) -> 'ok'.
 
 % Note: https://www.pivotaltracker.com/story/show/166962656
@@ -425,6 +418,14 @@ update_user_state(Pid, UserState) when is_pid(Pid) ->
 
 %%---------------------------------------------------------------------------
 
+-spec is_local(pid()) -> boolean().
+is_local(Pid) ->
+    pg:get_local_members(pg_scope(), Pid) =/= [].
+
+-spec pg_scope() -> atom().
+pg_scope() ->
+    rabbit:pg_scope_amqp091_channel().
+
 init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
       Capabilities, CollectorPid, LimiterPid, AmqpParams]) ->
     process_flag(trap_exit, true),
@@ -433,7 +434,7 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
 
     ?LG_PROCESS_TYPE(channel),
     ?store_proc_name({ConnName, Channel}),
-    ok = pg_local:join(rabbit_channels, self()),
+    ok = pg:join(pg_scope(), self(), self()),
     Flow = case rabbit_misc:get_env(rabbit, classic_queue_flow_control, true) of
              true   -> flow;
              false  -> noflow
@@ -455,6 +456,8 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
     OptionalVariables = extract_variable_map_from_amqp_params(AmqpParams),
     {ok, GCThreshold} = application:get_env(rabbit, writer_gc_threshold),
     MaxConsumers = application:get_env(rabbit, consumer_max_per_channel, infinity),
+    MaxTxMessages = application:get_env(rabbit, channel_tx_message_max,
+                                         ?MAX_CHANNEL_TX_MESSAGES),
     MsgIcptCtx = #{protocol => amqp091,
                    vhost => VHost,
                    username => User#user.username,
@@ -475,6 +478,7 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
                             consumer_timeout = ConsumerTimeout,
                             authz_context = OptionalVariables,
                             max_consumers = MaxConsumers,
+                            max_tx_messages = MaxTxMessages,
                             writer_gc_threshold = GCThreshold,
                             msg_interceptor_ctx = MsgIcptCtx},
                 limiter = Limiter,
@@ -598,10 +602,24 @@ handle_cast({method, Method, Content, Flow},
             {stop, {Reason, Stacktrace}, State}
     end;
 
+handle_cast({message_too_large, _Method, _Size, _MaxMessageSize},
+            State = #ch{cfg = #conf{state = closing}}) ->
+    noreply(State);
+handle_cast({message_too_large, Method, Size, MaxMessageSize}, State) ->
+    rabbit_global_counters:messages_received(amqp091, 1),
+    Error = message_too_large_error(Size, MaxMessageSize),
+    MethodName = rabbit_misc:method_record_type(Method),
+    handle_exception(Error#amqp_error{method = MethodName}, State);
+
 handle_cast(ready_for_close,
             State = #ch{cfg = #conf{state = closing,
                                     writer_pid = WriterPid}}) ->
-    ok = rabbit_writer:send_command_sync(WriterPid, #'channel.close_ok'{}),
+    try
+        ok = rabbit_writer:send_command_sync(WriterPid, #'channel.close_ok'{})
+    catch
+        _Class:Reason ->
+            ?LOG_DEBUG("Failed to send 'channel.close_ok' on a terminating connection, reason: ~tp", [Reason])
+    end,
     {stop, normal, State};
 
 handle_cast(terminate, State = #ch{cfg = #conf{writer_pid = WriterPid}}) ->
@@ -687,6 +705,10 @@ handle_info({'DOWN', _MRef, process, Pid, normal}, State) ->
     ?LOG_DEBUG("Process ~0p monitored by channel ~0p exited", [Pid, self()]),
     {noreply, State};
 
+%% `erpc` encodes a successful return as `{Ref, return, Value}` and the spawned
+%% helper exits with that reason; ignore it rather than crashing the channel.
+handle_info({'EXIT', _Pid, {Ref, return, _}}, State) when is_reference(Ref) ->
+    noreply(State);
 handle_info({'EXIT', _Pid, Reason}, State) ->
     {stop, Reason, State};
 
@@ -697,6 +719,15 @@ handle_info({{Ref, Node}, LateAnswer},
                  [Channel, LateAnswer, Node]),
     noreply(State);
 
+handle_info({timeout, TRef, {consumer_cancel_ok_timeout, CTag}},
+            #ch{pending_consumer_cancels = Pending} = State) ->
+    case Pending of
+        #{CTag := TRef} ->
+            {noreply, State1} = cancel_consumer(CTag, true, undefined, State),
+            noreply(State1);
+        _ ->
+            noreply(State)
+    end;
 handle_info(tick, #ch{} = State0) ->
     case get(permission_cache_can_expire) of
       true  ->
@@ -730,26 +761,32 @@ terminate(_Reason,
           State = #ch{cfg = #conf{user = #user{username = Username}},
                       consumer_mapping = CM,
                       queue_states = QueueCtxs}) ->
-    rabbit_queue_type:close(QueueCtxs),
-    {_Res, _State1} = notify_queues(State),
-    pg_local:leave(rabbit_channels, self()),
-    rabbit_event:if_enabled(State, #ch.stats_timer,
-                            fun() -> emit_stats(State) end),
-    [delete_stats(Tag) || {Tag, _} <- get()],
-    maybe_decrease_global_publishers(State),
-    maps:foreach(
-      fun (_, _) ->
-              rabbit_global_counters:consumer_deleted(amqp091)
-      end, CM),
-    rabbit_core_metrics:channel_closed(self()),
-    rabbit_event:notify(channel_closed, [{pid, self()},
-                                         {user_who_performed_action, Username},
-                                         {consumer_count, maps:size(CM)}]),
-    case rabbit_confirms:size(State#ch.unconfirmed) of
-        0 -> ok;
-        NumConfirms ->
-            ?LOG_WARNING("Channel is stopping with ~b pending publisher confirms",
-                               [NumConfirms])
+    try
+        rabbit_queue_type:close(QueueCtxs),
+        {_Res, _State1} = notify_queues(State),
+        pg:leave(pg_scope(), self(), self()),
+        rabbit_event:if_enabled(State, #ch.stats_timer,
+                                fun() -> emit_stats(State) end),
+        [delete_stats(Tag) || {Tag, _} <- get()],
+        maybe_decrease_global_publishers(State),
+        maps:foreach(
+          fun (_, _) ->
+                  rabbit_global_counters:consumer_deleted(amqp091)
+          end, CM),
+        rabbit_core_metrics:channel_closed(self()),
+        rabbit_event:notify(channel_closed, [{pid, self()},
+                                             {user_who_performed_action, Username},
+                                             {consumer_count, maps:size(CM)}]),
+        case rabbit_confirms:size(State#ch.unconfirmed) of
+            0 -> ok;
+            NumConfirms ->
+                ?LOG_WARNING("Channel is stopping with ~b pending publisher confirms",
+                                   [NumConfirms])
+        end
+    catch
+        _Class:Reason ->
+            ?LOG_WARNING("Channel ~tp termination cleanup failed with reason: ~tp",
+                         [self(), Reason])
     end.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -868,6 +905,43 @@ check_write_permitted(Resource, User, Context) ->
 check_read_permitted(Resource, User, Context) ->
     check_resource_access(User, Resource, read, Context).
 
+%% Used by passive declare operations.
+%%
+%% For security reviews:
+%% unlike regular declarations, passive declares require *any* permission on the
+%% target resource (e.g. a queue) by design.
+%% See rabbitmq/rabbitmq-server#16085 for context.
+check_any_resource_access_permitted(Resource, User, Context) ->
+    Cache = case get(permission_cache) of
+                undefined -> [];
+                C -> C
+            end,
+    HasCachedHit = lists:any(fun({Res, Ctx, _Permission})
+                                   when Res =:= Resource andalso
+                                        Ctx =:= Context ->
+                                     true;
+                                (_) ->
+                                     false
+                             end, Cache),
+    case HasCachedHit of
+        true ->
+            ok;
+        false ->
+            %% 'configure' is intentionally tried last so that the error reported
+            %% in the negative/refusal case matches that of a regular declare.
+            Perms = [read, write, configure],
+            check_any_resource_access(User, Resource, Perms, Context)
+    end.
+
+check_any_resource_access(User, Resource, [Perm], Context) ->
+    check_resource_access(User, Resource, Perm, Context);
+check_any_resource_access(User, Resource, [Perm | Rest], Context) ->
+    try
+        check_resource_access(User, Resource, Perm, Context)
+    catch exit:#amqp_error{name = access_refused} ->
+              check_any_resource_access(User, Resource, Rest, Context)
+    end.
+
 check_write_permitted_on_topics(#exchange{type = topic} = Resource, User, Mc, AuthzContext) ->
     lists:foreach(
       fun(RoutingKey) ->
@@ -942,6 +1016,18 @@ extract_variable_map_from_amqp_params([Value]) ->
 extract_variable_map_from_amqp_params(_) ->
     #{}.
 
+check_tx_size({Msgs, _Acks}, MaxTxMessages) ->
+    case ?QUEUE:len(Msgs) >= MaxTxMessages of
+        true ->
+            rabbit_misc:precondition_failed(
+              "transaction has reached the maximum of ~B uncommitted publishes",
+              [MaxTxMessages]);
+        false ->
+            ok
+    end;
+check_tx_size(_Tx, _MaxTxMessages) ->
+    ok.
+
 check_msg_size(Content, GCThreshold) ->
     MaxMessageSize = persistent_term:get(max_message_size),
     Size = rabbit_basic:maybe_gc_large_msg(Content, GCThreshold),
@@ -949,15 +1035,18 @@ check_msg_size(Content, GCThreshold) ->
         true ->
             rabbit_msg_size_metrics:observe(amqp091, Size);
         false ->
-            Fmt = case MaxMessageSize of
-                      ?MAX_MSG_SIZE ->
-                          "message size ~B is larger than max size ~B";
-                      _ ->
-                          "message size ~B is larger than configured max size ~B"
-                  end,
-            rabbit_misc:precondition_failed(
-              Fmt, [Size, MaxMessageSize])
+            rabbit_misc:protocol_error(
+              message_too_large_error(Size, MaxMessageSize))
     end.
+
+message_too_large_error(Size, MaxMessageSize) ->
+    Fmt = case MaxMessageSize of
+              ?MAX_MSG_SIZE ->
+                  "message size ~B is larger than max size ~B";
+              _ ->
+                  "message size ~B is larger than configured max size ~B"
+          end,
+    rabbit_misc:amqp_error(precondition_failed, Fmt, [Size, MaxMessageSize], none).
 
 qbin_to_resource(QueueNameBin, VHostPath) ->
     name_to_resource(queue, QueueNameBin, VHostPath).
@@ -1142,12 +1231,14 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
                                                 trace_state = TraceState,
                                                 authz_context = AuthzContext,
                                                 writer_gc_threshold = GCThreshold,
+                                                max_tx_messages = MaxTxMessages,
                                                 msg_interceptor_ctx = MsgIcptCtx
                                                },
                                    tx               = Tx,
                                    confirm_enabled  = ConfirmEnabled,
                                    delivery_flow    = Flow
                                    }) ->
+    check_tx_size(Tx, MaxTxMessages),
     State1 = maybe_increase_global_publishers(State0),
     rabbit_global_counters:messages_received(amqp091, 1),
     check_msg_size(Content, GCThreshold),
@@ -1382,8 +1473,12 @@ handle_method(#'basic.cancel'{consumer_tag = ConsumerTag, nowait = NoWait},
     OkMsg = #'basic.cancel_ok'{consumer_tag = ConsumerTag},
     cancel_consumer(ConsumerTag, NoWait, OkMsg, State);
 
-handle_method(#'basic.cancel_ok'{consumer_tag = ConsumerTag}, _, State) ->
-    cancel_consumer(ConsumerTag, false, undefined, State);
+handle_method(#'basic.cancel_ok'{consumer_tag = ConsumerTag}, _,
+              State = #ch{pending_consumer_cancels = Pending})
+  when is_map_key(ConsumerTag, Pending) ->
+    cancel_consumer(ConsumerTag, true, undefined, State);
+handle_method(#'basic.cancel_ok'{}, _, State) ->
+    {noreply, State};
 handle_method(#'basic.qos'{prefetch_size = Size}, _, _State) when Size /= 0 ->
     rabbit_misc:protocol_error(not_implemented,
                                "prefetch_size!=0 (~w)", [Size]);
@@ -1706,7 +1801,7 @@ handle_consuming_queue_down_or_eol(QName,
 
 cancel_consumer(CTag, QName, #ch{cfg = #conf{},
                                  consumer_mapping = CMap} = State) ->
-    case server_consumer_cancel_supported(State) of
+    case client_supports_consumer_cancel_notify(State) of
         true ->
             ok = send(#'basic.cancel'{consumer_tag = CTag,
                                       nowait = true}, State);
@@ -1716,9 +1811,10 @@ cancel_consumer(CTag, QName, #ch{cfg = #conf{},
     rabbit_event:notify(consumer_deleted, [{consumer_tag, CTag},
                                            {channel, self()},
                                            {queue, QName}]),
-    State#ch{consumer_mapping = maps:remove(CTag, CMap)}.
+    clear_pending_consumer_cancel(
+      CTag, State#ch{consumer_mapping = maps:remove(CTag, CMap)}).
 
-server_consumer_cancel_supported(#ch{cfg = #conf{capabilities = Capabilities}}) ->
+client_supports_consumer_cancel_notify(#ch{cfg = #conf{capabilities = Capabilities}}) ->
     {bool, true} == rabbit_misc:table_lookup(Capabilities,
                                              <<"consumer_cancel_notify">>).
 
@@ -1749,7 +1845,7 @@ cancel_consumer_recheck(CTag, Q,
                             queue_consumers = QCons,
                             queue_states = QStates0} = State) ->
     QName = amqqueue:get_name(Q),
-    case server_consumer_cancel_supported(State) of
+    case client_supports_consumer_cancel_notify(State) of
         true ->
             ok = send(#'basic.cancel'{consumer_tag = CTag,
                                       nowait = true}, State);
@@ -1783,9 +1879,10 @@ cancel_consumer_recheck(CTag, Q,
     rabbit_event:notify(consumer_deleted, [{consumer_tag, CTag},
                                            {channel, self()},
                                            {queue, QName}]),
-    State#ch{consumer_mapping = maps:remove(CTag, CMap),
-             queue_consumers = QCons1,
-             queue_states = QStates1}.
+    clear_pending_consumer_cancel(
+      CTag, State#ch{consumer_mapping = maps:remove(CTag, CMap),
+                     queue_consumers = QCons1,
+                     queue_states = QStates1}).
 
 binding_action_with_checks(
   Action, SourceNameBin0, DestinationType, DestinationNameBin0,
@@ -2302,10 +2399,6 @@ i(cached_segments,   #ch{queue_states = QS}) ->
 i(state,                   #ch{cfg = #conf{state = running}}) -> credit_flow:state();
 i(state,                   #ch{cfg = #conf{state = State}}) -> State;
 i(prefetch_count,          #ch{cfg = #conf{consumer_prefetch = C}})    -> C;
-%% Retained for backwards compatibility e.g. in mixed version clusters,
-%% can be removed starting with 4.2. MK.
-i(global_prefetch_count, #ch{limiter = Limiter}) ->
-    rabbit_limiter:get_prefetch_limit(Limiter);
 i(interceptors, #ch{interceptor_state = IState}) ->
     IState;
 i(garbage_collection, _State) ->
@@ -2442,11 +2535,12 @@ handle_method(#'queue.declare'{queue       = QueueNameBin,
                 true  -> ConnPid;
                 false -> none
             end,
+    Args0Stripped = lists:keydelete(<<"x-name-prefix">>, 1, Args0),
     Args = rabbit_amqqueue:augment_declare_args(VHostPath,
                                                 DurableDeclare,
                                                 ExclusiveDeclare,
                                                 AutoDelete,
-                                                Args0),
+                                                Args0Stripped),
     StrippedQueueNameBin = strip_cr_lf(QueueNameBin),
     Durable = DurableDeclare andalso not ExclusiveDeclare,
     Kind = queue,
@@ -2454,7 +2548,17 @@ handle_method(#'queue.declare'{queue       = QueueNameBin,
                         <<>> ->
                             case rabbit_amqqueue:is_server_named_allowed(Args) of
                                 true ->
-                                    rabbit_guid:binary(rabbit_guid:gen_secure(), "amq.gen");
+                                    NamePrefix =
+                                        case rabbit_amqqueue:server_named_queue_prefix(Args0) of
+                                            {ok, P} ->
+                                                strip_cr_lf(P);
+                                            {error, {prefix_too_long, P}} ->
+                                                rabbit_misc:protocol_error(
+                                                  precondition_failed,
+                                                  "Queue name prefix '~ts' exceeds the 64-byte limit",
+                                                  [strip_cr_lf(P)])
+                                        end,
+                                    rabbit_guid:binary(rabbit_guid:gen_secure(), NamePrefix);
                                 false ->
                                     rabbit_misc:protocol_error(
                                       precondition_failed,
@@ -2531,7 +2635,10 @@ handle_method(#'queue.declare'{queue   = QueueNameBin,
               ConnPid, AuthzContext, _CollectorPid, VHostPath, User) ->
     StrippedQueueNameBin = strip_cr_lf(QueueNameBin),
     QueueName = rabbit_misc:queue_resource(VHostPath, StrippedQueueNameBin),
-    check_configure_permitted(QueueName, User, AuthzContext),
+    %% For security reviews:
+    %% unlike regular declarations, passive declares require *any* permission by design.
+    %% See rabbitmq/rabbitmq-server#16085 for context.
+    check_any_resource_access_permitted(QueueName, User, AuthzContext),
     Fun = fun (Q0) ->
               QStat = maybe_stat(NoWait, Q0),
               {QStat, Q0}
@@ -2640,7 +2747,10 @@ handle_method(#'exchange.declare'{exchange    = ExchangeNameBin,
               _ConnPid, AuthzContext, _CollectorPid, VHostPath, User) ->
     ExchangeName = rabbit_misc:r(VHostPath, exchange, strip_cr_lf(ExchangeNameBin)),
     check_not_default_exchange(ExchangeName),
-    check_configure_permitted(ExchangeName, User, AuthzContext),
+    %% For security reviews:
+    %% unlike regular declarations, passive declares require *any* permission by design.
+    %% See rabbitmq/rabbitmq-server#16085 for context.
+    check_any_resource_access_permitted(ExchangeName, User, AuthzContext),
     _ = rabbit_exchange:lookup_or_die(ExchangeName).
 
 handle_deliver(CTag, Ack, Msgs, State) ->
@@ -2732,22 +2842,56 @@ get_operation_timeout_and_deadline() ->
     Deadline =  now_millis() + Timeout,
     {Timeout, Deadline}.
 
-handle_consumer_timed_out(Timeout, ConsumerTag, MsgId, QName,
+consumer_timeout_response() ->
+    application:get_env(rabbit, consumer_timeout_response, notify_consumer).
+
+handle_consumer_delivery_timeout(CTag, MsgId, QName, State) ->
+    case consumer_timeout_response() =:= notify_consumer andalso
+         client_supports_consumer_cancel_notify(State) andalso
+         is_map_key(CTag, State#ch.consumer_mapping) of
+        true ->
+            notify_consumer_of_cancelation_after_delivery_timeout(CTag, State);
+        false ->
+            %% The node is configured to use the pre-4.3 behavior
+            %% or this client does not advertise support for `consumer_cancel_notify`.
+            {_, State1} = handle_consumer_timed_out(CTag, MsgId, QName, State),
+            State1
+    end.
+
+notify_consumer_of_cancelation_after_delivery_timeout(
+  CTag, #ch{pending_consumer_cancels = Pending} = State)
+  when is_map_key(CTag, Pending) ->
+    State;
+notify_consumer_of_cancelation_after_delivery_timeout(
+  CTag, #ch{pending_consumer_cancels = Pending} = State) ->
+    ok = send(#'basic.cancel'{consumer_tag = CTag, nowait = true}, State),
+    TRef = erlang:start_timer(?CONSUMER_CANCEL_OK_TIMEOUT, self(),
+                              {consumer_cancel_ok_timeout, CTag}),
+    State#ch{pending_consumer_cancels = Pending#{CTag => TRef}}.
+
+clear_pending_consumer_cancel(CTag, #ch{pending_consumer_cancels = Pending} = State) ->
+    case maps:take(CTag, Pending) of
+        {TRef, Pending1} ->
+            _ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+            State#ch{pending_consumer_cancels = Pending1};
+        error ->
+            State
+    end.
+
+handle_consumer_timed_out(ConsumerTag, MsgId, QName,
                           #ch{cfg = #conf{channel = Channel}} = State) ->
     ?LOG_WARNING("Consumer '~ts' on channel ~w and ~ts has timed out "
                  "waiting for a consumer acknowledgement of a delivery with
-                 message id of ~b. Timeout used: ~tp ms. "
+                 message id of ~b. "
                  "This timeout value can be configured, see consumers doc guide to learn more",
                  [ConsumerTag,
                   Channel,
                   rabbit_misc:rs(QName),
-                  MsgId,
-                  Timeout]),
+                  MsgId]),
     Ex = rabbit_misc:amqp_error(precondition_failed,
                                 "delivery acknowledgement on channel ~w timed out. "
-                                "Timeout value used: ~tp ms. "
                                 "This timeout value can be configured, see consumers doc guide to learn more",
-                                [Channel, Timeout], none),
+                                [Channel], none),
     handle_exception(Ex, State).
 
 handle_queue_actions(Actions, State) ->
@@ -2768,18 +2912,7 @@ handle_queue_actions(Actions, State) ->
               S = S0#ch{unconfirmed = U},
               record_rejects(Rej, S);
          ({released, QRef, CTag, MsgSeqNos, timeout}, S0) ->
-              case server_consumer_cancel_supported(S0) andalso
-                   is_map_key(CTag, S0#ch.consumer_mapping) of
-                  true ->
-                      ok = send(#'basic.cancel'{consumer_tag = CTag,
-                                                nowait = true}, S0),
-                      S0;
-                  false ->
-                      %% fallback
-                      {_, S} = handle_consumer_timed_out(-1, CTag, hd(MsgSeqNos),
-                                                         QRef, S0),
-                      S
-              end;
+              handle_consumer_delivery_timeout(CTag, hd(MsgSeqNos), QRef, S0);
          ({deliver, CTag, AckRequired, Msgs}, S0) ->
               handle_deliver(CTag, AckRequired, Msgs, S0);
          ({queue_down, QRef}, S0) ->
@@ -2829,11 +2962,12 @@ unsupported_single_active_consumer_error(Q) ->
       [rabbit_misc:rs(amqqueue:get_name(Q)),
        rabbit_queue_type:short_alias_of(amqqueue:get_type(Q))]).
 
-cancel_consumer(ConsumerTag, NoWait, OkMsg,
-                #ch{cfg = #conf{user = #user{username = Username}},
-                    consumer_mapping = ConsumerMapping,
-                    queue_consumers = QCons,
-                    queue_states = QueueStates0} = State) ->
+cancel_consumer(ConsumerTag, NoWait, OkMsg, State0) ->
+    #ch{cfg = #conf{user = #user{username = Username}},
+        consumer_mapping = ConsumerMapping,
+        queue_consumers = QCons,
+        queue_states = QueueStates0} = State =
+        clear_pending_consumer_cancel(ConsumerTag, State0),
     case maps:find(ConsumerTag, ConsumerMapping) of
         error ->
             %% Spec requires we ignore this situation.

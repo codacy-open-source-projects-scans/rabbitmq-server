@@ -37,88 +37,10 @@ fun(Conf) ->
     end
 end}.
 
-{mapping, "stomp.tcp_listen_options", "rabbitmq_stomp.tcp_listen_options", [
-    {datatype, {enum, [none]}}]}.
-
-{translation, "rabbitmq_stomp.tcp_listen_options",
-fun(Conf) ->
-    case cuttlefish:conf_get("stomp.tcp_listen_options", Conf, undefined) of
-        none -> [];
-        _    -> cuttlefish:invalid("Invalid stomp.tcp_listen_options")
-    end
-end}.
-
-{mapping, "stomp.tcp_listen_options.backlog", "rabbitmq_stomp.tcp_listen_options.backlog", [
-    {datatype, integer}
-]}.
-
-{mapping, "stomp.tcp_listen_options.nodelay", "rabbitmq_stomp.tcp_listen_options.nodelay", [
-    {datatype, {enum, [true, false]}}
-]}.
-
-{mapping, "stomp.tcp_listen_options.buffer", "rabbitmq_stomp.tcp_listen_options.buffer",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.delay_send", "rabbitmq_stomp.tcp_listen_options.delay_send",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stomp.tcp_listen_options.dontroute", "rabbitmq_stomp.tcp_listen_options.dontroute",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stomp.tcp_listen_options.exit_on_close", "rabbitmq_stomp.tcp_listen_options.exit_on_close",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stomp.tcp_listen_options.fd", "rabbitmq_stomp.tcp_listen_options.fd",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.high_msgq_watermark", "rabbitmq_stomp.tcp_listen_options.high_msgq_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.high_watermark", "rabbitmq_stomp.tcp_listen_options.high_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.keepalive", "rabbitmq_stomp.tcp_listen_options.keepalive",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stomp.tcp_listen_options.low_msgq_watermark", "rabbitmq_stomp.tcp_listen_options.low_msgq_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.low_watermark", "rabbitmq_stomp.tcp_listen_options.low_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.port", "rabbitmq_stomp.tcp_listen_options.port",
-    [{datatype, integer}, {validators, ["port"]}]}.
-
-{mapping, "stomp.tcp_listen_options.priority", "rabbitmq_stomp.tcp_listen_options.priority",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.recbuf", "rabbitmq_stomp.tcp_listen_options.recbuf",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.send_timeout", "rabbitmq_stomp.tcp_listen_options.send_timeout",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.send_timeout_close", "rabbitmq_stomp.tcp_listen_options.send_timeout_close",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stomp.tcp_listen_options.sndbuf", "rabbitmq_stomp.tcp_listen_options.sndbuf",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.tos", "rabbitmq_stomp.tcp_listen_options.tos",
-    [{datatype, integer}]}.
-
-{mapping, "stomp.tcp_listen_options.linger.on", "rabbitmq_stomp.tcp_listen_options.linger",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stomp.tcp_listen_options.linger.timeout", "rabbitmq_stomp.tcp_listen_options.linger",
-    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
-
-{translation, "rabbitmq_stomp.tcp_listen_options.linger",
-fun(Conf) ->
-    LingerOn = cuttlefish:conf_get("stomp.tcp_listen_options.linger.on", Conf, false),
-    LingerTimeout = cuttlefish:conf_get("stomp.tcp_listen_options.linger.timeout", Conf, 0),
-    {LingerOn, LingerTimeout}
-end}.
+{include_partial, {rabbit, "tcp_listen_options"},
+    [{prefix, "stomp.tcp_listen_options"},
+     {app_prefix, "rabbitmq_stomp.tcp_listen_options"},
+     {disable_with, none}]}.
 
 
 %%
@@ -157,6 +79,19 @@ end}.
     {datatype, integer}
 ]}.
 
+{mapping, "stomp.max_connections", "rabbitmq_stomp.max_connections",
+    [{datatype, [{atom, infinity}, integer]}, {validators, ["non_negative_integer"]}]}.
+
+{translation, "rabbitmq_stomp.max_connections",
+fun(Conf) ->
+    case cuttlefish:conf_get("stomp.max_connections", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        infinity  -> infinity;
+        Val when is_integer(Val) -> Val;
+        _         -> cuttlefish:invalid("should be a non-negative integer")
+    end
+end}.
+
 %% Additional TLS options
 
 %% Extract a name from the client's certificate when using TLS.
@@ -164,7 +99,7 @@ end}.
 %% Defaults to true.
 
 {mapping, "stomp.ssl_cert_login", "rabbitmq_stomp.ssl_cert_login",
-    [{datatype, {enum, [true, false]}}]}.
+    [{datatype, boolean}]}.
 
 %% Set a default user name and password. This is used as the default login
 %% whenever a CONNECT frame omits the login and passcode headers.
@@ -211,24 +146,24 @@ end}.
 %% Defaults to true.
 
 {mapping, "stomp.implicit_connect", "rabbitmq_stomp.implicit_connect",
-    [{datatype, {enum, [true, false]}}]}.
+    [{datatype, boolean}]}.
 
 {mapping, "stomp.login_timeout", "rabbitmq_stomp.login_timeout",
-    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
+    [{datatype, {integer, non_negative}}]}.
 
 %% Whether or not to enable proxy protocol support.
 %%
 %% Defaults to false.
 
 {mapping, "stomp.proxy_protocol", "rabbitmq_stomp.proxy_protocol",
-    [{datatype, {enum, [true, false]}}]}.
+    [{datatype, boolean}]}.
 
 %% Whether or not to hide server info
 %%
 %% Defaults to false.
 
 {mapping, "stomp.hide_server_info", "rabbitmq_stomp.hide_server_info",
-    [{datatype, {enum, [true, false]}}]}.
+    [{datatype, boolean}]}.
 
 %% Whether or not to always requeue the message on nack
 %% If not set then coordinated by the usage of the frame "requeue" header
@@ -237,7 +172,7 @@ end}.
 %% Defaults to true.
 
 {mapping, "stomp.default_nack_requeue", "rabbitmq_stomp.default_nack_requeue",
-    [{datatype, {enum, [true, false]}}]}.
+    [{datatype, boolean}]}.
 
 
 
@@ -246,7 +181,7 @@ end}.
 %% Defaults to 192Kb.
 
 {mapping, "stomp.max_frame_size", "rabbitmq_stomp.max_frame_size",
-    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
+    [{datatype, {integer, non_negative}}]}.
 
 {mapping, "stomp.max_frame_size_unauthenticated", "rabbitmq_stomp.max_frame_size_unauthenticated",
-    [{datatype, integer}, {validators, ["non_zero_positive_integer"]}]}.
+    [{datatype, {integer, positive}}]}.

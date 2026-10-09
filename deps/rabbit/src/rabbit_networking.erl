@@ -34,8 +34,10 @@
          force_connection_event_refresh/1, force_non_amqp_connection_event_refresh/1,
          handshake/2, handshake/3, tcp_host/1,
          ranch_ref/1, ranch_ref/2, ranch_refs_of_protocol/1, ranch_ref_to_protocol/1,
+         listener_ip_addresses/1, listener_per_ip_address/1,
          listeners_of_protocol/1, stop_ranch_listeners_of_protocol/1,
-         list_local_connections_of_protocol/1]).
+         list_local_connections_of_protocol/1,
+         ensure_listeners/3]).
 
 %% Used by TCP-based transports, e.g. STOMP adapter
 -export([tcp_listener_addresses/1,
@@ -82,8 +84,9 @@
 -type family() :: atom().
 -type listener_config() :: ip_port() |
                            {hostname(), ip_port()} |
-                           {hostname(), ip_port(), family()}.
--type address() :: {inet:ip_address(), ip_port(), family()}.
+                           {hostname(), ip_port(), family()} |
+                           {local, string(), ip_port()}.
+-type address() :: {inet:ip_address() | {local, string()}, ip_port(), family()}.
 -type name_prefix() :: atom().
 -type protocol() :: atom().
 -type label() :: string().
@@ -141,11 +144,24 @@ ensure_ssl() ->
     {ok, SslOptsConfig0} = application:get_env(rabbit, ssl_options),
     rabbit_ssl_options:fix(SslOptsConfig0).
 
+-spec fix_ssl_options(rabbit_types:infos()) -> rabbit_types:infos().
+
+%% Some plugins do not rely on the core `ssl_options`: management UI/HTTP API, Web MQTT, Web STOMP.
+%%
+%% The `ssl_options_overrides` option lets a plugin such as `rabbitmq_trust_store`
+%% "reach" to those plugins' listeners just like it can reach the core one,
+%% and do so without this core module depending on the plugin.
 fix_ssl_options(Config) ->
-    rabbit_ssl_options:fix(Config).
+    Overrides = application:get_env(rabbit, ssl_options_overrides, []),
+    rabbit_ssl_options:wrap_password_opt(
+      rabbit_ssl_options:fix(
+        lists:foldl(fun({Key, Value}, Acc) -> rabbit_misc:pset(Key, Value, Acc) end,
+                    Config, Overrides))).
 
 -spec tcp_listener_addresses(listener_config()) -> [address()].
 
+tcp_listener_addresses({local, Path, _Port}) ->
+    [{{local, Path}, 0, local}];
 tcp_listener_addresses(Port) when is_integer(Port) ->
     tcp_listener_addresses_auto(Port);
 tcp_listener_addresses({"auto", Port}) ->
@@ -202,28 +218,60 @@ tcp_listener_spec(NamePrefix, {IPAddress, Port, Family}, SocketOpts,
 ranch_ref(#listener{ip_address = IPAddress, port = Port}) ->
     {acceptor, IPAddress, Port};
 ranch_ref(Listener) when is_list(Listener) ->
-    Port = rabbit_misc:pget(port, Listener),
-    IPAddress = case rabbit_misc:pget(ip, Listener) of
+    [IPAddress | _] = listener_ip_addresses(Listener),
+    {acceptor, IPAddress, rabbit_misc:pget(port, Listener)};
+ranch_ref(undefined) ->
+    undefined.
+
+%% Every address for a listener, computed in a dual-stack aware way.
+-spec listener_ip_addresses([{atom(), any()}]) -> [inet:ip_address(), ...].
+listener_ip_addresses(Listener) ->
+    case rabbit_misc:pget(ip, Listener) of
         undefined ->
-            [{Value, _Port, _Family} | _] = tcp_listener_addresses(Port),
-            Value;
+            Port = rabbit_misc:pget(port, Listener),
+            [IPAddress || {IPAddress, _Port, _Family} <- tcp_listener_addresses(Port)];
         Value when is_list(Value) ->
             %% since we only use this function to parse the address, only one result should
             %% be returned
             [{Parsed, _Family} | _] = gethostaddr(Value, auto),
-            Parsed;
+            [Parsed];
         Value when is_binary(Value) ->
-            Str = rabbit_data_coercion:to_list(Value),
-            %% since we only use this function to parse the address, only one result should
-            %% be returned
-            [{Parsed, _Family} | _] = gethostaddr(Str, auto),
-            Parsed;
+            [{Parsed, _Family} | _] = gethostaddr(rabbit_data_coercion:to_list(Value), auto),
+            [Parsed];
         Value when is_tuple(Value) ->
-            Value
-    end,
-    {acceptor, IPAddress, Port};
-ranch_ref(undefined) ->
-    undefined.
+            [Value]
+    end.
+
+-spec listener_per_ip_address([{atom(), any()}]) -> [[{atom(), any()}], ...].
+listener_per_ip_address(Listener) ->
+    [[{ip, IPAddress} | proplists:delete(ip, Listener)]
+     || IPAddress <- listener_ip_addresses(Listener)].
+
+%% A later address failing to bind must not leave an earlier address's
+%% listener running and unrecorded: `Stop` undoes every address this call
+%% has started with `Start` before the failure is re-raised.
+-spec ensure_listeners([[{atom(), any()}], ...],
+                       fun(([{atom(), any()}]) -> new | existing | ignore),
+                       fun(([{atom(), any()}]) -> any())) ->
+    [new | existing | ignore].
+ensure_listeners(PerAddress, Start, Stop) ->
+    ensure_listeners(PerAddress, Start, Stop, [], []).
+
+ensure_listeners([], _Start, _Stop, _Started, Results) ->
+    lists:reverse(Results);
+ensure_listeners([Bound | Rest], Start, Stop, Started, Results) ->
+    try Start(Bound) of
+        Result ->
+            Started1 = case Result of
+                           new -> [Bound | Started];
+                           _   -> Started
+                       end,
+            ensure_listeners(Rest, Start, Stop, Started1, [Result | Results])
+    catch
+        Class:Reason:Stacktrace ->
+            _ = [Stop(B) || B <- Started],
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
 
 -spec ranch_ref(inet:ip_address(), ip_port()) -> ranch:ref().
 
@@ -260,13 +308,19 @@ listeners_of_protocol(Protocol) ->
 
 -spec stop_ranch_listeners_of_protocol(atom()) -> ok.
 stop_ranch_listeners_of_protocol(Protocol) ->
-    case ranch_refs_of_protocol(Protocol) of
+    case listeners_of_protocol(Protocol) of
         [] ->
             ok;
-        Refs ->
+        Listeners ->
             ?LOG_DEBUG("Stopping Ranch listeners for protocol ~ts", [Protocol]),
-            lists:foreach(fun ranch:stop_listener/1, Refs)
+            lists:foreach(fun stop_ranch_listener/1, Listeners)
     end.
+
+-spec stop_ranch_listener(#listener{}) -> ok.
+stop_ranch_listener(Listener) ->
+    _ = ranch:stop_listener(ranch_ref(Listener)),
+    true = ets:delete_object(?ETS_TABLE, Listener),
+    ok.
 
 -spec list_local_connections_of_protocol(atom()) -> [pid()].
 list_local_connections_of_protocol(Protocol) ->
@@ -408,7 +462,7 @@ epmd_port_please(Name, Host, 0) ->
 epmd_port_please(Name, Host, RetriesLeft) ->
     ?LOG_DEBUG("Getting epmd port node '~ts', ~b retries left",
     [Name, RetriesLeft]),
-  case catch maybe_get_epmd_port(Name, Host) of
+  case try maybe_get_epmd_port(Name, Host) catch _:E -> {error, E} end of
     ok -> ok;
     {error, _} ->
       timer:sleep(?PORT_PLEASE_ATTEMPTS_WAIT),
@@ -468,13 +522,18 @@ node_client_listeners(Node) ->
                          end, Xs)
     end.
 
+pg_scope_amqp091_connection() ->
+    rabbit:pg_scope_amqp091_connection().
+
 -spec register_connection(pid()) -> ok.
 
-register_connection(Pid) -> pg_local:join(rabbit_connections, Pid).
+register_connection(Pid) ->
+    pg:join(pg_scope_amqp091_connection(), Pid, Pid).
 
 -spec unregister_connection(pid()) -> ok.
-
-unregister_connection(Pid) -> pg_local:leave(rabbit_connections, Pid).
+unregister_connection(Pid) ->
+    _ = pg:leave(pg_scope_amqp091_connection(), Pid, Pid),
+    ok.
 
 -spec connections() -> [rabbit_types:connection()].
 connections() ->
@@ -483,17 +542,17 @@ connections() ->
 
 -spec local_connections() -> [rabbit_types:connection()].
 local_connections() ->
-    Amqp091Pids = pg_local:get_members(rabbit_connections),
-    Amqp10Pids = rabbit_amqp1_0:list_local(),
+    Amqp091Pids = pg:which_groups(pg_scope_amqp091_connection()),
+    Amqp10Pids = rabbit_amqp_reader:local_connections(),
     Amqp10Pids ++ Amqp091Pids.
 
 -spec register_non_amqp_connection(pid()) -> ok.
 
-register_non_amqp_connection(Pid) -> pg_local:join(rabbit_non_amqp_connections, Pid).
+register_non_amqp_connection(Pid) -> pg:join(rabbit:pg_scope_non_amqp_connection(), Pid, Pid).
 
 -spec unregister_non_amqp_connection(pid()) -> ok.
 
-unregister_non_amqp_connection(Pid) -> pg_local:leave(rabbit_non_amqp_connections, Pid).
+unregister_non_amqp_connection(Pid) -> pg:leave(rabbit:pg_scope_non_amqp_connection(), Pid, Pid).
 
 -spec non_amqp_connections() -> [rabbit_types:connection()].
 
@@ -503,7 +562,7 @@ non_amqp_connections() ->
 
 -spec local_non_amqp_connections() -> [rabbit_types:connection()].
 local_non_amqp_connections() ->
-  pg_local:get_members(rabbit_non_amqp_connections).
+  pg:which_local_groups(rabbit:pg_scope_non_amqp_connection()).
 
 -spec connection_info(rabbit_types:connection(), rabbit_types:info_keys()) ->
           rabbit_types:infos().
@@ -606,6 +665,15 @@ ranch_handshake(Ref) ->
         %% https://github.com/rabbitmq/rabbitmq-server/pull/12304
         exit:{shutdown, {closed, _}} = Error:Stacktrace ->
             erlang:raise(exit, Error, Stacktrace);
+        %% A non-TLS client connected to a TLS listener. The TLS server sent
+        %% an 'unexpected_message' alert because the first bytes were not a
+        %% valid TLS ClientHello.
+        exit:{shutdown, {{tls_alert, {unexpected_message, _}}, {PeerIp, PeerPort}}} = Error:Stacktrace ->
+            PeerAddress = io_lib:format("~ts:~tp", [rabbit_misc:ntoab(PeerIp), PeerPort]),
+            Protocol = ranch_ref_to_protocol(Ref),
+            ?LOG_WARNING("~ts is connecting to the ~p listener without using TLS",
+                         [PeerAddress, Protocol]),
+            erlang:raise(exit, Error, Stacktrace);
         exit:{shutdown, {Reason, {PeerIp, PeerPort}}} = Error:Stacktrace ->
             PeerAddress = io_lib:format("~ts:~tp", [rabbit_misc:ntoab(PeerIp), PeerPort]),
             Protocol = ranch_ref_to_protocol(Ref),
@@ -636,6 +704,8 @@ tune_buffer_size_static(Sock) ->
 
 %%--------------------------------------------------------------------
 
+tcp_host({local, Path}) ->
+    rabbit_misc:ntoab({local, Path});
 tcp_host(IPAddress) ->
     rabbit_net:tcp_host(IPAddress).
 

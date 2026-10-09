@@ -26,7 +26,7 @@ define HEX_TARBALL_EXTRA_METADATA
 endef
 
 LOCAL_DEPS = compiler crypto public_key sasl ssl syntax_tools tools runtime_tools
-DEPS = thoas ranch recon credentials_obfuscation
+DEPS = ranch recon credentials_obfuscation
 
 # Variables and recipes in development.*.mk are meant to be used from
 # any Git clone. They are excluded from the files published to Hex.pm.
@@ -37,6 +37,9 @@ DEPS = thoas ranch recon credentials_obfuscation
 # inclusion errors.
 
 -include development.pre.mk
+
+# Appended after the include because `development.pre.mk` resets `TEST_DEPS`.
+TEST_DEPS += meck
 
 DEP_EARLY_PLUGINS = $(PROJECT)/mk/rabbitmq-early-plugin.mk
 # We do not depend on rabbit therefore can't run the broker.

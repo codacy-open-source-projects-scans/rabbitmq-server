@@ -41,7 +41,7 @@
 -define(SAMPLING_INTERVAL, 1000).
 -define(FILTER_RPC_TIMEOUT, 10000).
 
--define(INTERNAL_CLUSTER_ID_PARAM_NAME, internal_cluster_id).
+-define(INTERNAL_CLUSTER_ID_PARAM_NAME, <<"internal_cluster_id">>).
 
 % Retries as passed to https://erlang.org/doc/man/global.html#set_lock-3
 % To understand how retries map to the timeout, read
@@ -101,7 +101,7 @@ is_process_running(Node, Process) ->
 -spec cluster_name() -> binary().
 
 cluster_name() ->
-    case rabbit_runtime_parameters:value_global(cluster_name) of
+    case rabbit_runtime_parameters:value_global(<<"cluster_name">>) of
         not_found -> cluster_name_default();
         Name -> Name
     end.
@@ -153,7 +153,7 @@ set_cluster_name(Name) ->
 set_cluster_name(Name, Username) ->
     %% Cluster name should be binary
     BinaryName = rabbit_data_coercion:to_binary(Name),
-    rabbit_runtime_parameters:set_global(cluster_name, BinaryName, Username).
+    rabbit_runtime_parameters:set_global(<<"cluster_name">>, BinaryName, Username).
 
 ensure_epmd() ->
     rabbit_nodes_common:ensure_epmd().
@@ -543,7 +543,6 @@ do_filter_serving(Members) ->
     Rets = erpc:multicall(
              Members, rabbit, is_serving, [], ?FILTER_RPC_TIMEOUT),
     RetPerMember0 = lists:zip(Members, Rets),
-    RetPerMember1 = handle_is_serving_undefined(RetPerMember0, []),
     lists:filtermap(
       fun
           ({Member, {ok, true}}) ->
@@ -559,50 +558,7 @@ do_filter_serving(Members) ->
                  [?MODULE, ?FUNCTION_NAME, Member, Error],
                  #{domain => ?RMQLOG_DOMAIN_GLOBAL}),
               false
-      end, RetPerMember1).
-
-handle_is_serving_undefined(
-  [{Member, {error, {exception, undef, [{rabbit, is_serving, [], _} | _]}}}
-   | Rest],
-  Result) ->
-    %% The remote node must be RabbitMQ 3.11.x without the
-    %% `rabbit:is_serving()' function. That's ok, we can perform two calls
-    %% instead.
-    %%
-    %% This function can go away once we require a RabbitMQ version which has
-    %% `rabbit:is_serving()'.
-    ?LOG_NOTICE(
-       "~s:~s: rabbit:is_serving() unavailable on node ~ts, falling back to "
-       "two RPC calls",
-       [?MODULE, ?FUNCTION_NAME, Member],
-       #{domain => ?RMQLOG_DOMAIN_GLOBAL}),
-    try
-        IsRunning = erpc:call(
-                      Member, rabbit, is_running, [], ?FILTER_RPC_TIMEOUT),
-        case IsRunning of
-            true ->
-                InMaintenance = erpc:call(
-                                  Member,
-                                  rabbit_maintenance,
-                                  is_being_drained_local_read, [Member],
-                                  ?FILTER_RPC_TIMEOUT),
-                Result1 = [{Member, {ok, not InMaintenance}} | Result],
-                handle_is_serving_undefined(Rest, Result1);
-            false ->
-                Result1 = [{Member, {ok, false}} | Result],
-                handle_is_serving_undefined(Rest, Result1)
-        end
-    catch
-        Class:Reason ->
-            Result2 = [{Member, {Class, Reason}} | Result],
-            handle_is_serving_undefined(Rest, Result2)
-    end;
-handle_is_serving_undefined(
-  [Ret | Rest], Result) ->
-    handle_is_serving_undefined(Rest, [Ret | Result]);
-handle_is_serving_undefined(
-  [], Result) ->
-    lists:reverse(Result).
+      end, RetPerMember0).
 
 -spec running_count() -> integer().
 running_count() -> length(list_running()).

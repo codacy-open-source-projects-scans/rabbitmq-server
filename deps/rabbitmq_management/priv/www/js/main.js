@@ -1,9 +1,30 @@
 
-$(document).ready(function() {    
+const API_ERROR_REASONS = {
+    'failed_to_parse_json':       'Definitions file could not be parsed. Make sure it is valid JSON.',
+    'unsupported_file_extension': '{filename}Only .json files are accepted for definitions import.',
+};
+
+function format_error_response(response, reason) {
+    var template = API_ERROR_REASONS[reason];
+    if (typeof(template) != 'string') {
+        return reason;
+    }
+    return template.replace(/\{(\w+)\}/g, function(_, key) {
+        var val = response[key];
+        return val !== undefined ? val + ': ' : '';
+    });
+}
+
+$(document).ready(function() {
+  setup_oauth_events_if_required();
   var url_string = window.location.href;
   var url = new URL(url_string);
   var error = url.searchParams.get('error');
   if (error) {
+    // A failed IDP-initiated login returns here with an error. Drop the
+    // pending state markers to avoid a confusing redirect the next successful login.
+    clear_pref("oauth-idp-pending");
+    clear_pref("oauth-return-to");
     if (oauth.enabled) {
       renderWarningMessageInLoginStatus(oauth, fmt_escape_html(error));
     }
@@ -32,17 +53,15 @@ function removeDuplicates(array){
 
 
 function startWithOAuthLogin (oauth) {
-  store_pref("oauth-return-to", window.location.hash);
-
   if (!oauth.logged_in) {
-    hasAnyResourceServerReady(oauth, (oauth, warnings) => {  render_login_oauth(oauth, warnings); start_app_login(); })
+    hasAnyResourceServerReady(oauth, (oauth, escaped_warnings) => {  render_login_oauth(oauth, escaped_warnings); start_app_login(); })
   } else {
     start_app_login()
   }
 }
-function render_login_oauth(oauth, messages) {
+function render_login_oauth(oauth, escaped_messages) {
   let formatData = {};
-  formatData.warnings = [];
+  formatData.escaped_warnings = [];
   formatData.notAuthorized = false;
   formatData.resource_servers = oauth.resource_servers;
   formatData.declared_resource_servers_count = oauth.declared_resource_servers_count;
@@ -50,11 +69,11 @@ function render_login_oauth(oauth, messages) {
   formatData.strict_auth_mechanism = oauth.strict_auth_mechanism || null;
   formatData.preferred_auth_mechanism = oauth.preferred_auth_mechanism || null;
 
-  if (Array.isArray(messages)) {
-    formatData.warnings = messages
-  } else if (typeof messages == "string") {
-    formatData.warnings = [messages]
-    formatData.notAuthorized = messages == "Not authorized"
+  if (Array.isArray(escaped_messages)) {
+    formatData.escaped_warnings = escaped_messages
+  } else if (typeof escaped_messages == "string") {
+    formatData.escaped_warnings = [escaped_messages]
+    formatData.notAuthorized = escaped_messages == "Not authorized"
   }
   replace_content('outer', format('login_oauth', formatData))
 
@@ -86,12 +105,11 @@ function start_app_login () {
     this.get('#/', function () {})
     if (!oauth.enabled || !oauth.oauth_disable_basic_auth) {
       this.put('#/login', function() {
-        set_basic_auth(this.params['username'], this.params['password'])
-        check_login()
+        login(this.params['username'], this.params['password']);
       });
     }
   })
-  
+
   if (oauth.enabled) {
     if (has_auth_credentials()) {
       check_login();
@@ -117,34 +135,98 @@ function check_login () {
     }
     return false;
   }
-  check_version()
-  hide_popup_warn()
-  replace_content('outer', format('layout', {}))
-  var user_login_session_timeout = parseInt(user.login_session_timeout)
-  if (!isNaN(user_login_session_timeout)) {
-    update_login_session_timeout(user_login_session_timeout)
+
+  return load_init_data_and_ui(user);
+}
+
+// Sent with the Authorization header, so it must run after the credentials
+// have been set.
+function load_init_data() {
+  var raw = sync_get('/init');
+  if (!raw) {
+      console.error("Failed to load /api/init");
+      if (oauth.enabled) {
+          renderWarningMessageInLoginStatus(oauth, 'Could not load the management UI');
+      } else {
+          replace_content('login-status', '<p>Could not load the management UI</p>');
+      }
+      return false;
+  }
+  var data = JSON.parse(raw);
+  window.app_settings = data.settings;
+  window.app_vhosts = data.vhosts;
+  window.app_nodes = data.nodes || undefined;
+  return true;
+}
+
+function do_login(username, password) {
+    var result = null;
+    $.ajax({
+        async: false,
+        type: 'POST',
+        url: 'api/login',
+        data: {username: username, password: password},
+        success: function(resp) { result = resp; },
+        error: function(xhr) {
+            try { result = JSON.parse(xhr.responseText); } catch(e) {}
+            if (!result) result = {error: 'login_failed', reason: 'Login failed'};
+        }
+    });
+    return result;
+}
+
+function login(username, password) {
+  var result = do_login(username, password);
+  if (!result || result.error) {
+    replace_content('login-status', '<p>Login failed</p>');
+    if (result && result.reason && typeof result.reason === 'string') {
+      show_popup('warn', fmt_escape_html(result.reason));
+    }
+    return false;
+  }
+  user = result.user;
+  clear_local_pref(SESSION_EXPIRY);
+  var scheme = result.token.type === 'bearer' ? 'Bearer' : 'Basic';
+  set_auth(scheme, result.token.value);
+
+  return load_init_data_and_ui(user);
+}
+
+function load_init_data_and_ui(user) {
+  if (!load_init_data()) {
+    return false;
+  }
+  load_ui(user);
+  return true;
+}
+
+function load_ui(user) {
+  set_session_expiry_if_required(user.login_session_timeout);
+  check_version();
+  hide_popup_warn();
+
+  var settings = window.app_settings;
+
+  replace_content('outer', format('layout', {}));
+
+  ui_data_model.vhosts = window.app_vhosts;
+  ac.update(user, ui_data_model);
+
+  if (window.app_nodes !== undefined) {
+      ui_data_model.nodes = window.app_nodes;
   }
 
-  ui_data_model.vhosts = JSON.parse(sync_get('/vhosts'));
-  ac.update(user, ui_data_model)
-  if (ac.isMonitoringUser()) {
-    ui_data_model.nodes = JSON.parse(sync_get('/nodes'))
-  }
-  var overview = JSON.parse(sync_get('/overview'))
+  display.update(settings, ui_data_model);
 
-  display.update(overview, ui_data_model)
+  setup_global_vars(settings);
 
-  setup_global_vars(overview)
-
-  setup_constant_events()
-  update_vhosts()
-  update_interval()
+  setup_constant_events();
+  update_vhosts();
+  update_interval();
   setup_extensions(function onCompleted() {
     console.info("All extensions have been loaded. Starting application ..");
     start_app();
   });
-
-  return true
 }
 
 
@@ -176,14 +258,22 @@ function start_app() {
     var url = this.location.toString();
     var hash = this.location.hash;
     var pathname = this.location.pathname;
+
+    var return_to = '#/';
+    if (get_pref("oauth-idp-pending")) {
+        clear_pref("oauth-idp-pending");
+        return_to = get_pref("oauth-return-to") || '#/';
+        clear_pref("oauth-return-to");
+    }
+
     if (url.indexOf('#') == -1) {
-        this.location = url + '#/';
+        this.location = url + return_to;
     } else if (hash.indexOf('#token_type') != - 1 && pathname == '/') {
         // This is equivalent to previous `if` clause when uaa authorisation is used.
         // Tokens are passed in the url hash, so the url always contains a #.
         // We need to check the current path is `/` and token is present,
         // so we can redirect to `/#/`
-        this.location = url.replace(/#token_type.+/gi, '#/');
+        this.location = url.replace(/#token_type.+/gi, return_to);
     }
 
     app = new Sammy.Application(dispatcher);
@@ -211,6 +301,39 @@ function setup_constant_events() {
     if (!vhosts_interesting) {
         $('#vhost-form').hide();
     }
+    setup_form_events();
+}
+
+function setup_form_events() {
+    // Only the page size input is restricted to digits.
+    // The name filter input, which shares the pagination_class_input class,
+    // should not be affected by this validation, otherwise the filter input
+    // will break with legitimate non-numerical inputs.
+    $(document).on('keypress', '.pagination_class_pagesize_input', function(e) {
+        return isNumberKey(e);
+    });
+    $(document).on('click', '#ff-enable-all-button', function() {
+        enable_all_stable_feature_flags(this);
+    });
+    $(document).on('change', '[data-flag-name]', function() {
+        handle_feature_flag(this, $(this).data('flagName'));
+    });
+}
+
+function setup_oauth_events_if_required() {
+    if (!oauth.enabled) {
+        return;
+    }
+    $(document).on('click', '[data-oauth-action="login"]', function() {
+        oauth_initiateLogin($(this).data('resourceId'));
+    });
+    $(document).on('click', '[data-oauth-action="logout"]', function() {
+        oauth_initiateLogout();
+    });
+    $(document).on('submit', '#oauth2-resource-form', function(e) {
+        e.preventDefault();
+        oauth_initiateLogin(document.getElementById('oauth2-resource').value);
+    });
 }
 
 function update_vhosts() {
@@ -345,7 +468,7 @@ function go_to_home() {
     // location.href = rabbit_path_prefix() + "/"
     location.href =  "/"
   }
-  
+
 function set_timer_interval(interval) {
     timer_interval = interval;
     reset_timer();
@@ -799,9 +922,14 @@ function postprocess() {
         });
 
     $('#download-definitions').on('click', function() {
+        var filename = $('#download-filename').val()
+        if (!is_valid_token(filename)) {
+            show_popup('warn', 'Filename must only contain a-z A-Z 0-9 ! # $ % & \' * + - . ^ _ ` | ~ characters.')
+            return
+        }
         var idx = $("select[name='vhost-download'] option:selected").index()
         var vhost = ((idx <=0 ) ? "" : "/" + esc($("select[name='vhost-download'] option:selected").val()))
-        var download_filename = esc($('#download-filename').val())
+        var download_filename = esc(filename)
         var path = '/definitions' + vhost
         with_req('GET', path, null, function(resp) {
             if (resp.status >= 200 && resp.status <= 299) {
@@ -860,6 +988,15 @@ function postprocess() {
                 $('#' + param + '-div').slideUp(100);
             }
         }
+    });
+
+    $('select[name="queuetype"]').on('change', function() {
+        select_queue_type(this);
+    });
+
+    $('form[name="upload-definitions"]').on('submit', function(e) {
+        e.preventDefault();
+        submit_import(this);
     });
 
     $(document).on('click', '.help', function() {
@@ -926,6 +1063,11 @@ function is_valid_regexp(value) {
     } catch (e) {
         return false;
     }
+}
+
+// HTTP token defined in RFC9110 5.6.2.
+function is_valid_token(value) {
+    return value.length > 0 && /^[a-zA-Z0-9!#$%&'*+\-.^_`|~]+$/.test(value);
 }
 
 function url_pagination_template_context(template, context, defaultPage, defaultPageSize){
@@ -1080,6 +1222,8 @@ function postprocess_partial() {
     else {
         $('#filter-truncate').removeClass('filter-warning');
     }
+
+    feature_flags_refresh();
 }
 
 function update_multifields() {
@@ -1350,17 +1494,12 @@ function replace_content(id, html) {
     $("#" + id).html(html);
 }
 
-var ejs_cached = {};
-
 function format(template, json) {
     try {
-        var cache = true;
-        if (!(template in ejs_cached)) {
-            ejs_cached[template] = true;
-            cache = false;
-        }
-        var tmpl = new EJS({url: 'js/tmpl/' + template + '.ejs', cache: cache});
-        return tmpl.render(json);
+        var fn = COMPILED_TEMPLATES[template];
+        if (!fn) throw new Error('Template not found: ' + template);
+        var model = Object.assign({}, json, {settings: window.app_settings});
+        return fn.call(model, model, model);
     } catch (err) {
         clearInterval(timer);
         console.log("Uncaught error: " + err);
@@ -1421,7 +1560,7 @@ function with_req(method, path, body, fun, on404fun) {
             if (check_bad_response(req, !on404fun, on404fun)) {
                 last_successful_connect = new Date();
                 fun(req);
-            } 
+            }
         }
     };
     outstanding_reqs.push(req);
@@ -1508,13 +1647,11 @@ function sync_req(type, params0, path_template, options) {
     }
 }
 function initiate_logout(oauth, error = "") {
-    clear_pref('auth');
-    clear_cookie_value('auth');    
     renderWarningMessageInLoginStatus(oauth, error);
 }
 /**
  * Handle bad http response
- * @param {*} req 
+ * @param {*} req
  * @param {*} full_page_404 In case of 404, reload entire html page with the error message
  * @param {*} on404fun In case of 404, call this function or else show a popup error message
  * @returns true if there was no bad response
@@ -1542,17 +1679,17 @@ function check_bad_response(req, full_page_404, on404fun) {
         if (typeof(reason) != 'string') {
             reason = JSON.stringify(reason);
         }
-        if (    error == 'bad_request' || 
-                error == 'not_found'  || 
-                reason == 'Not Found' || 
-                error == 'not_authorised' || 
+        if (    error == 'bad_request' ||
+                error == 'not_found'  ||
+                reason == 'Not Found' ||
+                error == 'not_authorised' ||
                 error == 'not_authorized') {
             if ((req.status == 401 || req.status == 403) && oauth.enabled) {
-                initiate_logout(oauth, reason);
+                initiate_logout(oauth, fmt_escape_html(reason));
             } else if (on404fun && (typeof on404fun === 'function') && req.status == 404) {
                 on404fun(response);
             } else {
-                show_popup('warn', fmt_escape_html(reason));
+                show_popup('warn', fmt_escape_html(format_error_response(response, reason)));
             }
         } else if (error == 'page_out_of_range') {
             var seconds = 60;
@@ -1560,12 +1697,22 @@ function check_bad_response(req, full_page_404, on404fun) {
                     seconds = (new Date().getTime() - last_page_out_of_range_error.getTime())/1000;
             if (seconds > 3) {
                  Sammy.log('server reports page is out of range, redirecting to page 1');
-                 var contexts = ["queues", "exchanges", "connections", "channels"];
+                 var contexts = {
+                     "queues": "queues",
+                     "exchanges": "exchanges",
+                     "connections": "connections",
+                     "channels": "channels",
+                     "users": "users",
+                     "stream/connections": "streamConnections"
+                 };
                  var matches = /api\/(.*)\?/.exec(req.responseURL);
                  if (matches != null && matches.length > 1) {
-                     contexts.forEach(function(item) {
-                         if (matches[1].indexOf(item) == 0) {update_pages(item, 1)};
+                     var path = Object.keys(contexts).find(function(prefix) {
+                         return matches[1].indexOf(prefix) == 0;
                      });
+                     if (path !== undefined) {
+                         update_pages(contexts[path], 1);
+                     }
                  } else update_pages(current_template, 1);
 
                  last_page_out_of_range_error = new Date();
@@ -1676,12 +1823,15 @@ function collapse_multifields(params0) {
         }
     }
     if (params.hasOwnProperty('queuetype')) {
+        var the_queue_type = params['queuetype'];
         delete params['queuetype'];
-        if (queue_type != 'default') {
-            params['arguments']['x-queue-type'] = queue_type;
+        if (the_queue_type != 'default') {
+            if (params['arguments'] == undefined) {
+                params['arguments'] = {};
+            }
+            params['arguments']['x-queue-type'] = the_queue_type;
         }
-
-        params = Object.assign(params, QUEUE_TYPE[queue_type].params)
+        params = Object.assign(params, QUEUE_TYPE[the_queue_type].params)
     }
     return params;
 }
@@ -1862,7 +2012,7 @@ function is_internal(queue) {
     return queue.internal;
 }
 
-function get_queue_type (queue) {    
+function get_queue_type (queue) {
     switch(queue.type) {
         case "classic":
         case "quorum":
@@ -1990,7 +2140,9 @@ function change_own_password(sammy) {
         if (req.readyState == 4 && !done) {
             clearTimeout(timeout);
             if (req.status >= 200 && req.status < 300) {
-                set_basic_auth(username, new_password);
+                // Re-login via api/login so encrypted-credential mode stores
+                // a fresh token instead of plaintext Basic credentials.
+                login(username, new_password);
                 finish();
                 go_to('#/users');
             } else {

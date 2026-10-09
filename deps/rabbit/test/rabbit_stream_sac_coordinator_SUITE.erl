@@ -226,6 +226,61 @@ super_stream_partition_sac_test(_) ->
 
     ok.
 
+%% Regression test for a stuck-group state. When the arrival of the stepping-down
+%% consumer's consumer_update response triggers command_activate_consumer and
+%% evaluate_active_consumer picks the same consumer that just stepped down,
+%% the coordinator must still notify that consumer so its client learns it is
+%% active again. Without the notification, the coordinator believes the group
+%% has an active member while the client has been told active=false, and the
+%% group is silently stranded.
+super_stream_partition_sac_re_notifies_stepping_down_consumer_re_selected_as_active_test(_) ->
+    Stream = <<"stream">>,
+    ConsumerName = <<"app">>,
+    ConnectionPid = self(),
+    GroupId = {<<"/">>, Stream, ConsumerName},
+    %% Partition index chosen so that evaluate_active_consumer picks the first
+    %% consumer once three have joined (3 rem 3 = 0), which is precisely the
+    %% one deactivated by the two-consumer rebalance below.
+    PartitionIndex = 3,
+
+    Command0 = register_consumer_command(Stream, PartitionIndex, ConsumerName, ConnectionPid, 0),
+    State0 = state(),
+    {State1, {ok, true}, Effects1} = ?MOD:apply(Command0, State0),
+    assertSendMessageActivateEffect(ConnectionPid, 0, Stream, ConsumerName, true, Effects1),
+
+    Command1 = register_consumer_command(Stream, PartitionIndex, ConsumerName, ConnectionPid, 1),
+    {State2, {ok, false}, Effects2} = ?MOD:apply(Command1, State1),
+    %% 3 rem 2 = 1 selects subscription 1, so subscription 0 is asked to step down.
+    assertSendMessageSteppingDownEffect(ConnectionPid, 0, Stream, ConsumerName, Effects2),
+
+    Command2 = register_consumer_command(Stream, PartitionIndex, ConsumerName, ConnectionPid, 2),
+    {#?STATE{groups = #{GroupId := #group{consumers = Consumers3}}} = State3,
+     {ok, false}, Effects3} = ?MOD:apply(Command2, State2),
+    %% 3 rem 3 = 0 selects subscription 0, which is still lookup_active_consumer
+    %% because is_active({_, deactivating}) is true, so no rebalance happens.
+    assertCsrsEqual([csr(ConnectionPid, 0, deactivating),
+                     csr(ConnectionPid, 1, waiting),
+                     csr(ConnectionPid, 2, waiting)],
+                    Consumers3),
+    assertEmpty(Effects3),
+
+    %% Simulate the arrival of subscription 0's consumer_update response, which
+    %% causes the stream reader to fire command_activate_consumer.
+    Command3 = activate_consumer_command(Stream, ConsumerName),
+    {#?STATE{groups = #{GroupId := #group{consumers = Consumers4}}},
+     ok, Effects4} = ?MOD:apply(Command3, State3),
+
+    %% Subscription 0 is selected as active again by 3 rem 3 = 0.
+    assertCsrsEqual([csr(ConnectionPid, 0, active),
+                     csr(ConnectionPid, 1, waiting),
+                     csr(ConnectionPid, 2, waiting)],
+                    Consumers4),
+    %% Subscription 0's client was previously told active=false and must be
+    %% notified it is active again.
+    assertSendMessageActivateEffect(ConnectionPid, 0, Stream, ConsumerName, true, Effects4),
+
+    ok.
+
 ensure_monitors_test(_) ->
     GroupId = {<<"/">>, <<"stream">>, <<"app">>},
     Group = grp([csr(self(), 0, true), csr(self(), 1, false)]),
@@ -665,6 +720,47 @@ handle_node_reconnected_test(_) ->
     stop_node(N1Pid),
     ok.
 
+handle_node_reconnected_v8_test(_) ->
+    %% As of v8 a node disconnection keeps the connection in pids_groups, so
+    %% handle_node_reconnected/4 must NOT rebuild the reverse index (state is
+    %% left untouched) while still re-issuing the monitor and check-connection
+    %% effect for the reconnecting node's connections only. On a consistent
+    %% state the effect set must match the v7 /3 full scan.
+    N0 = node(),
+    {N1Pid, N1} = start_node(?FUNCTION_NAME),
+    N0Pid0 = new_process(N0),
+    N1Pid0 = new_process(N1),
+
+    GId0 = group_id(<<"s0">>),
+    GId1 = group_id(<<"s1">>),
+    Group0 = grp(0, [csr(N0Pid0, 0, {connected, active}),
+                     csr(N1Pid0, 1, {disconnected, waiting})]),
+    Group1 = grp(1, [csr(N0Pid0, 0, {connected, active}),
+                     csr(N1Pid0, 1, {disconnected, waiting})]),
+    Groups0 = #{GId0 => Group0, GId1 => Group1},
+    %% consistent index: the disconnected N1 connection is still tracked (v8)
+    State0 = state(Groups0),
+
+    {StateV8, EffV8} =
+        ?MOD:handle_node_reconnected(#{machine_version => 8}, N1, State0, []),
+    {_StateV7, EffV7} =
+        ?MOD:handle_node_reconnected(N1, State0, []),
+
+    %% v8 leaves the state byte-identical (no rebuild, no merge)
+    ?assertEqual(State0, StateV8),
+    %% only the reconnecting node's single connection is affected, and it is
+    %% visited once even though it belongs to two groups
+    assertSize(2, EffV8),
+    assertContainsCheckConnectionEffect(N1Pid0, EffV8),
+    assertContainsMonitorProcessEffect(N1Pid0, EffV8),
+    %% v7 /3 on the same consistent state yields the same effect set
+    assertSize(2, EffV7),
+    assertContainsCheckConnectionEffect(N1Pid0, EffV7),
+    assertContainsMonitorProcessEffect(N1Pid0, EffV7),
+
+    stop_node(N1Pid),
+    ok.
+
 connection_reconnected_simple_disconnected_becomes_connected_test(_) ->
     Pid0 = new_process(),
     Pid1 = new_process(),
@@ -685,6 +781,56 @@ connection_reconnected_simple_disconnected_becomes_connected_test(_) ->
                              csr(Pid2, 2, {connected, waiting})]),
                    Groups1),
     assertEmpty(Eff),
+    ok.
+
+connection_reconnected_v8_apply_matches_v7_test(_) ->
+    %% The v8 apply/3 fast path visits only the reconnecting connection's
+    %% groups (via the reverse index); it must produce the same state as the
+    %% v7 apply/2 full scan, including leaving unrelated groups untouched.
+    P0 = new_process(),
+    P1 = new_process(),
+    Other = new_process(),
+    GId = group_id(),
+    G2Id = {<<"/">>, <<"other-stream">>, <<"app">>},
+    G1 = grp([csr(P0, 0, {disconnected, active}),
+              csr(P1, 1, {connected, waiting})]),
+    %% an unrelated group the reconnecting connection is not part of
+    G2 = grp([csr(Other, 0, {connected, active})]),
+    State0 = state(#{GId => G1, G2Id => G2}),
+    Cmd = connection_reconnected_command(P0),
+
+    {#?STATE{groups = GroupsV7}, ok, _} = ?MOD:apply(Cmd, State0),
+    {#?STATE{groups = GroupsV8}, ok, _} =
+        ?MOD:apply(#{machine_version => 8}, Cmd, State0),
+
+    Expected = grp([csr(P0, 0, {connected, active}),
+                    csr(P1, 1, {connected, waiting})]),
+    assertHasGroup(GId, Expected, GroupsV7),
+    assertHasGroup(GId, Expected, GroupsV8),
+    assertHasGroup(G2Id, G2, GroupsV7),
+    assertHasGroup(G2Id, G2, GroupsV8),
+    ok.
+
+connection_reconnected_v8_ensure_monitors_skips_rebuild_test(_) ->
+    %% For a tracked connection, the v8 ensure_monitors/5 must skip the
+    %% O(total) reverse-index rebuild and leave pids_groups unchanged, while
+    %% still (re-)issuing the monitor. The result must match the v7 rebuild.
+    P0 = new_process(),
+    GId = group_id(),
+    State0 = state(#{GId => grp([csr(P0, 0, {connected, active})])}),
+    #?STATE{pids_groups = PG0} = State0,
+    Cmd = connection_reconnected_command(P0),
+
+    {#?STATE{pids_groups = PG8}, Mons8, Eff8} =
+        ?MOD:ensure_monitors(#{machine_version => 8}, Cmd, State0, #{}, []),
+    ?assertEqual(PG0, PG8),
+    ?assertEqual(#{P0 => sac}, Mons8),
+    ?assert(lists:member({monitor, process, P0}, Eff8)),
+
+    %% v7 path rebuilds the index but yields the same result
+    {#?STATE{pids_groups = PG7}, _, _} =
+        ?MOD:ensure_monitors(Cmd, State0, #{}, []),
+    ?assertEqual(PG7, PG8),
     ok.
 
 connection_reconnected_simple_active_should_be_first_test(_) ->
@@ -1871,17 +2017,68 @@ state_enter_test(_) ->
                                       Id1 => grp([csr(P1), csr(P1), csr(P1)]),
                                       Id2 => grp([csr(P0), csr(P1), csr(P1)])})),
 
-    ?assertEqual(lists:sort(mon_node_eff([N0, N1]) ++ mon_proc_eff([P0, P1]) ++ [timer_eff(P1)]),
-                 state_enter_leader(#{Id0 => grp([csr(P0), csr(P1, {disconnected, waiting})]),
-                                      Id2 => grp([csr(P0)])})),
+    %% The timer duration depends on elapsed time since disconnection, so it
+    %% is checked for presence here rather than for an exact value; the
+    %% duration itself is covered by the state_enter_disconnected_timer_*
+    %% tests below.
+    Effects3 = state_enter_leader(#{Id0 => grp([csr(P0), csr(P1, {disconnected, waiting})]),
+                                    Id2 => grp([csr(P0)])}),
+    assertNodeDisconnectedTimerEffectPresent(P1, Effects3),
+    ?assertEqual(lists:sort(mon_node_eff([N0, N1]) ++ mon_proc_eff([P0, P1])),
+                 lists:sort([E || E <- Effects3, not is_timer_eff(E)])),
 
-    ?assertEqual(lists:sort(mon_node_eff([N0, N1, N2]) ++ mon_proc_eff([P0, P1, P2]) ++ timer_eff([P1, P2])),
-                 state_enter_leader(#{Id0 => grp([csr(P0), csr(P1, {disconnected, waiting})]),
-                                      Id1 => grp([csr(P0), csr(P2, {disconnected, waiting})]),
-                                      Id2 => grp([csr(P0), csr(P1, {disconnected, waiting})])})),
+    Effects4 = state_enter_leader(#{Id0 => grp([csr(P0), csr(P1, {disconnected, waiting})]),
+                                    Id1 => grp([csr(P0), csr(P2, {disconnected, waiting})]),
+                                    Id2 => grp([csr(P0), csr(P1, {disconnected, waiting})])}),
+    assertNodeDisconnectedTimerEffectPresent(P1, Effects4),
+    assertNodeDisconnectedTimerEffectPresent(P2, Effects4),
+    ?assertEqual(lists:sort(mon_node_eff([N0, N1, N2]) ++ mon_proc_eff([P0, P1, P2])),
+                 lists:sort([E || E <- Effects4, not is_timer_eff(E)])),
 
     stop_node(N1Pid),
     stop_node(N2Pid),
+    ok.
+
+%% a disconnected consumer that has been disconnected for longer than 10s
+%% but less than the disconnected timeout used to crash the case
+%% expression in state_enter/2 with a case_clause error
+state_enter_disconnected_timer_between_bounds_test(_) ->
+    N0 = node(),
+    P0 = new_process(N0),
+    P1 = new_process(N0),
+
+    Id0 = group_id(<<"sO">>),
+
+    Elapsed = 30_000,
+    DisconnectedTs = erlang:system_time(millisecond) - Elapsed,
+    DisconnectedCsr = (csr(P1, {disconnected, waiting}))#consumer{ts = DisconnectedTs},
+
+    [MonNode, MonP0, MonP1, {timer, {sac, node_disconnected, #{connection_pid := P1}}, Time}] =
+        state_enter_leader(#{Id0 => grp([csr(P0), DisconnectedCsr])}),
+
+    ?assertEqual(mon_node_eff(N0), MonNode),
+    ?assertEqual(mon_proc_eff([P0, P1]), [MonP0, MonP1]),
+    ?assert(Time >= 10_000 andalso Time =< 60_000),
+    ok.
+
+%% a consumer disconnected for longer than the disconnected timeout gets
+%% the 10s floor, not a full fresh interval
+state_enter_disconnected_timer_past_timeout_test(_) ->
+    N0 = node(),
+    P0 = new_process(N0),
+    P1 = new_process(N0),
+
+    Id0 = group_id(<<"sO">>),
+
+    DisconnectedTs = erlang:system_time(millisecond) - 90_000,
+    DisconnectedCsr = (csr(P1, {disconnected, waiting}))#consumer{ts = DisconnectedTs},
+
+    [MonNode, MonP0, MonP1, {timer, {sac, node_disconnected, #{connection_pid := P1}}, Time}] =
+        state_enter_leader(#{Id0 => grp([csr(P0), DisconnectedCsr])}),
+
+    ?assertEqual(mon_node_eff(N0), MonNode),
+    ?assertEqual(mon_proc_eff([P0, P1]), [MonP0, MonP1]),
+    ?assertEqual(10_000, Time),
     ok.
 
 mon_node_eff(Nodes) when is_list(Nodes) ->
@@ -1895,11 +2092,8 @@ mon_proc_eff(Pid) ->
     {monitor, process, Pid}.
 
 
-timer_eff(Pids) when is_list(Pids) ->
-    lists:sort([timer_eff(Pid) || Pid <- Pids]);
-timer_eff(Pid) ->
-    {timer, {sac, node_disconnected,
-             #{connection_pid => Pid}}, 10_000}.
+is_timer_eff({timer, {sac, node_disconnected, _}, _}) -> true;
+is_timer_eff(_) -> false.
 
 state_enter_leader(MapState) ->
     lists:sort(?MOD:state_enter(leader, state(MapState))).

@@ -68,20 +68,10 @@ gmake ct-rabbit_mgmt_http t="all_tests_with_prefix:users_test"
 gmake ct-rabbit_mgmt_http t="all_tests_with_prefix:queues_test"
 ```
 
-### Running Tests with a Specific Schema Data Store
+### Schema Data Store
 
-Set `RABBITMQ_METADATA_STORE` to either `khepri` or `mnesia` to make the Common Test suites
-use a specific [schema data store]() (metadata store):
-
-``` shell
-RABBITMQ_METADATA_STORE=khepri gmake ct-quorum_queue
-```
-
-Or, with Nu shell:
-
-```nu
-with-env {'RABBITMQ_METADATA_STORE': 'khepri'} { gmake ct-quorum_queue }
-```
+Khepri is the only [schema data store](https://www.rabbitmq.com/docs/metadata-store) since `4.3.0`,
+so test suites always run against it. `RABBITMQ_METADATA_STORE` is no longer read.
 
 ### Running Mixed Version Tests
 
@@ -171,6 +161,17 @@ To stop a previously started cluster:
 # Stops a three node cluster started earlier
 gmake stop-cluster NODES=3
 ```
+
+### Running JavaScript Tests
+
+Plugins with a JavaScript-based Web UI can run JavaScript tests alongside Erlang tests when executing `gmake tests`.
+
+To enable JavaScript tests for a plugin:
+
+ * Place a `package.json` at the root of the plugin directory (see `deps/rabbitmq_management/package.json` as a reference)
+ * Add JavaScript test files under the `test/` directory
+
+When `gmake tests` runs, all Erlang tests execute first. If `npm` is installed in the environment and `package.json` exists in the plugin, `gmake tests` automatically runs the `npm-test` target to execute all JavaScript tests under `test/` recursively.
 
 
 ## Working on Management UI with BrowserSync

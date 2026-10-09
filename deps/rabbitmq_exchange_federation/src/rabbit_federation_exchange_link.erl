@@ -16,7 +16,8 @@
 -behaviour(gen_server2).
 
 -export([go/0, add_binding/3, remove_bindings/3]).
--export([list_routing_keys/1]). %% For testing
+%% Exported for tests.
+-export([list_routing_keys/1, hops/4]).
 -export([all_local/0, disconnect_all/0, reconnect_all/0]).
 
 -export([start_link/1]).
@@ -86,13 +87,26 @@ init_link({Upstream, XName}) ->
     case rabbit_exchange:lookup(XName) of
         {ok, X} ->
             DeobfuscatedUpstream = rabbit_federation_util:deobfuscate_upstream(Upstream),
-            DeobfuscatedUParams = rabbit_federation_upstream:to_params(DeobfuscatedUpstream, X),
-            UParams = rabbit_federation_util:obfuscate_upstream_params(DeobfuscatedUParams),
-            rabbit_federation_status:report(Upstream, UParams, XName, starting),
-            join(rabbit_federation_exchanges),
-            join({rabbit_federation_exchange, XName}),
-            gen_server2:cast(self(), maybe_go),
-            {ok, {not_started, {Upstream, UParams, XName}}};
+            case rabbit_federation_upstream:to_params(DeobfuscatedUpstream, X) of
+                {ok, DeobfuscatedUParams} ->
+                    UParams = rabbit_federation_util:obfuscate_upstream_params(DeobfuscatedUParams),
+                    rabbit_federation_status:report(Upstream, UParams, XName, starting),
+                    join(rabbit_federation_exchanges),
+                    join({rabbit_federation_exchange, XName}),
+                    gen_server2:cast(self(), maybe_go),
+                    {ok, {not_started, {Upstream, UParams, XName}}};
+                {error, {_Info, SafeURI} = Reason} ->
+                    %% Unable to parse upstream URI. Return `ignore` so this
+                    %% link's supervisor keeps its siblings and does not fail
+                    %% broker startup. Publish an entry to the status table
+                    %% so the link is visible via `federation_status`.
+                    rabbit_federation_util:log_skipped_link(
+                      XName, Upstream#upstream.name, Reason),
+                    rabbit_federation_status:report(
+                      Upstream, #upstream_params{safe_uri = SafeURI}, XName,
+                      {invalid_upstream_uri, Reason}),
+                    ignore
+            end;
         {error, not_found} ->
             ?LOG_WARNING("not found, stopping link", []),
             {stop, gone}
@@ -148,8 +162,8 @@ handle_cast(disconnect_for_shutdown, State = #state{
                 _ ->
                     try
                         {ok, Ch} = amqp_connection:open_channel(Conn),
-                        catch amqp_channel:call(Ch, #'queue.delete'{queue = Queue}),
-                        catch amqp_channel:call(Ch, #'exchange.delete'{exchange = IntExchange})
+                        try amqp_channel:call(Ch, #'queue.delete'{queue = Queue}) catch _:_ -> ok end,
+                        try amqp_channel:call(Ch, #'exchange.delete'{exchange = IntExchange}) catch _:_ -> ok end
                     catch
                         _:_ -> ok
                     end
@@ -240,6 +254,13 @@ handle_info(check_internal_exchange, State = #state{internal_exchange = IntXName
             TRef = erlang:send_after(Interval, self(), check_internal_exchange),
             {noreply, State#state{internal_exchange_timer = TRef}}
     end;
+
+handle_info({'EXIT', _From, Reason},
+            State = #state{upstream            = Upstream,
+                           upstream_params     = UParams,
+                           downstream_exchange = XName}) ->
+    rabbit_federation_link_util:handle_connection_exit(
+      Reason, Upstream, UParams, XName, State);
 
 handle_info({'EXIT', _From, Reason}, State) ->
     {stop, Reason, State};
@@ -414,10 +435,10 @@ binding_op(UpdateFun, Cmd, B = #binding{args = Args},
            State = #state{cmd_channel = Ch}) ->
     {DoIt, State1} =
         case rabbit_misc:table_lookup(Args, ?BINDING_HEADER) of
-            undefined  -> UpdateFun(B, State);
-            {array, _} -> {Cmd =/= ignore, State}
+            undefined -> UpdateFun(B, State);
+            _         -> {true, State}
         end,
-    case DoIt of
+    case DoIt andalso Cmd =/= ignore of
         true  -> amqp_channel:call(Ch, Cmd);
         false -> ok
     end,
@@ -488,6 +509,9 @@ bind_cmd0(unbind, Source, Destination, RoutingKey, Arguments, Nowait) ->
 %%
 %% In other words, we count down to 0 from the link with the most
 %% restrictive max_hops we have yet passed through.
+%%
+%% The binding header is an ordinary binding argument, so clients can set
+%% it to anything. `hops/4` therefore never trusts it.
 
 update_binding(Args, #state{downstream_exchange = X,
                             upstream            = Upstream,
@@ -495,32 +519,43 @@ update_binding(Args, #state{downstream_exchange = X,
                             upstream_name       = UName}) ->
     #upstream{max_hops = MaxHops} = Upstream,
     UVhost = vhost(UpstreamX),
-    Hops = case rabbit_misc:table_lookup(Args, ?BINDING_HEADER) of
-               undefined    -> MaxHops;
-               {array, All} -> [{table, Prev} | _] = All,
-                               PrevHops = get_hops(Prev),
-                               case rabbit_federation_util:already_seen(
-                                      UName, UVhost, All) of
-                                   true  -> 0;
-                                   false -> lists:min([PrevHops - 1, MaxHops])
-                               end
-           end,
-    case Hops of
-        0 -> ignore;
-        _ -> Cluster = rabbit_nodes:cluster_name(),
-             ABSuffix = rabbit_federation_db:get_active_suffix(
-                          X, Upstream, <<"A">>),
-             DVhost = vhost(X),
-             DName = name(X),
-             Down = <<DVhost/binary,":", DName/binary, " ", ABSuffix/binary>>,
-             Info = [{<<"cluster-name">>, longstr, Cluster},
-                     {<<"vhost">>,        longstr, DVhost},
-                     {<<"exchange">>,     longstr, Down},
-                     {<<"hops">>,         short,   Hops}],
-             rabbit_basic:prepend_table_header(?BINDING_HEADER, Info, Args)
+    case hops(Args, MaxHops, UName, UVhost) of
+        0 ->
+            ignore;
+        Hops ->
+            Cluster = rabbit_nodes:cluster_name(),
+            ABSuffix = rabbit_federation_db:get_active_suffix(
+                         X, Upstream, <<"A">>),
+            DVhost = vhost(X),
+            DName = name(X),
+            Down = <<DVhost/binary,":", DName/binary, " ", ABSuffix/binary>>,
+            Info = [{<<"cluster-name">>, longstr, Cluster},
+                    {<<"vhost">>,        longstr, DVhost},
+                    {<<"exchange">>,     longstr, Down},
+                    {<<"hops">>,         short,   Hops}],
+            rabbit_basic:prepend_table_header(?BINDING_HEADER, Info, Args)
     end.
 
+%% A header that does not carry a positive hop count stops propagation
+%% instead of being trusted.
+-spec hops(rabbit_framing:amqp_table(), integer(), binary() | unknown, binary()) ->
+          non_neg_integer().
+hops(Args, MaxHops, UName, UVhost) ->
+    Hops = case rabbit_misc:table_lookup(Args, ?BINDING_HEADER) of
+               undefined ->
+                   MaxHops;
+               {array, All} ->
+                   case rabbit_federation_util:already_seen(UName, UVhost, All) of
+                       true  -> 0;
+                       false -> lists:min([previous_hops(All) - 1, MaxHops])
+                   end;
+               _ ->
+                   0
+           end,
+    erlang:max(0, Hops).
 
+previous_hops([{table, Prev} | _]) -> get_hops(Prev);
+previous_hops(_)                   -> 0.
 
 key(#binding{key = Key, args = Args}) -> {Key, Args}.
 
@@ -588,7 +623,7 @@ reuse_command_channel(MainCh, #upstream{name = UName}, DownXName) ->
                                 [UName, rabbit_misc:rs(DownXName)]),
     {ok, MainCh}.
 
-open_command_channel(Conn, Upstream = #upstream{name = UName}, UParams, DownXName, S0) ->
+open_command_channel(Conn, #upstream{name = UName}, _UParams, DownXName, _S0) ->
     ?LOG_DEBUG("Will open a command channel to upstream '~ts' for downstream federated ~ts",
                                 [UName, rabbit_misc:rs(DownXName)]),
     case amqp_connection:open_channel(Conn) of
@@ -596,10 +631,13 @@ open_command_channel(Conn, Upstream = #upstream{name = UName}, UParams, DownXNam
             erlang:monitor(process, CCh),
             {ok, CCh};
         E ->
+            %% `amqp_connection:open_channel/1` can return the bare atom
+            %% `closing` rather than `{error, _}`
+            %%
+            %% Exit early so that `start_conn_ch/5` handles it
+            %% instead of failing with a badmatch ok `{ok, _}`.
             rabbit_federation_link_util:ensure_connection_closed(Conn, connection_close_timeout()),
-            _ = rabbit_federation_link_util:connection_error(command_channel, E,
-                                                             Upstream, UParams, DownXName, S0),
-            E
+            exit(E)
     end.
 
 consume_from_upstream_queue(
@@ -629,6 +667,11 @@ consume_from_upstream_queue(
         false -> amqp_channel:call(Ch, #'basic.qos'{prefetch_count = Prefetch});
         true  -> ok
     end,
+    %% Without this, an unmatched `basic.cancel` or `basic.deliver` results
+    %% in an exception. Note that this does not add a new consumer: the current
+    %% process will handle the delivered frames for "unknown" (e.g. recently cancelled)
+    %% consumers.
+    ok = amqp_selective_consumer:register_default_consumer(Ch, self()),
     #'basic.consume_ok'{consumer_tag = CTag} =
         amqp_channel:subscribe(Ch, #'basic.consume'{queue  = Q,
                                                     no_ack = NoAck}, self()),
@@ -780,17 +823,10 @@ header_for_upstream_vhost(unknown) -> [];
 header_for_upstream_vhost(Name)    -> [{<<"vhost">>, longstr, Name}].
 
 get_hops(Table) ->
-  case rabbit_misc:table_lookup(Table, <<"hops">>) of
-    %% see rabbit_binary_generator
-    {short, N}         -> N;
-    {long, N}          -> N;
-    {byte, N}          -> N;
-    {signedint, N}     -> N;
-    {unsignedbyte, N}  -> N;
-    {unsignedshort, N} -> N;
-    {unsignedint, N}   -> N;
-    {_, N} when is_integer(N) andalso N >= 0 -> N
-  end.
+    case rabbit_misc:table_lookup(Table, <<"hops">>) of
+        {_, N} when is_integer(N) andalso N > 0 -> N;
+        _                                       -> 0
+    end.
 
 handle_down(DCh, Reason, _Ch, _CmdCh, DCh, Args, State) ->
     rabbit_federation_link_util:handle_downstream_down(Reason, Args, State);

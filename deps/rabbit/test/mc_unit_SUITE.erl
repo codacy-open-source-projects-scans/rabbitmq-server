@@ -25,6 +25,8 @@ groups() ->
 all_tests() ->
     [
      mc_util_uuid_to_urn_roundtrip,
+     mc_util_urn_string_to_uuid_rejects_non_hex_body,
+     mc_util_urn_string_to_uuid_rejects_wrong_dash_placement,
      amqpl_defaults,
      amqpl_compat,
      amqpl_table_x_header,
@@ -39,9 +41,35 @@ all_tests() ->
      amqp_amqpl_amqp_message_id_uuid,
      amqp_amqpl_message_id_large,
      amqp_amqpl_message_id_binary,
+     amqp_amqpl_message_id_out_of_spec_type_dropped,
+     amqp_amqpl_properties_out_of_spec_type_dropped,
+     amqp_amqpl_properties_wrong_2_tuple_type_dropped,
+     amqp_amqpl_header_out_of_spec_type_dropped,
      amqp_amqpl_unsupported_values_not_converted,
+     amqp_amqpl_long_key_in_nested_map_dropped,
+     amqp_amqpl_long_key_in_nested_map_in_list_dropped,
+     amqp_amqpl_as_is_in_nested_map_in_list_dropped,
+     amqp_amqpl_bare_atom_map_key_dropped,
+     amqp_amqpl_bare_atom_map_key_in_list_dropped,
+     amqp_amqpl_as_is_in_list_in_list_dropped,
+     amqp_amqpl_array_nested_in_list_converted,
+     amqp_amqpl_char_uuid_top_level_dropped,
+     amqp_amqpl_char_uuid_described_nested_in_map_dropped,
+     amqp_amqpl_char_uuid_described_nested_in_list_dropped,
+     amqp_amqpl_uuid_map_key_dropped,
+     amqp_amqpl_binary_map_key_dropped,
+     amqp_amqpl_ulong_in_list_converted,
+     amqp_amqpl_x_cc_unconvertible_value_dropped,
+     mc_amqpl_is_convertible,
+     mc_amqpl_is_representable,
+     mc_amqpl_is_representable_nested,
+     amqp_amqpl_malformed_x_opt_deaths_dropped,
      amqp_to_amqpl_data_body,
      amqp_amqpl_amqp_bodies,
+     amqpl_amqp_type_body_shapes,
+     amqpl_amqp_type_invalid_payload,
+     amqpl_invalid_expiration,
+     amqpl_to_amqp_invalid_expiration,
      amqp_x_headers,
      amqpl_x_headers
     ].
@@ -492,6 +520,43 @@ mc_util_uuid_to_urn_roundtrip(_Config) ->
     S = mc_util:uuid_to_urn_string(UUID),
     ?assertEqual(<<"urn:uuid:58b867b0-8151-1f56-1bd4-73229807fd60">>, S),
     ?assertEqual({ok, UUID}, mc_util:urn_string_to_uuid(S)),
+    %% RFC 4122 requires readers to accept upper case hex
+    ?assertEqual({ok, UUID},
+                 mc_util:urn_string_to_uuid(
+                   <<"urn:uuid:58B867B0-8151-1F56-1BD4-73229807FD60">>)),
+    ok.
+
+%% Only the `urn:uuid:` prefix and the 36-byte body length were checked, so
+%% a non-hex body reached `binary:decode_hex/1`, which raises badarg.
+mc_util_urn_string_to_uuid_rejects_non_hex_body(_Config) ->
+    NotHexBody = <<"zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz">>,
+    ?assertEqual(36, byte_size(NotHexBody)),
+    ?assertEqual({error, not_urn_string},
+                 mc_util:urn_string_to_uuid(<<"urn:uuid:", NotHexBody/binary>>)),
+    %% dashes in the wrong places, leaving segments `binary:decode_hex/1` rejects
+    OddSegmentBody = <<"abcdefg-1234-5678-9abc-def0123456789">>,
+    ?assertEqual(36, byte_size(OddSegmentBody)),
+    ?assertEqual({error, not_urn_string},
+                 mc_util:urn_string_to_uuid(<<"urn:uuid:", OddSegmentBody/binary>>)),
+    ok.
+
+%% `binary:decode_hex/1` doesn't care where the dashes are, so a 36-byte body
+%% with misplaced dashes used to decode to a wrong-sized binary and reach the
+%% AMQP 1.0 encoder, which requires a uuid to be exactly 16 bytes.
+mc_util_urn_string_to_uuid_rejects_wrong_dash_placement(_Config) ->
+    %% no dashes at all: decodes to 18 bytes
+    NoDashes = binary:copy(<<"a">>, 36),
+    ?assertEqual({error, not_urn_string},
+                 mc_util:urn_string_to_uuid(<<"urn:uuid:", NoDashes/binary>>)),
+    AllDashes = binary:copy(<<"-">>, 36),
+    ?assertEqual({error, not_urn_string},
+                 mc_util:urn_string_to_uuid(<<"urn:uuid:", AllDashes/binary>>)),
+    %% 32 hex characters and 4 dashes, but grouped 16-4-16
+    HexHalf = binary:copy(<<"a">>, 16),
+    ClusteredDashes = <<HexHalf/binary, "----", HexHalf/binary>>,
+    ?assertEqual(36, byte_size(ClusteredDashes)),
+    ?assertEqual({error, not_urn_string},
+                 mc_util:urn_string_to_uuid(<<"urn:uuid:", ClusteredDashes/binary>>)),
     ok.
 
 do_n(0, _) ->
@@ -526,6 +591,342 @@ amqp_amqpl_unsupported_values_not_converted(_Config) ->
     ?assertMatch(undefined, header(LongKey, HL)),
     %% RabbitMQ does not validate that keys are ascii as per spec
     %% that's ok after all who really cares?
+    ok.
+
+amqp_amqpl_long_key_in_nested_map_dropped(_Config) ->
+    LongKey = binary:copy(<<"b">>, 256),
+    NestedMap = {map, [{{utf8, <<"short">>}, {utf8, <<"ok">>}},
+                        {{utf8, LongKey}, {utf8, <<"nope">>}}]},
+    APC = [
+           {{utf8, <<"area">>}, {utf8, <<"East Sussex">>}},
+           {{utf8, <<"nested">>}, NestedMap}
+          ],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, longstr, <<"East Sussex">>}, header(<<"area">>, HL)),
+    {_, table, Nested} = header(<<"nested">>, HL),
+    ?assertMatch({_, longstr, <<"ok">>}, header(<<"short">>, Nested)),
+    ?assertMatch(undefined, header(LongKey, Nested)),
+    ok.
+
+amqp_amqpl_long_key_in_nested_map_in_list_dropped(_Config) ->
+    LongKey = binary:copy(<<"b">>, 256),
+    NestedMap = {map, [{{utf8, <<"short">>}, {utf8, <<"ok">>}},
+                        {{utf8, LongKey}, {utf8, <<"nope">>}}]},
+    APC = [{{utf8, <<"list">>}, {list, [NestedMap]}}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    {_, array, [{table, Nested}]} = header(<<"list">>, HL),
+    ?assertMatch({_, longstr, <<"ok">>}, header(<<"short">>, Nested)),
+    ?assertMatch(undefined, header(LongKey, Nested)),
+    ok.
+
+amqp_amqpl_as_is_in_nested_map_in_list_dropped(_Config) ->
+    %% amqp10_framing cannot encode a decimal32, so the map { "k" =>
+    %% decimal32(0) } nested inside a list is built by hand, following the
+    %% AMQP 1.0 primitive and compound encodings directly.
+    Decimal32 = <<16#74, 0, 0, 0, 0>>,
+    KeyBin = <<16#a1, 1, "k">>,
+    MapContents = <<KeyBin/binary, Decimal32/binary>>,
+    MapBin = <<16#c1, (byte_size(MapContents) + 1), 2, MapContents/binary>>,
+    ListBin = <<16#c0, (byte_size(MapBin) + 1), 1, MapBin/binary>>,
+    APKey = <<16#a1, 4, "list">>,
+    APContents = <<APKey/binary, ListBin/binary>>,
+    APMap = <<16#c1, (byte_size(APContents) + 1), 2, APContents/binary>>,
+    AP = <<0, 16#53, 16#74, APMap/binary>>,
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = <<AP/binary, (serialize_sections([D]))/binary>>,
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, array, [{table, []}]}, header(<<"list">>, HL)),
+    ok.
+
+amqp_amqpl_bare_atom_map_key_dropped(_Config) ->
+    APC = [{{utf8, <<"m">>}, {map, [{true, {utf8, <<"v">>}},
+                                     {{utf8, <<"short">>}, {utf8, <<"ok">>}}]}}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    {_, table, Nested} = header(<<"m">>, HL),
+    ?assertMatch({_, longstr, <<"ok">>}, header(<<"short">>, Nested)),
+    ?assertEqual(1, length(Nested)),
+    ok.
+
+amqp_amqpl_bare_atom_map_key_in_list_dropped(_Config) ->
+    NestedMap = {map, [{true, {utf8, <<"v">>}},
+                        {{utf8, <<"short">>}, {utf8, <<"ok">>}}]},
+    APC = [{{utf8, <<"list">>}, {list, [NestedMap]}}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    {_, array, [{table, Nested}]} = header(<<"list">>, HL),
+    ?assertMatch({_, longstr, <<"ok">>}, header(<<"short">>, Nested)),
+    ?assertEqual(1, length(Nested)),
+    ok.
+
+amqp_amqpl_as_is_in_list_in_list_dropped(_Config) ->
+    %% amqp10_framing cannot encode a decimal32, so { list => [ list =>
+    %% [decimal32(0)] ] } is built by hand.
+    Decimal32 = <<16#74, 0, 0, 0, 0>>,
+    InnerListBin = <<16#c0, (byte_size(Decimal32) + 1), 1, Decimal32/binary>>,
+    OuterListBin = <<16#c0, (byte_size(InnerListBin) + 1), 1, InnerListBin/binary>>,
+    APKey = <<16#a1, 4, "list">>,
+    APContents = <<APKey/binary, OuterListBin/binary>>,
+    APMap = <<16#c1, (byte_size(APContents) + 1), 2, APContents/binary>>,
+    AP = <<0, 16#53, 16#74, APMap/binary>>,
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = <<AP/binary, (serialize_sections([D]))/binary>>,
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, array, [{array, []}]}, header(<<"list">>, HL)),
+    ok.
+
+amqp_amqpl_array_nested_in_list_converted(_Config) ->
+    APC = [{{utf8, <<"list">>},
+            {list, [{array, utf8, [{utf8, <<"x">>}, {utf8, <<"y">>}]}]}}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, array, [{array, [{longstr, <<"x">>}, {longstr, <<"y">>}]}]},
+                 header(<<"list">>, HL)),
+    ok.
+
+%% A described value isn't exercised at this level: an unrecognised
+%% descriptor is rejected earlier, by amqp10_framing:decode/1 itself,
+%% before mc_amqpl ever sees it (see the nested cases below instead).
+amqp_amqpl_char_uuid_top_level_dropped(_Config) ->
+    APC = [{{utf8, <<"area">>}, {utf8, <<"East Sussex">>}},
+           {{utf8, <<"char">>}, {char, 65}},
+           {{utf8, <<"uuid">>}, {uuid, <<0:128>>}}
+          ],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, longstr, <<"East Sussex">>}, header(<<"area">>, HL)),
+    ?assertMatch(undefined, header(<<"char">>, HL)),
+    ?assertMatch(undefined, header(<<"uuid">>, HL)),
+    ok.
+
+amqp_amqpl_char_uuid_described_nested_in_map_dropped(_Config) ->
+    NestedMap = {map, [{{utf8, <<"char">>}, {char, 65}},
+                        {{utf8, <<"uuid">>}, {uuid, <<0:128>>}},
+                        {{utf8, <<"described">>},
+                         {described, {symbol, <<"my-type">>}, {utf8, <<"v">>}}},
+                        {{utf8, <<"short">>}, {utf8, <<"ok">>}}]},
+    APC = [{{utf8, <<"nested">>}, NestedMap}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    {_, table, Nested} = header(<<"nested">>, HL),
+    ?assertMatch({_, longstr, <<"ok">>}, header(<<"short">>, Nested)),
+    ?assertEqual(1, length(Nested)),
+    ok.
+
+amqp_amqpl_char_uuid_described_nested_in_list_dropped(_Config) ->
+    APC = [{{utf8, <<"list">>},
+            {list, [{char, 65},
+                    {uuid, <<0:128>>},
+                    {described, {symbol, <<"my-type">>}, {utf8, <<"v">>}},
+                    {utf8, <<"ok">>}]}}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, array, [{longstr, <<"ok">>}]}, header(<<"list">>, HL)),
+    ok.
+
+amqp_amqpl_uuid_map_key_dropped(_Config) ->
+    NestedMap = {map, [{{uuid, <<0:128>>}, {utf8, <<"v">>}},
+                        {{utf8, <<"short">>}, {utf8, <<"ok">>}}]},
+    APC = [{{utf8, <<"m">>}, NestedMap}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    {_, table, Nested} = header(<<"m">>, HL),
+    ?assertMatch({_, longstr, <<"ok">>}, header(<<"short">>, Nested)),
+    ?assertEqual(1, length(Nested)),
+    ok.
+
+amqp_amqpl_binary_map_key_dropped(_Config) ->
+    NestedMap = {map, [{{binary, <<0, 1, 2>>}, {utf8, <<"v">>}},
+                        {{utf8, <<"short">>}, {utf8, <<"ok">>}}]},
+    APC = [{{utf8, <<"m">>}, NestedMap}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    {_, table, Nested} = header(<<"m">>, HL),
+    ?assertMatch({_, longstr, <<"ok">>}, header(<<"short">>, Nested)),
+    ?assertEqual(1, length(Nested)),
+    ok.
+
+amqp_amqpl_ulong_in_list_converted(_Config) ->
+    APC = [{{utf8, <<"list">>}, {list, [{ulong, 42}, {utf8, <<"ok">>}]}}],
+    AP = #'v1_0.application_properties'{content = APC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([AP, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, array, [{long, 42}, {longstr, <<"ok">>}]},
+                 header(<<"list">>, HL)),
+    ok.
+
+amqp_amqpl_x_cc_unconvertible_value_dropped(_Config) ->
+    MAC = [{{symbol, <<"x-cc">>}, {char, 65}},
+           {{symbol, <<"x-other">>}, {utf8, <<"still-here">>}}],
+    M = #'v1_0.message_annotations'{content = MAC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([M, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertEqual(undefined, header(<<"CC">>, HL)),
+    ?assertMatch({_, longstr, <<"still-here">>}, header(<<"x-other">>, HL)),
+    ok.
+
+mc_amqpl_is_convertible(_Config) ->
+    ?assertNot(mc_amqpl:is_convertible({as_is, 16#74, <<0,0,0,0>>})),
+    ?assertNot(mc_amqpl:is_convertible({char, 65})),
+    ?assertNot(mc_amqpl:is_convertible({uuid, <<0:128>>})),
+    ?assertNot(mc_amqpl:is_convertible({described, {symbol, <<"t">>}, {utf8, <<"v">>}})),
+    ?assert(mc_amqpl:is_convertible({utf8, <<"v">>})),
+    ?assert(mc_amqpl:is_convertible({long, 42})),
+    ?assert(mc_amqpl:is_convertible({ulong, 42})),
+    ?assert(mc_amqpl:is_convertible(true)),
+    ?assert(mc_amqpl:is_convertible(undefined)),
+    ?assert(mc_amqpl:is_convertible({map, []})),
+    ?assert(mc_amqpl:is_convertible({list, []})),
+    ok.
+
+mc_amqpl_is_representable(_Config) ->
+    ShortKey = <<"k">>,
+    MaxKey = binary:copy(<<"k">>, 255),
+    LongKey = binary:copy(<<"k">>, 256),
+    ?assert(mc_amqpl:is_representable(ShortKey, {utf8, <<"v">>})),
+    ?assert(mc_amqpl:is_representable(MaxKey, {utf8, <<"v">>})),
+    ?assertNot(mc_amqpl:is_representable(LongKey, {utf8, <<"v">>})),
+    ?assertNot(mc_amqpl:is_representable(ShortKey, {uuid, <<0:128>>})),
+    ?assertNot(mc_amqpl:is_representable(LongKey, {uuid, <<0:128>>})),
+    ok.
+
+mc_amqpl_is_representable_nested(_Config) ->
+    ?assert(mc_amqpl:is_representable(
+              <<"k">>, {map, [{{utf8, <<"a">>}, {utf8, <<"v">>}}]})),
+    ?assertNot(mc_amqpl:is_representable(
+                 <<"k">>, {map, [{{utf8, <<"a">>}, {uuid, <<0:128>>}}]})),
+    ?assertNot(mc_amqpl:is_representable(
+                 <<"k">>, {map, [{{binary, <<0>>}, {utf8, <<"v">>}}]})),
+    ?assert(mc_amqpl:is_representable(
+              <<"k">>, {list, [{utf8, <<"v">>}]})),
+    ?assertNot(mc_amqpl:is_representable(
+                 <<"k">>, {list, [{uuid, <<0:128>>}]})),
+    ?assertNot(mc_amqpl:is_representable(
+                 <<"k">>, {list, [{map, [{{utf8, <<"a">>}, {char, 65}}]}]})),
+    ?assert(mc_amqpl:is_representable(
+              <<"k">>, {array, utf8, [{utf8, <<"v">>}]})),
+    ?assertNot(mc_amqpl:is_representable(
+                 <<"k">>, {array, uuid, [{uuid, <<0:128>>}]})),
+    ok.
+
+%% Malformed client-supplied x-opt-deaths entries are dropped on conversion to AMQP 0-9-1.
+amqp_amqpl_malformed_x_opt_deaths_dropped(_Config) ->
+    Malformed = {map, [{{symbol, <<"queue">>}, {utf8, <<"q">>}}]},
+    WellFormedKvs = [
+                     {{symbol, <<"queue">>}, {utf8, <<"q2">>}},
+                     {{symbol, <<"reason">>}, {symbol, <<"rejected">>}},
+                     {{symbol, <<"count">>}, {ulong, 3}},
+                     {{symbol, <<"first-time">>}, {timestamp, 1000}},
+                     {{symbol, <<"last-time">>}, {timestamp, 2000}},
+                     {{symbol, <<"exchange">>}, {utf8, <<"ex">>}},
+                     {{symbol, <<"routing-keys">>},
+                      {array, utf8, [{utf8, <<"rk1">>}]}}
+                    ],
+    WellFormed = {map, WellFormedKvs},
+    WrongType = {map, lists:keyreplace({symbol, <<"count">>}, 1, WellFormedKvs,
+                                       {{symbol, <<"count">>}, {uint, 3}})},
+    MAC = [
+           {{symbol, <<"x-opt-deaths">>},
+            {array, map, [Malformed, WrongType, WellFormed]}},
+           {{symbol, <<"x-other">>}, {utf8, <<"still-here">>}}
+          ],
+    M = #'v1_0.message_annotations'{content = MAC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([M, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    %% The malformed and wrong-type entries are dropped; the well-formed one
+    %% and the other x- annotations still convert.
+    {_, array, [{table, T}]} = header(<<"x-death">>, HL),
+    ?assertMatch({_, longstr, <<"q2">>}, header(<<"queue">>, T)),
+    ?assertMatch({_, longstr, <<"rejected">>}, header(<<"reason">>, T)),
+    ?assertMatch({_, long, 3}, header(<<"count">>, T)),
+    ?assertMatch({_, longstr, <<"still-here">>}, header(<<"x-other">>, HL)),
+
+    %% A message whose only death entry is malformed converts to an empty
+    %% x-death array.
+    MAC1 = [{{symbol, <<"x-opt-deaths">>}, {array, map, [Malformed]}}],
+    Payload1 = serialize_sections([#'v1_0.message_annotations'{content = MAC1}, D]),
+    Msg1 = mc:init(mc_amqp, Payload1, annotations()),
+    MsgL1 = mc:convert(mc_amqpl, Msg1),
+    #content{properties = #'P_basic'{headers = HL1}} = mc:protocol_state(MsgL1),
+    ?assertMatch({_, array, []}, header(<<"x-death">>, HL1)),
+
+    %% An x-opt-deaths value that is not an array of maps is ignored.
+    MAC2 = [{{symbol, <<"x-opt-deaths">>}, {utf8, <<"junk">>}}],
+    Payload2 = serialize_sections([#'v1_0.message_annotations'{content = MAC2}, D]),
+    Msg2 = mc:init(mc_amqp, Payload2, annotations()),
+    MsgL2 = mc:convert(mc_amqpl, Msg2),
+    #content{properties = #'P_basic'{headers = HL2}} = mc:protocol_state(MsgL2),
+    ?assertEqual(undefined, header(<<"x-death">>, HL2)),
     ok.
 
 amqp_amqpl_amqp_uuid_correlation_id(_Config) ->
@@ -713,6 +1114,72 @@ amqp_amqpl_message_id_binary(_Config) ->
     ?assertMatch({_, binary, Orig}, header(<<"x-correlation-id">>, Hdrs)),
     ok.
 
+%% amqp10_composite:properties/2 decodes the properties section
+%% positionally, with no per-field type validation.
+amqp_amqpl_message_id_out_of_spec_type_dropped(_Config) ->
+    P = #'v1_0.properties'{message_id = true,
+                           correlation_id = {as_is, 16#74, <<0, 0, 0, 0>>}},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([P, D]),
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    ?assertEqual(undefined, mc:message_id(MsgL)),
+    ?assertEqual(undefined, mc:correlation_id(MsgL)),
+    #content{properties = #'P_basic'{headers = Hdrs}} = mc:protocol_state(MsgL),
+    ?assertEqual(undefined, header(<<"x-message-id">>, Hdrs)),
+    ?assertEqual(undefined, header(<<"x-correlation-id">>, Hdrs)),
+    ok.
+
+amqp_amqpl_properties_out_of_spec_type_dropped(_Config) ->
+    P = #'v1_0.properties'{content_type = true,
+                           content_encoding = {as_is, 16#74, <<0, 0, 0, 0>>},
+                           creation_time = {described, {symbol, <<"t">>}, {utf8, <<"v">>}}},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([P, D]),
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{content_type = ContentType,
+                                     content_encoding = ContentEncoding,
+                                     timestamp = Timestamp}} = mc:protocol_state(MsgL),
+    ?assertEqual(undefined, ContentType),
+    ?assertEqual(undefined, ContentEncoding),
+    ?assertEqual(undefined, Timestamp),
+    ok.
+
+%% Same as amqp_amqpl_properties_out_of_spec_type_dropped, but with a
+%% 2-tuple of the wrong type (e.g. {utf8, _} for creation-time) rather
+%% than a bare atom or 3-tuple.
+amqp_amqpl_properties_wrong_2_tuple_type_dropped(_Config) ->
+    P = #'v1_0.properties'{content_type = {list, [{utf8, <<"a">>}]},
+                           content_encoding = {long, 5},
+                           creation_time = {utf8, <<"not-a-timestamp">>}},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([P, D]),
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{content_type = ContentType,
+                                     content_encoding = ContentEncoding,
+                                     timestamp = Timestamp}} = mc:protocol_state(MsgL),
+    ?assertEqual(undefined, ContentType),
+    ?assertEqual(undefined, ContentEncoding),
+    ?assertEqual(undefined, Timestamp),
+    ok.
+
+%% amqp10_composite:header/2 decodes the header section positionally,
+%% with no per-field type check, same as the properties section.
+amqp_amqpl_header_out_of_spec_type_dropped(_Config) ->
+    H = #'v1_0.header'{priority = {utf8, <<"bad">>},
+                       ttl = {utf8, <<"bad">>}},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([H, D]),
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{priority = Priority,
+                                     expiration = Expiration}} = mc:protocol_state(MsgL),
+    ?assertEqual(undefined, Priority),
+    ?assertEqual(undefined, Expiration),
+    ok.
+
 amqp_to_amqpl_data_body(_Config) ->
     Cases = [#'v1_0.data'{content = <<"helloworld">>},
              #'v1_0.data'{content = [<<"hello">>, <<"world">>]}],
@@ -770,6 +1237,85 @@ amqp_amqpl_amqp_bodies(_Config) ->
      end || Body <- Bodies],
     ok.
 
+amqpl_amqp_type_body_shapes(_Config) ->
+    Data = #'v1_0.data'{content = <<"hello">>},
+    Seq = #'v1_0.amqp_sequence'{content = [{utf8, <<"one">>}]},
+    Value = #'v1_0.amqp_value'{content = {utf8, <<"hello">>}},
+    Footer = #'v1_0.footer'{content = [{{symbol, <<"x-crc">>}, {uint, 1}}]},
+    Bodies = [[Value],
+              [Value, Footer],
+              [Seq, Seq],
+              [Seq, Footer],
+              [Data, Data],
+              [Data, Footer]],
+    [?assertEqual(Body, amqp_type_body_sections(serialize_sections(Body)))
+     || Body <- Bodies].
+
+%% `type' is an ordinary AMQP 0.9.1 property that any publisher can set, so a
+%% payload claiming to be AMQP 1.0 encoded may be neither well formed nor a
+%% message body. Such a payload is delivered as an opaque data section.
+amqpl_amqp_type_invalid_payload(_Config) ->
+    Payloads = [
+                <<>>,
+                <<"hello world">>,
+                <<0, 0>>,
+                %% a data section descriptor without its value
+                <<0, 16#53, 16#75>>,
+                serialize_sections([#'v1_0.header'{durable = true}]),
+                serialize_sections([#'v1_0.properties'{subject = {utf8, <<"s">>}}]),
+                serialize_sections([#'v1_0.application_properties'{content = []}]),
+                serialize_sections(
+                  [#'v1_0.message_annotations'{
+                      content = [{{symbol, <<"x-a">>}, {utf8, <<"v">>}}]}]),
+                serialize_sections([#'v1_0.footer'{content = []}]),
+                serialize_sections([#'v1_0.amqp_value'{content = {utf8, <<"a">>}},
+                                    #'v1_0.footer'{content = []},
+                                    #'v1_0.amqp_value'{content = {utf8, <<"b">>}}])
+               ],
+    [?assertEqual([#'v1_0.data'{content = Payload}],
+                  amqp_type_body_sections(Payload))
+     || Payload <- Payloads].
+
+%% The AMQP 0.9.1 channel rejects an invalid expiration at publish time, but
+%% other protocols build a #content{} and initialise it directly.
+amqpl_invalid_expiration(_Config) ->
+    Ex = #resource{virtual_host = <<"/">>,
+                   kind = exchange,
+                   name = <<"ex">>},
+    Init = fun(Expiration) ->
+                   Content = #content{class_id = 60,
+                                      properties = #'P_basic'{expiration = Expiration},
+                                      properties_bin = none,
+                                      payload_fragments_rev = [<<"data">>]},
+                   {ok, Msg} = mc_amqpl:message(Ex, <<"rkey">>, Content, #{}),
+                   mc:ttl(Msg)
+           end,
+    ?assertEqual(60_000, Init(<<"60000">>)),
+    [?assertEqual(undefined, Init(Expiration))
+     || Expiration <- [<<"abc">>, <<"10x">>, <<"-1">>, <<>>,
+                       <<"99999999999999999999999">>]],
+    ok.
+
+%% mc_amqpl:convert_to/3 must not assume that expiration was already
+%% validated either, for the same reason as amqpl_invalid_expiration.
+amqpl_to_amqp_invalid_expiration(_Config) ->
+    Ttl = fun(Expiration) ->
+                  Content = #content{class_id = 60,
+                                     properties = #'P_basic'{expiration = Expiration},
+                                     properties_bin = none,
+                                     payload_fragments_rev = [<<"data">>]},
+                  Msg = mc:init(mc_amqpl, Content, annotations()),
+                  [HeaderBin | _] = mc:protocol_state(mc:convert(mc_amqp, Msg)),
+                  [#'v1_0.header'{ttl = Wrapped}] =
+                      amqp10_framing:decode_bin(iolist_to_binary(HeaderBin)),
+                  Wrapped
+          end,
+    ?assertEqual({uint, 60_000}, Ttl(<<"60000">>)),
+    [?assertEqual(undefined, Ttl(Expiration))
+     || Expiration <- [<<"abc">>, <<"10x">>, <<"-1">>, <<>>,
+                       <<"99999999999999999999999">>]],
+    ok.
+
 amqp_x_headers(_Config) ->
     MAC = [
            {{symbol, <<"x-stream-filter">>}, {utf8, <<"apple">>}},
@@ -817,6 +1363,18 @@ amqpl_x_headers(_Config) ->
                  mc:x_headers(BasicMsg)).
 
 %% Utility
+
+%% Converts an AMQP 0.9.1 message whose `type' is <<"amqp-1.0">> and returns the
+%% body sections the conversion produced.
+amqp_type_body_sections(Payload) ->
+    Content = #content{class_id = 60,
+                       properties = #'P_basic'{type = <<"amqp-1.0">>},
+                       properties_bin = none,
+                       payload_fragments_rev = [Payload]},
+    Msg = mc:init(mc_amqpl, Content, annotations()),
+    [_Header, _MessageAnnotations | BodySections] =
+        mc:protocol_state(mc:convert(mc_amqp, Msg)),
+    amqp10_framing:decode_bin(iolist_to_binary(BodySections)).
 
 amqp10_encode_bin(L) when is_list(L) ->
     [iolist_to_binary(amqp10_framing:encode_bin(X)) || X <- L];

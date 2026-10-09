@@ -33,6 +33,8 @@
 -type raw_jwt_token() :: binary() | #{binary() => any()}.
 -type decoded_jwt_token() :: #{binary() => any()}.
 
+-type scope_pattern_syntax() :: wildcard | regex.
+
 -record(internal_oauth_provider, {
     id :: oauth_provider_id(),
     default_key :: binary() | undefined,
@@ -44,11 +46,13 @@
   id :: resource_server_id(),
   resource_server_type :: binary() | undefined,
   verify_aud :: boolean(),
+  require_exp :: boolean(),
   scope_prefix :: binary(),
   additional_scopes_key :: binary() | undefined,
   preferred_username_claims :: list(),
   scope_aliases :: map() | undefined,
-  oauth_provider_id :: oauth_provider_id()
+  oauth_provider_id :: oauth_provider_id(),
+  scope_pattern_syntax :: scope_pattern_syntax()
  }).
 
 -type resource_server() :: #resource_server{}.

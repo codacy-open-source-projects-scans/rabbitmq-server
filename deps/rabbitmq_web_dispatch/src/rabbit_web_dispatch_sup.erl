@@ -14,8 +14,16 @@
 
 -define(SUP, ?MODULE).
 
+%% Ranch reads these keys from the top of its `transport_opts` map.
+-define(RANCH_TRANSPORT_OPT_KEYS, [max_connections, num_acceptors, num_conns_sups]).
+
 %% External exports
 -export([start_link/0, ensure_listener/1, stop_listener/1]).
+
+-ifdef(TEST).
+-export([build_ranch_transport_opts/1, combine_ensure_results/1,
+         ensure_listener/2, transport_config/1, has_certificate/1]).
+-endif.
 
 %% supervisor callbacks
 -export([init/1]).
@@ -25,37 +33,92 @@
 start_link() ->
     supervisor:start_link({local, ?SUP}, ?MODULE, []).
 
+-spec ensure_listener([{atom(), any()}]) ->
+    new | existing | ignore |
+    {error, {no_port_given | listener_address_in_use, [{atom(), any()}]}}.
 ensure_listener(Listener) ->
     case proplists:get_value(port, Listener) of
         undefined ->
             {error, {no_port_given, Listener}};
         _ ->
-            {Transport, TransportOpts0, ProtoOpts} = preprocess_config(Listener),
-            TransportOpts = rabbit_ssl_options:wrap_password_opt(TransportOpts0),
-            ProtoOptsMap = maps:from_list(ProtoOpts),
-            StreamHandlers = stream_handlers_config(ProtoOpts),
-            ?LOG_DEBUG("Starting HTTP[S] listener with transport ~ts", [Transport]),
-            CowboyOptsMap =
-                maps:merge(#{env =>
-                                #{rabbit_listener => Listener},
-                             middlewares =>
-                                [rabbit_cowboy_middleware, cowboy_router, cowboy_handler],
-                             stream_handlers => StreamHandlers},
-                           ProtoOptsMap),
-            Child = ranch:child_spec(rabbit_networking:ranch_ref(Listener),
-                Transport, TransportOpts,
-                cowboy_clear, CowboyOptsMap),
-            case supervisor:start_child(?SUP, Child) of
-                {ok,                      _}  -> new;
-                {error, {already_started, _}} -> existing;
-                {error, {E, _}}               -> check_error(Listener, E)
-            end
+            ensure_listener(Listener,
+                            rabbit_networking:listener_per_ip_address(Listener))
     end.
 
+-spec ensure_listener([{atom(), any()}], [[{atom(), any()}], ...]) ->
+    new | existing | ignore |
+    {error, {listener_address_in_use, [{atom(), any()}]}}.
+ensure_listener(Listener, PerAddress) ->
+    Results = rabbit_networking:ensure_listeners(
+                PerAddress,
+                fun(Bound) -> ensure_listener_on(Listener, Bound) end,
+                fun stop_listener_on/1),
+    case combine_ensure_results(Results) of
+        mixed ->
+            _ = [stop_listener_on(Bound)
+                 || {new, Bound} <- lists:zip(Results, PerAddress)],
+            case combine_ensure_results([R || R <- Results, R =/= new]) of
+                existing -> {error, {listener_address_in_use, Listener}};
+                ignore   -> ignore
+            end;
+        Result ->
+            Result
+    end.
+
+%% `Listener` is passed to Cowboy unchanged because the registry's
+%% `lookup_dispatch/1` matches the stored term exactly.
+%%
+%% `Bound` is the same configuration narrowed to the address this socket binds to.
+-spec ensure_listener_on([{atom(), any()}], [{atom(), any()}]) -> new | existing | ignore.
+ensure_listener_on(Listener, Bound) ->
+    {Transport, TransportOpts0, ProtoOpts} = preprocess_config(Bound),
+    TransportOpts1 = rabbit_ssl_options:wrap_password_opt(TransportOpts0),
+    TransportOpts = build_ranch_transport_opts(TransportOpts1),
+    ProtoOptsMap = maps:from_list(ProtoOpts),
+    StreamHandlers = stream_handlers_config(ProtoOpts),
+    ?LOG_DEBUG("Starting HTTP[S] listener with transport ~ts", [Transport]),
+    CowboyOptsMap =
+        maps:merge(#{env =>
+                        #{rabbit_listener => Listener},
+                     middlewares =>
+                        [rabbit_cowboy_middleware, cowboy_router, cowboy_handler],
+                     stream_handlers => StreamHandlers},
+                   ProtoOptsMap),
+    Child = ranch:child_spec(rabbit_networking:ranch_ref(Bound),
+        Transport, TransportOpts,
+        cowboy_clear, CowboyOptsMap),
+    case supervisor:start_child(?SUP, Child) of
+        {ok,                      _}  -> new;
+        {error, {already_started, _}} -> existing;
+        {error, {E, _}}               -> check_error(Bound, E)
+    end.
+
+-spec combine_ensure_results([new | existing | ignore]) ->
+    new | existing | ignore | mixed.
+combine_ensure_results(Results) ->
+    case {lists:member(new, Results), lists:member(existing, Results),
+          lists:member(ignore, Results)} of
+        {true,  false, false} -> new;
+        {true,  _,     _}     -> mixed;
+        {false, true,  _}     -> existing;
+        {false, false, _}     -> ignore
+    end.
+
+-spec stop_listener([{atom(), any()}]) -> ok.
 stop_listener(Listener) ->
-    Name = rabbit_networking:ranch_ref(Listener),
-    ok = supervisor:terminate_child(?SUP, {ranch_embedded_sup, Name}),
-    ok = supervisor:delete_child(?SUP, {ranch_embedded_sup, Name}).
+    _ = [stop_listener_on(Bound)
+         || Bound <- rabbit_networking:listener_per_ip_address(Listener)],
+    ok.
+
+%% An address that `ensure_listener_on/2` skipped with `ignore` has no child to
+%% terminate, and that is not a failure.
+-spec stop_listener_on([{atom(), any()}]) -> ok.
+stop_listener_on(Listener) ->
+    Id = {ranch_embedded_sup, rabbit_networking:ranch_ref(Listener)},
+    case supervisor:terminate_child(?SUP, Id) of
+        ok                 -> ok = supervisor:delete_child(?SUP, Id);
+        {error, not_found} -> ok
+    end.
 
 %% @spec init([[instance()]]) -> SupervisorTree
 %% @doc supervisor callback.
@@ -84,7 +147,22 @@ auto_ssl(Options) ->
     Remove = [verify, fail_if_no_peer_cert],
     SSLOpts = [{K, V} || {K, V} <- ServerOpts,
                          not lists:member(K, Remove)],
+    %% Make the problem more visible to operators.
+    case has_certificate(SSLOpts) of
+        true ->
+            ok;
+        false ->
+            ?LOG_WARNING("TLS listener on port ~tp falls back to the node's "
+                         "ssl_options, which carry no certificate. Handshakes "
+                         "on this listener will fail.",
+                         [proplists:get_value(port, Options)])
+    end,
     fix_ssl([{ssl_opts, SSLOpts} | Options]).
+
+-spec has_certificate([{atom(), any()}]) -> boolean().
+has_certificate(SSLOpts) ->
+    lists:any(fun(Key) -> proplists:is_defined(Key, SSLOpts) end,
+              [cert, certfile, certs_keys, sni_fun, sni_hosts]).
 
 fix_ssl(Options) ->
     TLSOpts0 = proplists:get_value(ssl_opts, Options),
@@ -103,7 +181,7 @@ transport_config(Options0) ->
         undefined ->
             Options;
         IP when is_tuple(IP) ->
-            Options;
+            [{ip, IP} | proplists:delete(ip, Options)];
         IP when is_list(IP) ->
             {ok, ParsedIP} = inet_parse:address(IP),
             [{ip, ParsedIP}|proplists:delete(ip, Options)]
@@ -111,6 +189,24 @@ transport_config(Options0) ->
 
 protocol_config(Options) ->
     proplists:get_value(cowboy_opts, Options, []).
+
+%% Ranch options such as `max_connections` must sit at the top of a
+%% `transport_opts` map, not under `socket_opts` (where they would reach
+%% `gen_tcp:listen` and fail). Build that map when any are present;
+%% otherwise pass the proplist through and let Ranch wrap it as
+%% `#{socket_opts => Proplist}` itself.
+build_ranch_transport_opts(Options) ->
+    {RanchOpts, SocketOpts} =
+        lists:partition(fun is_ranch_transport_opt/1, Options),
+    case RanchOpts of
+        []    -> Options;
+        [_|_] -> (proplists:to_map(RanchOpts))#{socket_opts => SocketOpts}
+    end.
+
+is_ranch_transport_opt({Key, _}) ->
+    lists:member(Key, ?RANCH_TRANSPORT_OPT_KEYS);
+is_ranch_transport_opt(_) ->
+    false.
 
 stream_handlers_config(Options) ->
     case lists:keyfind(compress, 1, Options) of

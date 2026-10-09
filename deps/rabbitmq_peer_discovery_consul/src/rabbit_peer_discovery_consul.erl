@@ -15,7 +15,7 @@
 -include("rabbit_peer_discovery_consul.hrl").
 
 -export([init/0, list_nodes/0, supports_registration/0, register/0, unregister/0,
-         post_registration/0, lock/1, unlock/1]).
+         post_registration/0, lock/1, unlock/1, reports_all_nodes/0]).
 -export([send_health_check_pass/0]).
 -export([session_ttl_update_callback/1]).
 %% for debugging from the REPL
@@ -51,7 +51,7 @@ init() ->
     rabbit_peer_discovery_httpc:maybe_configure_proxy(),
     rabbit_peer_discovery_httpc:maybe_configure_inet6().
 
--spec list_nodes() -> {ok, {Nodes :: list(), NodeType :: rabbit_types:node_type()}} | {error, Reason :: string()}.
+-spec list_nodes() -> {ok, {SelectedNode :: node() | [], NodeType :: rabbit_types:node_type()}} | {error, Reason :: string()}.
 
 list_nodes() ->
     Fun0 = fun() -> {ok, {[], disc}} end,
@@ -98,6 +98,11 @@ list_nodes() ->
            end,
     rabbit_peer_discovery_util:maybe_backend_configured(?BACKEND_CONFIG_KEY, Fun0, Fun1, Fun2).
 
+
+-spec reports_all_nodes() -> boolean().
+
+reports_all_nodes() ->
+    false.
 
 -spec supports_registration() -> boolean().
 
@@ -189,7 +194,7 @@ unlock(_Data) ->
 internal_lock() ->
     M = ?CONFIG_MODULE:config_map(?BACKEND_CONFIG_KEY),
     ?LOG_DEBUG(
-       "Effective Consul peer discovery configuration: ~tp", [M],
+       "Effective Consul peer discovery configuration: ~tp", [?UTIL_MODULE:redact_secrets(M)],
        #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
     Node = node(),
     case create_session(Node, get_config_key(consul_svc_ttl, M)) of
@@ -290,7 +295,7 @@ sort_nodes(Nodes) ->
         IndexA =< IndexB
     end, Nodes).
 
--spec extract_node(ConsulResult :: [#{binary() => term()}]) -> list().
+-spec extract_node(ConsulResult :: [#{binary() => term()}]) -> node() | [].
 extract_node([]) ->
     [];
 extract_node([H | _]) ->
@@ -608,27 +613,26 @@ send_health_check_pass() ->
       ok
   end.
 
+%% `list_nodes/0' returns the single node Consul selected, not the full
+%% membership list (see `extract_node/1').
 maybe_re_register({error, Reason}) ->
     ?LOG_ERROR(
        "Internal error in Consul while updating health check. "
        "Cannot obtain list of nodes registered in Consul either: ~tp",
        [Reason],
        #{domain => ?RMQLOG_DOMAIN_PEER_DISC});
-maybe_re_register({ok, {Members, _NodeType}}) ->
-    maybe_re_register(Members);
-maybe_re_register(Members) ->
-    case lists:member(node(), Members) of
-        true ->
-            ?LOG_ERROR(
-               "Internal error in Consul while updating health check",
-               #{domain => ?RMQLOG_DOMAIN_PEER_DISC});
-        false ->
-            ?LOG_ERROR(
-               "Internal error in Consul while updating health check, "
-               "node is not registered. Re-registering",
-               #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
-            register()
-    end.
+maybe_re_register({ok, {SelectedNode, _NodeType}}) ->
+    maybe_re_register(SelectedNode);
+maybe_re_register(SelectedNode) when SelectedNode =:= node() ->
+    ?LOG_ERROR(
+       "Internal error in Consul while updating health check",
+       #{domain => ?RMQLOG_DOMAIN_PEER_DISC});
+maybe_re_register(_SelectedNodeOrNone) ->
+    ?LOG_ERROR(
+       "Internal error in Consul while updating health check, "
+       "node is not registered. Re-registering",
+       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+    register().
 
 wait_for_list_nodes() ->
     wait_for_list_nodes(60).
@@ -671,7 +675,7 @@ create_session(Name, TTL) ->
 -spec consul_session_create(Query, Headers, Body) -> {ok, term()} | {error, any()} when
       Query :: list(),
       Headers :: [{string(), string()}],
-      Body :: thoas:input_term().
+      Body :: term().
 consul_session_create(Query, Headers, Body) ->
     M = ?CONFIG_MODULE:config_map(?BACKEND_CONFIG_KEY),
     case serialize_json_body(Body) of
@@ -697,7 +701,7 @@ consul_session_create(Query, Headers, Body) ->
 %% the JSON serialization library.
 %% @end
 %%--------------------------------------------------------------------
--spec serialize_json_body(thoas:input_term()) -> {ok, Payload :: binary()} | {error, atom()}.
+-spec serialize_json_body(term()) -> {ok, Payload :: binary()} | {error, atom()}.
 serialize_json_body([]) -> {ok, []};
 serialize_json_body(Payload) ->
     case rabbit_json:try_encode(Payload) of

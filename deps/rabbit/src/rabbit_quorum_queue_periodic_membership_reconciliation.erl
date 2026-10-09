@@ -7,13 +7,15 @@
 
 -module(rabbit_quorum_queue_periodic_membership_reconciliation).
 
--feature(maybe_expr, enable).
-
 -behaviour(gen_server).
 
 -export([on_node_up/1, on_node_down/1, queue_created/1, policy_set/0]).
 
 -export([start_link/0]).
+
+-ifdef(TEST).
+-export([get_target_size/2]).
+-endif.
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -224,10 +226,10 @@ get_target_size(Q) ->
                   end,
     Arguments = amqqueue:get_arguments(Q),
     case rabbit_misc:table_lookup(Arguments, <<"x-quorum-target-group-size">>) of
-        undefined ->
-            PolicyValue;
-        ArgN ->
-            max(ArgN, PolicyValue)
+        {_Type, ArgN} when is_integer(ArgN) ->
+            max(ArgN, PolicyValue);
+        _ ->
+            PolicyValue
     end.
 
 remove_members(_Q, []) ->

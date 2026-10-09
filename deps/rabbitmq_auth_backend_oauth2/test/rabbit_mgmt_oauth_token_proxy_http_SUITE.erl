@@ -1,0 +1,343 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+%% Drives rabbit_mgmt_oauth_token_proxy over HTTP against a broker whose
+%% resource server points at a mock OpenID provider.
+-module(rabbit_mgmt_oauth_token_proxy_http_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+-compile(export_all).
+
+-define(SECRET, <<"test-client-secret">>).
+-define(MOCK_LISTENER, oauth2_mock_http_listener).
+
+all() ->
+    [{group, top_level}, {group, per_resource}].
+
+groups() ->
+    %% The core behaviour is checked under both ways of defining a resource
+    %% server: the top-level keys, and an entry in the oauth_resource_servers map.
+    Core = [rewrites_only_the_token_endpoint, injects_client_secret_and_forwards,
+            honors_forwarded_headers,
+            ignores_forwarding_hints_in_the_query_string],
+    [{top_level, [], Core ++ [
+        keeps_client_supplied_secret,
+        relays_provider_error,
+        unknown_resource_server_returns_404,
+        token_endpoint_rejects_get,
+        unusable_forwarded_values_fall_back_to_the_connection,
+        malformed_query_string_does_not_fail_the_request,
+        bootstrap_does_not_disclose_secret,
+        rejects_metadata_with_a_non_https_endpoint,
+        rejects_metadata_from_a_resource_with_a_foreign_issuer
+     ]},
+     {per_resource, [], Core ++ [
+        resource_without_secret_returns_404
+     ]}].
+
+%%
+%% Setup
+%%
+
+init_per_suite(Config0) ->
+    rabbit_ct_helpers:log_environment(),
+    inets:start(),
+    {ok, _} = application:ensure_all_started(ssl),
+    {ok, _} = application:ensure_all_started(cowboy),
+    Config1 = rabbit_ct_helpers:set_config(Config0,
+        [{rmq_nodename_suffix, ?MODULE}]),
+    Config2 = rabbit_ct_helpers:run_setup_steps(Config1,
+        rabbit_ct_broker_helpers:setup_steps() ++
+        rabbit_ct_client_helpers:setup_steps()),
+    CertsDir = ?config(rmq_certsdir, Config2),
+    CaCertFile = filename:join([CertsDir, "testca", "cacert.pem"]),
+    MockPort = start_mock_provider(CertsDir),
+    [ok = rabbit_ct_broker_helpers:enable_plugin(Config2, 0, Plugin)
+     || Plugin <- [rabbitmq_management, rabbitmq_auth_backend_oauth2]],
+    rabbit_ct_helpers:set_config(Config2,
+        [{mock_port, MockPort}, {mock_ca_cert_file, CaCertFile}]).
+
+end_per_suite(Config) ->
+    _ = cowboy:stop_listener(?MOCK_LISTENER),
+    rabbit_ct_helpers:run_teardown_steps(Config,
+        rabbit_ct_client_helpers:teardown_steps() ++
+        rabbit_ct_broker_helpers:teardown_steps()).
+
+init_per_group(Group, Config) ->
+    reset_oauth(Config),
+    configure(Group, Config).
+
+end_per_group(_, Config) ->
+    reset_oauth(Config),
+    Config.
+
+init_per_testcase(_, Config) -> Config.
+
+end_per_testcase(TestCase, Config) when
+        TestCase =:= rejects_metadata_with_a_non_https_endpoint;
+        TestCase =:= rejects_metadata_from_a_resource_with_a_foreign_issuer ->
+    set_env(Config, rabbitmq_management, oauth_provider_url,
+        mock_base(?config(mock_port, Config))),
+    Config;
+end_per_testcase(_, Config) -> Config.
+
+%% The mock runs in the CT node; the broker reaches it over localhost. It uses
+%% TLS because oauth2_client requires every OpenID endpoint to be HTTPS.
+start_mock_provider(CertsDir) ->
+    {ok, _} = cowboy:start_tls(?MOCK_LISTENER,
+        [{port, 0},
+         {certfile, filename:join([CertsDir, "server", "cert.pem"])},
+         {keyfile, filename:join([CertsDir, "server", "key.pem"])}],
+        #{env => #{dispatch => cowboy_router:compile([{'_', []}])}}),
+    Port = ranch:get_port(?MOCK_LISTENER),
+    Issuer = mock_base(Port),
+    Dispatch = cowboy_router:compile([{'_', [
+        {"/.well-known/openid-configuration", oauth2_mock_http_handler,
+            #{kind => discovery, issuer => Issuer,
+              token_endpoint => <<Issuer/binary, "/token">>}},
+        {"/non-https-endpoint/.well-known/openid-configuration",
+            oauth2_mock_http_handler,
+            #{kind => discovery, issuer => <<Issuer/binary, "/non-https-endpoint">>,
+              authorization_endpoint => <<"http://attacker.example/authorize">>,
+              token_endpoint => <<Issuer/binary, "/token">>}},
+        {"/a-resource/.well-known/openid-configuration",
+            oauth2_mock_http_handler,
+            #{kind => discovery, issuer => <<"https://attacker.example">>,
+              token_endpoint => <<Issuer/binary, "/token">>}},
+        {"/token", oauth2_mock_http_handler, #{kind => token}}
+    ]}]),
+    cowboy:set_env(?MOCK_LISTENER, dispatch, Dispatch),
+    Port.
+
+configure(top_level, Config) ->
+    ProviderURL = mock_base(?config(mock_port, Config)),
+    set_env(Config, rabbitmq_auth_backend_oauth2, resource_server_id,
+        <<"rabbitmq">>),
+    set_env(Config, rabbitmq_auth_backend_oauth2, key_config,
+        ssl_options(?config(mock_ca_cert_file, Config))),
+    set_env(Config, rabbitmq_management, oauth_enabled, true),
+    set_env(Config, rabbitmq_management, oauth_client_id, <<"rabbitmq_mgt">>),
+    set_env(Config, rabbitmq_management, oauth_client_secret, ?SECRET),
+    set_env(Config, rabbitmq_management, oauth_provider_url, ProviderURL),
+    set_env(Config, rabbitmq_management, oauth_scopes, <<"openid">>),
+    rabbit_ct_helpers:set_config(Config, {resource, <<"rabbitmq">>});
+configure(per_resource, Config) ->
+    ProviderURL = mock_base(?config(mock_port, Config)),
+    set_env(Config, rabbitmq_auth_backend_oauth2, resource_servers,
+        #{<<"rabbit_prod">> => [{id, <<"rabbit_prod">>}],
+          <<"rabbit_public">> => [{id, <<"rabbit_public">>}]}),
+    set_env(Config, rabbitmq_auth_backend_oauth2, key_config,
+        ssl_options(?config(mock_ca_cert_file, Config))),
+    set_env(Config, rabbitmq_management, oauth_enabled, true),
+    set_env(Config, rabbitmq_management, oauth_resource_servers,
+        #{<<"rabbit_prod">> =>
+              [{id, <<"rabbit_prod">>},
+               {oauth_client_id, <<"prod_client">>},
+               {oauth_client_secret, ?SECRET},
+               {oauth_provider_url, ProviderURL}],
+          %% rabbit_public has no client secret, so the proxy must refuse it.
+          <<"rabbit_public">> =>
+              [{id, <<"rabbit_public">>},
+               {oauth_client_id, <<"public_client">>},
+               {oauth_provider_url, ProviderURL}]}),
+    rabbit_ct_helpers:set_config(Config, {resource, <<"rabbit_prod">>}).
+
+%% Trusts the mock provider's certificate so the proxy's outbound TLS
+%% connection to it succeeds.
+ssl_options(CaCertFile) ->
+    [{verify, verify_peer},
+     {depth, 10},
+     {fail_if_no_peer_cert, false},
+     {cacertfile, CaCertFile}].
+
+reset_oauth(Config) ->
+    [unset_env(Config, rabbitmq_management, Key)
+     || Key <- [oauth_enabled, oauth_client_id, oauth_client_secret,
+                oauth_provider_url, oauth_scopes, oauth_resource_servers]],
+    [unset_env(Config, rabbitmq_auth_backend_oauth2, Key)
+     || Key <- [resource_server_id, resource_servers, key_config]],
+    ok.
+
+%%
+%% Test cases
+%%
+
+rewrites_only_the_token_endpoint(Config) ->
+    Id = ?config(resource, Config),
+    {200, Map} = get_json(Config, metadata_path(Id)),
+    Issuer = mock_base(?config(mock_port, Config)),
+    ?assertEqual(proxy_token_endpoint(Config, Id),
+        maps:get(<<"token_endpoint">>, Map)),
+    ?assertEqual(Issuer, maps:get(<<"issuer">>, Map)),
+    ?assertEqual(<<Issuer/binary, "/authorize">>,
+        maps:get(<<"authorization_endpoint">>, Map)),
+    ?assertEqual(<<Issuer/binary, "/keys">>, maps:get(<<"jwks_uri">>, Map)).
+
+honors_forwarded_headers(Config) ->
+    Id = ?config(resource, Config),
+    Headers = [{"x-forwarded-proto", "https"},
+               {"x-forwarded-host", "proxy.example.com"},
+               {"x-forwarded-port", "8443"}],
+    {200, Map} = get_json_with_headers(Config, metadata_path(Id), Headers),
+    Expected = iolist_to_binary(["https://proxy.example.com:8443", token_path(Id)]),
+    ?assertEqual(Expected, maps:get(<<"token_endpoint">>, Map)).
+
+ignores_forwarding_hints_in_the_query_string(Config) ->
+    Id = ?config(resource, Config),
+    Query = "?x-forwarded-proto=https&x-forwarded-host=evil.example.com"
+            "&x-forwarded-port=8443",
+    {200, Map} = get_json(Config, metadata_path(Id) ++ Query),
+    ?assertEqual(proxy_token_endpoint(Config, Id),
+        maps:get(<<"token_endpoint">>, Map)).
+
+unusable_forwarded_values_fall_back_to_the_connection(Config) ->
+    Id = ?config(resource, Config),
+    Expected = proxy_token_endpoint(Config, Id),
+    Unusable = [[{"x-forwarded-port", "abc"}],
+                [{"x-forwarded-port", ""}],
+                [{"x-forwarded-host", "a.example:xx"}],
+                [{"x-forwarded-host", "good.example@evil.example"}],
+                [{"x-forwarded-host", ""}]],
+    [begin
+         {200, Map} = get_json_with_headers(Config, metadata_path(Id), Headers),
+         ?assertEqual(Expected, maps:get(<<"token_endpoint">>, Map))
+     end || Headers <- Unusable].
+
+malformed_query_string_does_not_fail_the_request(Config) ->
+    Id = ?config(resource, Config),
+    {Status, _} = raw_get(Config, metadata_path(Id) ++ "?%"),
+    ?assertEqual(200, Status).
+
+injects_client_secret_and_forwards(Config) ->
+    Id = ?config(resource, Config),
+    Body = <<"grant_type=authorization_code&code=the-code&code_verifier=v">>,
+    {200, Metadata} = get_json(Config, metadata_path(Id)),
+    Advertised = binary_to_list(maps:get(<<"token_endpoint">>, Metadata)),
+    {200, Map} = post_form_url(Advertised, Body),
+    ?assertEqual(<<"mock-access-token">>, maps:get(<<"access_token">>, Map)),
+    %% The mock echoes what it received; it only sees client_secret if the proxy
+    %% injected it server-side.
+    Received = maps:get(<<"received">>, Map),
+    ?assertEqual(?SECRET, maps:get(<<"client_secret">>, Received)),
+    ?assertEqual(<<"the-code">>, maps:get(<<"code">>, Received)),
+    ?assertEqual(<<"authorization_code">>, maps:get(<<"grant_type">>, Received)).
+
+keeps_client_supplied_secret(Config) ->
+    Id = ?config(resource, Config),
+    Body = <<"grant_type=refresh_token&refresh_token=r&client_secret=explicit">>,
+    {200, Map} = post_form(Config, token_path(Id), Body),
+    Received = maps:get(<<"received">>, Map),
+    ?assertEqual(<<"explicit">>, maps:get(<<"client_secret">>, Received)).
+
+relays_provider_error(Config) ->
+    Id = ?config(resource, Config),
+    Body = <<"grant_type=authorization_code&code=bad-code">>,
+    {400, Map} = post_form(Config, token_path(Id), Body),
+    ?assertEqual(<<"invalid_grant">>, maps:get(<<"error">>, Map)).
+
+unknown_resource_server_returns_404(Config) ->
+    {404, _} = get_raw(Config, metadata_path(<<"does-not-exist">>)).
+
+token_endpoint_rejects_get(Config) ->
+    {405, _} = get_raw(Config, token_path(?config(resource, Config))).
+
+bootstrap_does_not_disclose_secret(Config) ->
+    {200, Body} = get_raw(Config, "/js/oidc-oauth/bootstrap.js"),
+    ?assertEqual(nomatch, binary:match(Body, <<"oauth_client_secret">>)),
+    ?assertEqual(nomatch, binary:match(Body, ?SECRET)),
+    ?assertNotEqual(nomatch, binary:match(Body, <<"use_token_endpoint_proxy">>)).
+
+rejects_metadata_with_a_non_https_endpoint(Config) ->
+    {502, _} = metadata_from_provider_path(Config, "/non-https-endpoint").
+
+rejects_metadata_from_a_resource_with_a_foreign_issuer(Config) ->
+    {502, _} = metadata_from_provider_path(Config, "/a-resource").
+
+resource_without_secret_returns_404(Config) ->
+    {404, _} = get_raw(Config, metadata_path(<<"rabbit_public">>)).
+
+%%
+%% Helpers
+%%
+
+metadata_from_provider_path(Config, Path) ->
+    Base = mock_base(?config(mock_port, Config)),
+    set_env(Config, rabbitmq_management, oauth_provider_url,
+        iolist_to_binary([Base, Path])),
+    get_raw(Config, metadata_path(?config(resource, Config))).
+
+token_path(Id) ->
+    "/js/oidc-oauth/token-endpoint/" ++ binary_to_list(Id).
+
+metadata_path(Id) ->
+    token_path(Id) ++ "/openid-configuration".
+
+proxy_token_endpoint(Config, Id) ->
+    iolist_to_binary([mgmt_base(Config), token_path(Id)]).
+
+mock_base(Port) ->
+    iolist_to_binary(["https://localhost:", integer_to_list(Port)]).
+
+mgmt_base(Config) ->
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_mgmt),
+    "http://localhost:" ++ integer_to_list(Port).
+
+set_env(Config, App, Key, Value) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
+        [App, Key, Value]).
+
+unset_env(Config, App, Key) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, unset_env,
+        [App, Key]).
+
+get_raw(Config, Path) ->
+    get_raw_with_headers(Config, Path, []).
+
+get_raw_with_headers(Config, Path, Headers) ->
+    {ok, {{_, Code, _}, _RespHeaders, Body}} =
+        httpc:request(get, {mgmt_base(Config) ++ Path, Headers}, [],
+                      [{body_format, binary}]),
+    {Code, Body}.
+
+%% httpc rejects a malformed request URI before it reaches the socket, so the
+%% request has to be written out directly.
+raw_get(Config, Path) ->
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_mgmt),
+    {ok, Sock} = gen_tcp:connect("localhost", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock, ["GET ", Path, " HTTP/1.1\r\n",
+                             "Host: localhost\r\n",
+                             "Connection: close\r\n\r\n"]),
+    Response = recv_until_closed(Sock, <<>>),
+    ok = gen_tcp:close(Sock),
+    <<"HTTP/1.1 ", Status:3/binary, _/binary>> = Response,
+    {binary_to_integer(Status), Response}.
+
+recv_until_closed(Sock, Acc) ->
+    case gen_tcp:recv(Sock, 0, 30000) of
+        {ok, Data} -> recv_until_closed(Sock, <<Acc/binary, Data/binary>>);
+        {error, closed} -> Acc
+    end.
+
+get_json(Config, Path) ->
+    get_json_with_headers(Config, Path, []).
+
+get_json_with_headers(Config, Path, Headers) ->
+    {Code, Body} = get_raw_with_headers(Config, Path, Headers),
+    {Code, rabbit_json:decode(Body)}.
+
+post_form(Config, Path, Body) ->
+    post_form_url(mgmt_base(Config) ++ Path, Body).
+
+post_form_url(Url, Body) ->
+    {ok, {{_, Code, _}, _Headers, RespBody}} =
+        httpc:request(post,
+            {Url, [], "application/x-www-form-urlencoded", Body},
+            [], [{body_format, binary}]),
+    {Code, rabbit_json:decode(RespBody)}.

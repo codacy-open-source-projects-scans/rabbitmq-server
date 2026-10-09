@@ -12,7 +12,7 @@
 -export([ack_mode/1, consumer_tag_reply_to/1, consumer_tag/1, message_headers/1,
          headers_post_process/1, headers/9, message_properties/1, tag_to_id/1,
          msg_header_name/1, ack_header_name/1, build_arguments/1, build_params/2,
-         has_durable_header/1]).
+         has_durable_header/1, integer_argument/2, invalid_header/1, strip_cr_lf/1]).
 -export([negotiate_version/2]).
 -export([trim_headers/1]).
 
@@ -152,13 +152,16 @@ headers_post_process(Headers) ->
 headers(SessionId, ConsumerTag, DeliveryTag,
         ExchangeBin, RoutingKey, Redelivered,
         Properties, AckMode, Version) ->
+    %% Message properties/headers are publisher-controlled (STOMP or AMQP),
+    %% so the server-generated values must win on key conflict, not the
+    %% other way round.
     maps:merge(
+      maps:from_list(
+        headers_post_process(message_headers(Properties))),
       maps:from_list(
         headers_extra(SessionId, ConsumerTag, DeliveryTag,
                       ExchangeBin, RoutingKey, Redelivered,
-                      AckMode, Version)),
-      maps:from_list(
-        headers_post_process(message_headers(Properties)))).
+                      AckMode, Version))).
 
 tag_to_id(<<?INTERNAL_TAG_PREFIX, Id/binary>>) ->
     {ok, {internal, Id}};
@@ -188,7 +191,11 @@ user_header(Hdr)
        Hdr =:= ?HEADER_TYPE orelse
        Hdr =:= ?HEADER_USER_ID orelse
        Hdr =:= ?HEADER_APP_ID orelse
-       Hdr =:= ?HEADER_DESTINATION ->
+       Hdr =:= ?HEADER_DESTINATION orelse
+       Hdr =:= ?HEADER_MESSAGE_ID orelse
+       Hdr =:= ?HEADER_ACK orelse
+       Hdr =:= ?HEADER_SUBSCRIPTION orelse
+       Hdr =:= ?HEADER_REDELIVERED ->
     false;
 user_header(_) ->
     true.
@@ -290,26 +297,38 @@ build_argument(?HEADER_X_DEAD_LETTER_EXCHANGE, Val) ->
 build_argument(?HEADER_X_DEAD_LETTER_ROUTING_KEY, Val) ->
     {?HEADER_X_DEAD_LETTER_ROUTING_KEY, longstr, string:trim(Val)};
 build_argument(?HEADER_X_EXPIRES, Val) ->
-    {?HEADER_X_EXPIRES, long, binary_to_integer(string:trim(Val))};
+    {?HEADER_X_EXPIRES, long, integer_argument(?HEADER_X_EXPIRES, Val)};
 build_argument(?HEADER_X_MAX_LENGTH, Val) ->
-    {?HEADER_X_MAX_LENGTH, long, binary_to_integer(string:trim(Val))};
+    {?HEADER_X_MAX_LENGTH, long, integer_argument(?HEADER_X_MAX_LENGTH, Val)};
 build_argument(?HEADER_X_MAX_LENGTH_BYTES, Val) ->
-    {?HEADER_X_MAX_LENGTH_BYTES, long, binary_to_integer(string:trim(Val))};
+    {?HEADER_X_MAX_LENGTH_BYTES, long, integer_argument(?HEADER_X_MAX_LENGTH_BYTES, Val)};
 build_argument(?HEADER_X_MAX_PRIORITY, Val) ->
-    {?HEADER_X_MAX_PRIORITY, long, binary_to_integer(string:trim(Val))};
+    {?HEADER_X_MAX_PRIORITY, long, integer_argument(?HEADER_X_MAX_PRIORITY, Val)};
 build_argument(?HEADER_X_MESSAGE_TTL, Val) ->
-    {?HEADER_X_MESSAGE_TTL, long, binary_to_integer(string:trim(Val))};
+    {?HEADER_X_MESSAGE_TTL, long, integer_argument(?HEADER_X_MESSAGE_TTL, Val)};
 build_argument(?HEADER_X_MAX_AGE, Val) ->
     {?HEADER_X_MAX_AGE, longstr, string:trim(Val)};
 build_argument(?HEADER_X_STREAM_MAX_SEGMENT_SIZE_BYTES, Val) ->
     {?HEADER_X_STREAM_MAX_SEGMENT_SIZE_BYTES, long,
-     binary_to_integer(string:trim(Val))};
+     integer_argument(?HEADER_X_STREAM_MAX_SEGMENT_SIZE_BYTES, Val)};
 build_argument(?HEADER_X_QUEUE_TYPE, Val) ->
     {?HEADER_X_QUEUE_TYPE, longstr, string:trim(Val)};
 build_argument(?HEADER_X_STREAM_FILTER_SIZE_BYTES, Val) ->
     {?HEADER_X_STREAM_FILTER_SIZE_BYTES, long,
-     binary_to_integer(string:trim(Val))}.
+     integer_argument(?HEADER_X_STREAM_FILTER_SIZE_BYTES, Val)}.
 
+integer_argument(Header, Val) ->
+    try
+        binary_to_integer(string:trim(Val))
+    catch
+        error:badarg ->
+            invalid_header(Header)
+    end.
+
+-spec invalid_header(binary()) -> no_return().
+invalid_header(Header) ->
+    rabbit_misc:protocol_error(
+      precondition_failed, "invalid value for header '~ts'", [Header]).
 
 build_params(EndPoint, Headers) ->
     Params = fold_headers(fun(K, V, Acc) ->
@@ -378,17 +397,22 @@ format_destination(Exchange, RoutingKey) ->
 %% Destination Parsing
 %%--------------------------------------------------------------------
 
+-spec subscription_queue_name(binary(), binary(), #stomp_frame{}) -> binary().
 subscription_queue_name(Destination, SubscriptionId, Frame) ->
-    case rabbit_stomp_frame:header(Frame, ?HEADER_X_QUEUE_NAME, undefined) of
-        undefined ->
+    case string:trim(strip_cr_lf(rabbit_stomp_frame:header(Frame, ?HEADER_X_QUEUE_NAME, <<>>))) of
+        <<>> ->
+            %% Hashed as lists, as on `4.3`, so that durable subscriptions keep their queue names.
             rabbit_guid:binary(
               erlang:md5(
                 term_to_binary_compat:term_to_binary_1(
-                  {Destination, SubscriptionId})),
+                  {binary_to_list(Destination), binary_to_list(SubscriptionId)})),
               "stomp-subscription");
         Name ->
             Name
     end.
+
+strip_cr_lf(Name) ->
+    binary:replace(Name, [<<"\n">>, <<"\r">>], <<>>, [global]).
 
 %% ---- Helpers ----
 

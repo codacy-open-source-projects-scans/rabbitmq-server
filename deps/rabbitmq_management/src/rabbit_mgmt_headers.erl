@@ -12,9 +12,10 @@
 -export([set_common_permission_headers/2]).
 -export([set_cors_headers/2, set_hsts_headers/2, set_csp_headers/2, set_no_cache_headers/2]).
 
--define(X_CONTENT_TYPE_OPTIONS_HEADER, <<"X-Content-Type-Options">>).
--define(X_FRAME_OPTIONS_HEADER, <<"X-Frame-Options">>).
--define(X_XSS_PROTECTION_HEADER, <<"X-XSS-Protection">>).
+-define(X_CONTENT_TYPE_OPTIONS_HEADER, <<"x-content-type-options">>).
+-define(X_FRAME_OPTIONS_HEADER, <<"x-frame-options">>).
+-define(X_XSS_PROTECTION_HEADER, <<"x-xss-protection">>).
+-define(REFERRER_POLICY_HEADER, <<"referrer-policy">>).
 
 %%
 %% API
@@ -37,6 +38,9 @@ set_xss_protection_header(ReqData, _Module) ->
 
 set_frame_options_header(ReqData, _Module) ->
     maybe_set_known_configured_header(ReqData, frame_options, ?X_FRAME_OPTIONS_HEADER).
+
+set_referrer_policy_header(ReqData, _Module) ->
+    maybe_set_known_configured_header(ReqData, referrer_policy, ?REFERRER_POLICY_HEADER).
 
 maybe_set_known_configured_header(ReqData, AppEnvKey, HeaderName) ->
     case application:get_env(rabbitmq_management, headers) of
@@ -61,7 +65,8 @@ set_common_permission_headers(ReqData0, EndpointModule) ->
                 fun set_cors_headers/2,
                 fun set_content_type_options_header/2,
                 fun set_xss_protection_header/2,
-                fun set_frame_options_header/2]).
+                fun set_frame_options_header/2,
+                fun set_referrer_policy_header/2]).
 
 set_etag_based_cache_headers(ReqData0, _Module) ->
     cowboy_req:set_resp_header(<<"cache-control">>, <<"public, max-age=0, must-revalidate">>, ReqData0).

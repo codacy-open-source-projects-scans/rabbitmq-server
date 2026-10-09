@@ -141,11 +141,11 @@
                  dependencies,     %% [atom()]
                  location,         %% string()
                  %% List of supported broker version ranges,
-                 %% e.g. ["3.5.7", "3.6.1"]
+                 %% e.g. ["4.3.0", "4.4.0"]
                  broker_version_requirements, %% [string()]
                  %% Proplist of supported dependency versions,
-                 %% e.g. [{rabbitmq_management, ["3.5.7", "3.6.1"]},
-                 %%       {rabbitmq_federation, ["3.5.7", "3.6.1"]},
+                 %% e.g. [{rabbitmq_management, ["4.3.0", "4.4.0"]},
+                 %%       {rabbitmq_federation, ["4.3.0", "4.4.0"]},
                  %%       {rabbitmq_email,      ["0.1.0"]}]
                  dependency_version_requirements, %% [{atom(), [string()]}]
                  extra_dependencies %% string()
@@ -214,7 +214,6 @@
 %%----------------------------------------------------------------------------
 
 -define(COPYRIGHT_MESSAGE, "Copyright (c) 2007-2026 Broadcom Inc and/or its subsidiaries").
--define(INFORMATION_MESSAGE, "Licensed under the MPL 2.0. Website: https://rabbitmq.com").
 
 %% EMPTY_FRAME_SIZE, 8 = 1 + 2 + 4 + 1
 %%  - 1 byte of frame type
@@ -226,6 +225,7 @@
 -define(EMPTY_FRAME_SIZE, 8).
 
 -define(MAX_WAIT, 16#ffffffff).
+-define(FAIR_WAIT, 70_000).
 -define(SUPERVISOR_WAIT,
         rabbit_misc:get_env(rabbit, supervisor_shutdown_timeout, infinity)).
 -define(WORKER_WAIT,

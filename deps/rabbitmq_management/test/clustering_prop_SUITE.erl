@@ -111,7 +111,9 @@ prop_connection_channel_counts(Config) ->
                 % ensure we begin with no connections
                 ct:pal("Init testcase"),
                 rabbit_ct_helpers:await_condition(
-                  fun () -> validate_counts(Config, []) end,
+                  fun () ->
+                          force_stats(Config),
+                          validate_counts(Config, []) end,
                   60000),
                 Cons = lists:foldl(fun (Op, Agg) ->
                                           execute_op(Config, Op, Agg)
@@ -201,7 +203,9 @@ force_all(Nodes) ->
        end || N <- Nodes]).
 
 clear_all_table_data() ->
-    [ets:delete_all_objects(T) || {T, _} <- ?CORE_TABLES],
+    %% Forward-compat: skip tables a mixed-version secondary may lack.
+    [ets:delete_all_objects(T) || {T, _} <- ?CORE_TABLES,
+                                  ets:info(T) =/= undefined],
     rabbit_mgmt_storage:reset(),
     [gen_server:call(P, purge_cache)
      || {_, P, _, _} <- supervisor:which_children(rabbit_mgmt_db_cache_sup)].

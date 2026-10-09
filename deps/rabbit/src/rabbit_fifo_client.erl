@@ -39,6 +39,9 @@
          stat/1,
          stat/2,
          query_single_active_consumer/1,
+         local_query/2,
+         local_query/3,
+         versioned_query/3,
          cluster_name/1
          ]).
 
@@ -312,10 +315,16 @@ return(ConsumerTag, [_|_] = MsgIds,
     ConsumerKey = consumer_key(ConsumerTag, State0),
     %% we've reached the soft limit so will stash the command to be
     %% sent once we have seen enough notifications
+    %% MsgIds has fewer elements than Returns, so put it on the left side
+    %% of the ++ operator: Returns accumulates in reverse-chronological
+    %% batch order (most recent first), unreversed once in add_command/4,
+    %% since rabbit_fifo relies on this list's order to redeliver and
+    %% dead-letter messages in the order they were returned.
+    RevMsgIds = lists:reverse(MsgIds),
     Unsent = maps:update_with(ConsumerKey,
                               fun ({Settles, Returns, Discards}) ->
-                                      {Settles, Returns ++ MsgIds, Discards}
-                              end, {[], MsgIds, []}, Unsent0),
+                                      {Settles, RevMsgIds ++ Returns, Discards}
+                              end, {[], RevMsgIds, []}, Unsent0),
     State1 = State0#state{unsent_commands = Unsent},
     {State1, []}.
 
@@ -337,10 +346,16 @@ discard(ConsumerTag, [_|_] = MsgIds,
     ConsumerKey = consumer_key(ConsumerTag, State0),
     %% we've reached the soft limit so will stash the command to be
     %% sent once we have seen enough notifications
+    %% MsgIds has fewer elements than Discards, so put it on the left side
+    %% of the ++ operator: Discards accumulates in reverse-chronological
+    %% batch order (most recent first), unreversed once in add_command/4,
+    %% since rabbit_fifo dead-letters messages in the order they were
+    %% discarded (see discard_or_dead_letter/4).
+    RevMsgIds = lists:reverse(MsgIds),
     Unsent = maps:update_with(ConsumerKey,
                               fun ({Settles, Returns, Discards}) ->
-                                      {Settles, Returns, Discards ++ MsgIds}
-                              end, {[], [], MsgIds}, Unsent0),
+                                      {Settles, Returns, RevMsgIds ++ Discards}
+                              end, {[], [], RevMsgIds}, Unsent0),
     {State0#state{unsent_commands = Unsent}, []}.
 
 -spec modify(rabbit_types:ctag(), [rabbit_fifo:msg_id()],
@@ -432,13 +447,56 @@ checkout(ConsumerTag, CreditMode, #{} = Meta,
 query_single_active_consumer(#state{leader = undefined}) ->
     {error, leader_not_known};
 query_single_active_consumer(#state{leader = Leader}) ->
-    case ra:local_query(Leader, fun rabbit_fifo:query_single_active_consumer/1,
-                        ?COMMAND_TIMEOUT) of
+    case local_query(Leader, query_single_active_consumer, ?COMMAND_TIMEOUT) of
         {ok, {_, Reply}, _} ->
             {ok, Reply};
         Err ->
             Err
     end.
+
+%% @doc Runs a read-only query function against the state machine.
+%%
+%% Queries the queue's own (latest) machine module first. In a mixed-version
+%% cluster the queue may still be running at an older machine version whose
+%% state shape does not match the latest module, in which case the query
+%% crashes with a (caught) `function_clause' and we retry against whichever
+%% frozen module that version is served by, resolved on the queried server.
+-spec local_query(ra:server_id(), atom()) ->
+    {ok, {ra:idxterm(), term()}, ra:server_id()} |
+    {error, term()} | {timeout, ra:server_id()}.
+local_query(Server, QueryFun) ->
+    local_query(Server, QueryFun, 5000).
+
+-spec local_query(ra:server_id(), atom(), timeout()) ->
+    {ok, {ra:idxterm(), term()}, ra:server_id()} |
+    {error, term()} | {timeout, ra:server_id()}.
+local_query(Server, QueryFun, Timeout) when is_atom(QueryFun) ->
+    case ra:local_query(Server, fun rabbit_fifo:QueryFun/1, Timeout) of
+        {error, function_clause} ->
+            %% The queried server's effective machine version is older than
+            %% this module, so its machine state has the shape of one of the
+            %% frozen rabbit_fifo_vN modules and the pattern above did not
+            %% match it. Resolve the module the state actually belongs to.
+            ra:local_query(Server,
+                           {?MODULE, versioned_query, [QueryFun],
+                            [with_context]},
+                           Timeout);
+        Other ->
+            Other
+    end.
+
+%% @doc Apply a query function using whichever rabbit_fifo module serves the
+%% queried server's effective machine version.
+%%
+%% Passed to ra as an MFA rather than a closure on purpose: an MFA is
+%% resolved by name on the queried server, whereas a closure carries a hash
+%% of the defining module and fails to load where that module differs. That
+%% difference is the norm during a rolling upgrade, which is exactly when
+%% this fallback is reached.
+-spec versioned_query(atom(), ra:query_ctx(), term()) -> term().
+versioned_query(QueryFun, #{machine_version := Vsn}, State) ->
+    Mod = rabbit_fifo:which_module(Vsn),
+    Mod:QueryFun(State).
 
 %% @doc Provide credit to the queue
 %%
@@ -523,30 +581,27 @@ retry_delayed(Server, Mode) when Mode =:= all orelse
             Err
     end.
 
-%% @doc Assign deferred messages by token to a consumer.
+%% @doc Claim the deferred messages parked under the given tokens for a
+%% consumer.
+%%
+%% This is fire-and-forget and says nothing about link credit. The queue
+%% moves the messages' keys onto the consumer and then delivers them ahead
+%% of the ready backlog as the consumer's credit allows, so the caller does
+%% not have to make the claim and the credit top-up atomic.
+%%
 %% @param ConsumerTag the tag uniquely identifying the consumer.
 %% @param Tokens list of deferral tokens (from x-opt-deferral-token).
 %% @param State the {@module} state
-%% @returns `{ok, NumAssigned}' on success,
-%%   `{partial, NumAssigned, NotFoundTokens}' if some tokens not found,
-%%   `{error, Reason}' on failure.
+%% @returns `{state(), actions()}' - claimed messages arrive as normal deliveries.
 -spec assign_deferred(rabbit_types:ctag(), [binary()], state()) ->
-    {{ok, non_neg_integer()} |
-     {partial, non_neg_integer(), [binary()]} |
-     {error, term()},
-     state()}.
+    {state(), rabbit_queue_type:actions()}.
 assign_deferred(ConsumerTag, [_|_] = Tokens, State0) ->
     ConsumerKey = consumer_key(ConsumerTag, State0),
     ServerId = pick_server(State0),
     Cmd = rabbit_fifo:make_delayed({assign_deferred, ConsumerKey, Tokens}),
-    case ra:process_command(ServerId, Cmd, ?COMMAND_TIMEOUT) of
-        {ok, Reply, _} ->
-            {Reply, State0};
-        Err ->
-            {Err, State0}
-    end;
+    {send_command(ServerId, undefined, Cmd, normal, State0), []};
 assign_deferred(_ConsumerTag, [], State) ->
-    {{ok, 0}, State}.
+    {State, []}.
 
 -spec pending_size(state()) -> non_neg_integer().
 pending_size(#state{pending = Pend}) ->
@@ -575,15 +630,12 @@ stat(Leader) ->
 stat(Leader, Timeout) ->
     %% short timeout as we don't want to spend too long if it is going to
     %% fail anyway
-    %% TODO: the overview is too large to be super efficient
-    %% but we use it for backwards compatibilty
-    case ra:member_overview(Leader, Timeout) of
-      {ok, #{machine := #{num_ready_messages := R,
-                          num_consumers := C}}, _} ->
+    case local_query(Leader, query_stat, Timeout) of
+        {ok, {_, {R, C}}, _} ->
             {ok, R, C};
-      {error, _} = Error ->
+        {error, _} = Error ->
             Error;
-      {timeout, _} = Error ->
+        {timeout, _} = Error ->
             Error
     end.
 
@@ -608,10 +660,9 @@ update_machine_state(Server, Conf) ->
 %% ```
 %%  receive
 %%     {ra_event, From, Evt} ->
-%%         case rabbit_fifo_client:handle_ra_event(From, Evt, State0) of
-%%             {internal, _Seq, State} -> State;
-%%             {{delivery, _ConsumerTag, Msgs}, State} ->
-%%                  handle_messages(Msgs),
+%%         case rabbit_fifo_client:handle_ra_event(QName, From, Evt, State0) of
+%%             {ok, State, Actions} ->
+%%                  handle_actions(Actions),
 %%                  ...
 %%         end
 %%  end
@@ -623,26 +674,18 @@ update_machine_state(Server, Conf) ->
 %% @param State the current {@module} state.
 %%
 %% @returns
-%% `{internal, AppliedCorrelations, State}' if the event contained an internally
-%% handled event such as a notification and a correlation was included with
-%% the command (e.g. in a call to `enqueue/3' the correlation terms are returned
-%% here).
+%% `{ok, State, Actions}' after the event has been applied to the client state.
+%% `Actions' carries any deliveries, settled correlations and flow control
+%% signals (such as `block', `unblock') the caller might need to handle.
 %%
-%% `{RaFifoEvent, State}' if the event contained a client message generated by
-%% the `rabbit_fifo' state machine such as a delivery.
+%% `{eol, Actions}' if the queue has been deleted.
 %%
-%% The type of `rabbit_fifo' client messages that can be received are:
-%%
-%% `{delivery, ConsumerTag, [{MsgId, {MsgHeader, Msg}}]}'
-%%
-%% <li>`ConsumerTag' the binary tag passed to {@link checkout/3.}</li>
-%% <li>`MsgId' is a consumer scoped monotonically incrementing id that can be
-%% used to {@link settle/3.} (roughly: AMQP 0.9.1 ack) message once finished
-%% with them.</li>
+%% `{protocol_error, Type, Reason, Args}' if the event could not be handled.
 -spec handle_ra_event(rabbit_amqqueue:name(), ra:server_id(),
                       ra_server_proc:ra_event_body(), state()) ->
-    {internal, Correlators :: [term()], rabbit_queue_type:actions(), state()} |
-    {rabbit_fifo:client_msg(), state()} | {eol, rabbit_queue_type:actions()}.
+    {ok, state(), rabbit_queue_type:actions()} |
+    {eol, rabbit_queue_type:actions()} |
+    {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
 handle_ra_event(QName, Leader, {applied, Seqs},
                 #state{leader = OldLeader,
                        cfg = #cfg{soft_limit = SftLmt}} = State0) ->
@@ -1052,9 +1095,11 @@ add_command(_, _, [], Acc) ->
 add_command(Cid, settle, MsgIds, Acc) ->
     [rabbit_fifo:make_settle(Cid, MsgIds) | Acc];
 add_command(Cid, return, MsgIds, Acc) ->
-    [rabbit_fifo:make_return(Cid, MsgIds) | Acc];
+    %% MsgIds was accumulated in reverse-chronological order; see return/3.
+    [rabbit_fifo:make_return(Cid, lists:reverse(MsgIds)) | Acc];
 add_command(Cid, discard, MsgIds, Acc) ->
-    [rabbit_fifo:make_discard(Cid, MsgIds) | Acc].
+    %% MsgIds was accumulated in reverse-chronological order; see discard/3.
+    [rabbit_fifo:make_discard(Cid, lists:reverse(MsgIds)) | Acc].
 
 find_local_or_leader(#state{leader = Leader,
                             cfg = #cfg{servers = Servers}}) ->

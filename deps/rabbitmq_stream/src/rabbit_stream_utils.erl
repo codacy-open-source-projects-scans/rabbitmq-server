@@ -16,17 +16,24 @@
 
 -module(rabbit_stream_utils).
 
--feature(maybe_expr, enable).
+-define(MAX_SUPER_STREAM_PARTITIONS, 1000).
+
+-define(ENDPOINT_TIMEOUT, 10_000).
+
+%% Sub-entry compression types 0-4 are assigned (none, gzip, snappy, lz4, zstd);
+%% 5-7 are not, and a batch declaring one of them can never be decoded by a consumer.
+-define(MAX_KNOWN_COMPRESSION_TYPE, 4).
 
 %% API
 -export([enforce_correct_name/1,
-         write_messages/6,
+         write_messages/8,
          parse_map/2,
          auth_mechanisms/1,
          auth_mechanism_to_module/2,
          check_configure_permitted/2,
          check_write_permitted/2,
          check_read_permitted/3,
+         check_read_or_write_permitted/2,
          extract_stream_list/2,
          sort_partitions/1,
          strip_cr_lf/1,
@@ -35,8 +42,24 @@
          filter_spec/1,
          command_versions/0,
          check_super_stream_management_permitted/4,
+         check_super_stream_permitted/3,
          offset_lag/4,
-         consumer_offset/3]).
+         consumer_offset/3,
+         validate_super_stream_max_partitions/1,
+         max_super_stream_partitions/0,
+         node_endpoints/2]).
+
+%% super stream partition helpers
+-export([streams_from_partitions/2,
+         streams_from_binding_keys/2,
+         binding_keys/1,
+         routing_keys/1]).
+
+%% for tests
+-export([validate_super_stream_max_partitions/2,
+         node_endpoints/3,
+         classify_endpoint/3,
+         transient_endpoint_error/1]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbitmq_stream_common/include/rabbit_stream.hrl").
@@ -60,8 +83,13 @@ check_name(<<"">>) ->
 check_name(_Name) ->
     ok.
 
-write_messages(_Version, _ClusterLeader, _PublisherRef, _PublisherId, _InternalId, <<>>) ->
-    ok;
+-spec write_messages(rabbit_stream_core:command_version(), pid(),
+                     undefined | binary(), byte(),
+                     integer(), binary(), non_neg_integer(), binary()) ->
+    [integer()].
+write_messages(_Version, _ClusterLeader, _PublisherRef, _PublisherId, _InternalId, <<>>,
+               _MaxUncompressedSize, _Stream) ->
+    [];
 write_messages(?VERSION_1 = V, ClusterLeader,
                PublisherRef,
                PublisherId,
@@ -70,9 +98,10 @@ write_messages(?VERSION_1 = V, ClusterLeader,
                  0:1,
                  MessageSize:31,
                  Message:MessageSize/binary,
-                 Rest/binary>>) ->
+                 Rest/binary>>,
+               MaxUncompressedSize, Stream) ->
     write_messages0(V, ClusterLeader, PublisherRef, PublisherId, InternalId,
-                    PublishingId, Message, Rest);
+                    PublishingId, Message, Rest, MaxUncompressedSize, Stream);
 write_messages(?VERSION_1 = V, ClusterLeader,
                PublisherRef,
                PublisherId,
@@ -85,10 +114,23 @@ write_messages(?VERSION_1 = V, ClusterLeader,
                  UncompressedSize:32,
                  BatchSize:32,
                  Batch:BatchSize/binary,
-                 Rest/binary>>) ->
-    Data = {batch, MessageCount, CompressionType, UncompressedSize, Batch},
-    write_messages0(V, ClusterLeader, PublisherRef, PublisherId, InternalId,
-                    PublishingId, Data, Rest);
+                 Rest/binary>>,
+               MaxUncompressedSize, Stream) ->
+    case validate_compressed_sub_batch(CompressionType, MessageCount,
+                                       UncompressedSize, BatchSize,
+                                       MaxUncompressedSize) of
+        ok ->
+            Data = {batch, MessageCount, CompressionType, UncompressedSize, Batch},
+            write_messages0(V, ClusterLeader, PublisherRef, PublisherId, InternalId,
+                            PublishingId, Data, Rest, MaxUncompressedSize, Stream);
+        {error, Reason} ->
+            ?LOG_WARNING("Rejecting sub-entry batch published to stream '~ts' "
+                         "by publisher ~tp: ~tp. The rest of the publish "
+                         "frame is rejected as well to avoid a gap in the "
+                         "publishing ID sequence.",
+                         [Stream, PublisherId, Reason]),
+            [PublishingId | reject_remaining(V, Rest)]
+    end;
 write_messages(?VERSION_2 = V, ClusterLeader,
                PublisherRef,
                PublisherId,
@@ -98,9 +140,10 @@ write_messages(?VERSION_2 = V, ClusterLeader,
                  0:1,
                  MessageSize:31,
                  Message:MessageSize/binary,
-                 Rest/binary>>) ->
+                 Rest/binary>>,
+               MaxUncompressedSize, Stream) ->
     write_messages0(V, ClusterLeader, PublisherRef, PublisherId, InternalId,
-                    PublishingId, Message, Rest);
+                    PublishingId, Message, Rest, MaxUncompressedSize, Stream);
 write_messages(?VERSION_2 = V, ClusterLeader,
                PublisherRef,
                PublisherId,
@@ -110,11 +153,13 @@ write_messages(?VERSION_2 = V, ClusterLeader,
                  0:1,
                  MessageSize:31,
                  Message:MessageSize/binary,
-                 Rest/binary>>) ->
+                 Rest/binary>>,
+               MaxUncompressedSize, Stream) ->
     write_messages0(V, ClusterLeader, PublisherRef, PublisherId, InternalId,
-                    PublishingId, {FilterValue, Message}, Rest).
+                    PublishingId, {FilterValue, Message}, Rest, MaxUncompressedSize, Stream).
 
-write_messages0(Vsn, ClusterLeader, PublisherRef, PublisherId, InternalId, PublishingId, Data, Rest) ->
+write_messages0(Vsn, ClusterLeader, PublisherRef, PublisherId, InternalId, PublishingId, Data,
+                Rest, MaxUncompressedSize, Stream) ->
     Corr = case PublisherRef of
                undefined ->
                    %% we add the internal ID to detect late confirms from a stale publisher
@@ -125,7 +170,71 @@ write_messages0(Vsn, ClusterLeader, PublisherRef, PublisherId, InternalId, Publi
                    PublishingId
            end,
     ok = osiris:write(ClusterLeader, PublisherRef, Corr, Data),
-    write_messages(Vsn, ClusterLeader, PublisherRef, PublisherId, InternalId, Rest).
+    write_messages(Vsn, ClusterLeader, PublisherRef, PublisherId, InternalId, Rest,
+                   MaxUncompressedSize, Stream).
+
+%% Only the ?VERSION_1 compressed sub-batch shape is validated, so only that shape
+%% (and the plain ?VERSION_1 entry it can be interleaved with) can appear here.
+reject_remaining(_V, <<>>) ->
+    [];
+reject_remaining(?VERSION_1 = V, <<PublishingId:64,
+                                    0:1,
+                                    MessageSize:31,
+                                    _Message:MessageSize/binary,
+                                    Rest/binary>>) ->
+    [PublishingId | reject_remaining(V, Rest)];
+reject_remaining(?VERSION_1 = V, <<PublishingId:64,
+                                    1:1,
+                                    _CompressionType:3,
+                                    _Unused:4,
+                                    _MessageCount:16,
+                                    _UncompressedSize:32,
+                                    BatchSize:32,
+                                    _Batch:BatchSize/binary,
+                                    Rest/binary>>) ->
+    [PublishingId | reject_remaining(V, Rest)].
+
+-spec validate_compressed_sub_batch(non_neg_integer(), non_neg_integer(),
+                                    non_neg_integer(), non_neg_integer(),
+                                    non_neg_integer()) -> ok | {error, term()}.
+validate_compressed_sub_batch(CompressionType, MessageCount, UncompressedSize,
+                              BatchSize, MaxUncompressedSize) ->
+    maybe
+        ok ?= check_uncompressed_size(UncompressedSize, MaxUncompressedSize),
+        ok ?= check_message_count(MessageCount),
+        ok ?= check_message_count_fits_uncompressed_size(MessageCount, UncompressedSize),
+        ok ?= check_compression_type(CompressionType),
+        check_batch_size(BatchSize, CompressionType)
+    end.
+
+check_uncompressed_size(UncompressedSize, MaxUncompressedSize)
+  when UncompressedSize > MaxUncompressedSize ->
+    {error, {uncompressed_size_exceeds_limit, UncompressedSize, MaxUncompressedSize}};
+check_uncompressed_size(_UncompressedSize, _MaxUncompressedSize) ->
+    ok.
+
+check_message_count(0) ->
+    {error, zero_message_count};
+check_message_count(_MessageCount) ->
+    ok.
+
+%% every sub-entry carries at least its own 4-byte length prefix
+check_message_count_fits_uncompressed_size(MessageCount, UncompressedSize)
+  when MessageCount * 4 > UncompressedSize ->
+    {error, {message_count_exceeds_uncompressed_size, MessageCount, UncompressedSize}};
+check_message_count_fits_uncompressed_size(_MessageCount, _UncompressedSize) ->
+    ok.
+
+check_compression_type(CompressionType)
+  when CompressionType > ?MAX_KNOWN_COMPRESSION_TYPE ->
+    {error, {unknown_compression_type, CompressionType}};
+check_compression_type(_CompressionType) ->
+    ok.
+
+check_batch_size(0, CompressionType) when CompressionType =/= 0 ->
+    {error, empty_batch_with_compression};
+check_batch_size(_BatchSize, _CompressionType) ->
+    ok.
 
 parse_map(<<>>, _Count) ->
     {#{}, <<>>};
@@ -194,13 +303,22 @@ check_write_permitted(Resource, User) ->
 check_read_permitted(Resource, User, Context) ->
     check_resource_access(User, Resource, read, Context).
 
--spec check_super_stream_management_permitted(rabbit_types:vhost(), binary(), [binary()], rabbit_types:user()) ->
+check_read_or_write_permitted(Resource, User) ->
+    case check_read_permitted(Resource, User, #{}) of
+        ok ->
+            ok;
+        _ ->
+            check_write_permitted(Resource, User)
+    end.
+
+-spec check_super_stream_management_permitted(rabbit_types:vhost(), binary(),
+                                              [binary()], rabbit_types:user()) ->
     ok | error.
 check_super_stream_management_permitted(VirtualHost, SuperStream, Partitions, User) ->
     Exchange = e(VirtualHost, SuperStream),
     maybe
         %% exchange creation
-        ok ?= check_configure_permitted(Exchange, User),
+        ok ?= check_super_stream_permitted(VirtualHost, SuperStream, User),
         %% stream creations
         ok ?= check_streams_permissions(fun check_configure_permitted/2,
                                         VirtualHost, Partitions,
@@ -212,6 +330,13 @@ check_super_stream_management_permitted(VirtualHost, SuperStream, Partitions, Us
                                   VirtualHost, Partitions,
                                   User)
     end.
+
+-spec check_super_stream_permitted(rabbit_types:vhost(), binary(),
+                                   rabbit_types:user()) ->
+    ok | error.
+check_super_stream_permitted(Vhost, SuperStream, User) ->
+    Exchange = e(Vhost, SuperStream),
+    check_configure_permitted(Exchange, User).
 
 check_streams_permissions(Fun, VirtualHost, List, User) ->
     case lists:all(fun(S) ->
@@ -348,3 +473,167 @@ offset_lag(_, 0, 0, LastListenerOffset) when LastListenerOffset > 0 ->
     0;
 offset_lag(CommittedOffset, ConsumerOffset, _, _) ->
     CommittedOffset - ConsumerOffset.
+
+-spec validate_super_stream_max_partitions(list() | integer()) -> boolean().
+validate_super_stream_max_partitions(Partitions) ->
+    MaxPartitions = rabbit_stream_utils:max_super_stream_partitions(),
+    validate_super_stream_max_partitions(Partitions, MaxPartitions).
+
+-spec validate_super_stream_max_partitions(list() | integer(),
+                                           infinity | non_neg_integer()) -> boolean().
+validate_super_stream_max_partitions(_, infinity) ->
+    true;
+validate_super_stream_max_partitions(Partitions, Max) when is_list(Partitions) ->
+    length(Partitions) =< Max;
+validate_super_stream_max_partitions(Partitions, Max) when is_integer(Partitions) ->
+    Partitions =< Max.
+
+-spec max_super_stream_partitions() -> infinity | non_neg_integer().
+max_super_stream_partitions() ->
+    application:get_env(rabbitmq_stream, max_super_stream_partitions,
+                        ?MAX_SUPER_STREAM_PARTITIONS).
+
+%% super stream partition helpers
+-spec streams_from_partitions(binary(), non_neg_integer()) -> [binary()].
+streams_from_partitions(Name, Partitions) ->
+    [<<Name/binary, "-", (integer_to_binary(K))/binary>> ||
+     K <- lists:seq(0, Partitions - 1)].
+
+-spec streams_from_binding_keys(binary(), [binary()]) -> [binary()].
+streams_from_binding_keys(Name, BindingKeys) ->
+    [<<Name/binary, "-", K/binary>> || K <- BindingKeys].
+
+-spec routing_keys(non_neg_integer()) -> [binary()].
+routing_keys(Partitions) ->
+    [integer_to_binary(K) || K <- lists:seq(0, Partitions - 1)].
+
+-spec binding_keys(unicode:chardata()) -> [binary()].
+binding_keys(BindingKeysBin) ->
+    Keys = binary:split(rabbit_data_coercion:to_binary(BindingKeysBin),
+                        <<",">>, [global]),
+    %% Trim first, then verify the token is not an empty binary
+    [Trimmed || K <- Keys,
+                Trimmed <- [string:trim(K)],
+                Trimmed =/= <<>>].
+
+-spec node_endpoints([node()], tcp | ssl) -> #{node() => {binary(), integer()}}.
+node_endpoints(Nodes, Transport) ->
+    node_endpoints(Nodes, Transport, advertised_endpoint).
+
+node_endpoints([], _Transport, _Fun) ->
+    #{};
+node_endpoints(Nodes, Transport, Fun) ->
+    %% Absolute deadline, so that both phases and the receive loop of the
+    %% fallback share one budget.
+    Deadline = {abs, erlang:monotonic_time(millisecond) + ?ENDPOINT_TIMEOUT},
+    Results = erpc:multicall(Nodes, rabbit_stream, Fun, [Transport], Deadline),
+    Classify = fun(NodeResult, Acc) ->
+                       classify_endpoint(Fun, NodeResult, Acc)
+               end,
+    {Endpoints, Legacy} = lists:foldl(Classify, {#{}, []},
+                                      lists:zip(Nodes, Results)),
+    case Legacy of
+        [] ->
+            Endpoints;
+        _ ->
+            ?LOG_DEBUG("Nodes ~tp do not export rabbit_stream:~ts/1, "
+                       "retrieving host and port separately", [Legacy, Fun]),
+            Fallback = legacy_node_endpoints(Legacy, Transport, Deadline),
+            maps:merge(Endpoints, Fallback)
+    end.
+
+classify_endpoint(_Fun, {Node, {ok, {Host, Port}}}, {Endpoints, Legacy})
+  when is_binary(Host), is_integer(Port) ->
+    {Endpoints#{Node => {Host, Port}}, Legacy};
+%% The peer predates advertised_endpoint/1, or the stream plugin is not
+%% running there.
+classify_endpoint(Fun,
+                  {Node,
+                   {error, {exception, undef, [{rabbit_stream, Fun, _, _} | _]}}},
+                  {Endpoints, Legacy}) ->
+    {Endpoints, [Node | Legacy]};
+classify_endpoint(_Fun, {Node, Result}, {Endpoints, Legacy}) ->
+    log_unusable_endpoint(Node, Result),
+    {Endpoints, Legacy}.
+
+log_unusable_endpoint(Node, {ok, {Host, Port}}) ->
+    ?LOG_WARNING("Invalid stream endpoint reported by node '~ts': ~tp ~tp",
+                 [Node, Host, Port]);
+log_unusable_endpoint(Node, Result) ->
+    Level = case transient_endpoint_error(Result) of
+                true -> debug;
+                false -> warning
+            end,
+    ?LOG(Level, "Could not retrieve the endpoint of node '~ts': ~tp",
+         [Node, Result]).
+
+transient_endpoint_error({error, {erpc, timeout}}) ->
+    true;
+transient_endpoint_error({error, {erpc, noconnection}}) ->
+    true;
+%% The stream plugin is not running on that node.
+transient_endpoint_error({error, {exception, undef,
+                                  [{rabbit_stream, _, _, _} | _]}}) ->
+    true;
+transient_endpoint_error(_) ->
+    false.
+
+%% For peers that do not export rabbit_stream:advertised_endpoint/1. It can go
+%% away once every version an upgrade can start from exports it.
+%%
+%% Both requests of a node are sent before any of them is collected, so that a
+%% slow node does not use up the budget of the others.
+legacy_node_endpoints(Nodes, Transport, Deadline) ->
+    HostFun = legacy_host_fun(Transport),
+    PortFun = legacy_port_fun(Transport),
+    ReqIds = lists:foldl(
+               fun(Node, Acc0) ->
+                       Acc1 = erpc:send_request(Node, rabbit_stream, HostFun,
+                                                [], {Node, host}, Acc0),
+                       erpc:send_request(Node, rabbit_stream, PortFun,
+                                         [], {Node, port}, Acc1)
+               end, erpc:reqids_new(), Nodes),
+    Parts = receive_endpoint_parts(ReqIds, Deadline, #{}),
+    Endpoints = maps:filtermap(
+                  fun(_Node, #{host := H, port := P})
+                        when is_binary(H), is_integer(P) ->
+                          {true, {H, P}};
+                     (_Node, _Part) ->
+                          false
+                  end, Parts),
+    case Nodes -- maps:keys(Endpoints) of
+        [] ->
+            ok;
+        Missing ->
+            ?LOG_DEBUG("Could not retrieve the endpoint of nodes ~tp: ~tp",
+                       [Missing, maps:with(Missing, Parts)])
+    end,
+    Endpoints.
+
+receive_endpoint_parts(ReqIds, Deadline, Acc) ->
+    try erpc:receive_response(ReqIds, Deadline, true) of
+        no_request ->
+            Acc;
+        {Value, {Node, Key}, ReqIds1} ->
+            Acc1 = add_endpoint_part(Node, Key, Value, Acc),
+            receive_endpoint_parts(ReqIds1, Deadline, Acc1)
+    catch
+        error:{erpc, timeout} ->
+            %% receive_response/3 abandons the outstanding requests.
+            Acc;
+        _Class:{Reason, {Node, Key}, ReqIds1} ->
+            Acc1 = add_endpoint_part(Node, Key, {error, Reason}, Acc),
+            receive_endpoint_parts(ReqIds1, Deadline, Acc1)
+    end.
+
+add_endpoint_part(Node, Key, Value, Acc) ->
+    Part = maps:get(Node, Acc, #{}),
+    Acc#{Node => Part#{Key => Value}}.
+
+%% Only functions old peers export, hence not advertised_host/1 and
+%% advertised_port/1.
+legacy_host_fun(tcp) -> host;
+legacy_host_fun(ssl) -> tls_host.
+
+legacy_port_fun(tcp) -> port;
+legacy_port_fun(ssl) -> tls_port.

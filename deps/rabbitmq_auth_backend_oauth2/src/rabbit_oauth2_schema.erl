@@ -41,7 +41,7 @@ translate_scope_aliases(Conf) ->
         extract_scope_aliases_as_list_of_alias_scope_props(Settings)).
 
 convert_space_separated_string_to_list_of_binaries(String) ->
-    [ list_to_binary(V) || V <- string:tokens(String, " ")].
+    [ list_to_binary(V) || V <- string:lexemes(String, " ")].
 
 extract_scope_alias_as_map(Settings) ->
     maps:from_list([{
@@ -158,6 +158,7 @@ translate_oauth_providers(Conf) ->
             Settings),
         extract_oauth_providers_algorithm(Settings),
         extract_oauth_providers_https(Settings),
+        extract_oauth_providers_discovery(Settings),
         extract_oauth_providers_signing_keys(Settings)
         ]).
 
@@ -257,9 +258,41 @@ extract_resource_server_properties(Settings) ->
     KeyFun = fun extract_key_as_binary/1,
     ValueFun = fun extract_value/1,
 
-    OAuthProviders = [{Name, {list_to_atom(resource_servers_key_synonym(Key)), list_to_binary(V)}}
+    OAuthProviders = [{Name, {list_to_atom(resource_servers_key_synonym(Key)),
+        resource_server_property_value(Key, V)}}
         || {[?AUTH_OAUTH2, ?RESOURCE_SERVERS, Name, Key], V} <- Settings ],
     maps:groups_from_list(KeyFun, ValueFun, OAuthProviders).
+
+resource_server_property_value(Key, V) ->
+    case resource_servers_key_synonym(Key) of
+        "scope_pattern_syntax" ->
+            parse_scope_pattern_syntax_for_schema(V);
+        _ ->
+            resource_server_string_property_value(V)
+    end.
+
+resource_server_string_property_value(V) when is_binary(V) ->
+    V;
+resource_server_string_property_value(V) when is_list(V) ->
+    list_to_binary(V).
+
+parse_scope_pattern_syntax_for_schema(wildcard) ->
+    wildcard;
+parse_scope_pattern_syntax_for_schema(regex) ->
+    regex;
+parse_scope_pattern_syntax_for_schema(V) when is_binary(V) ->
+    parse_scope_pattern_syntax_for_schema(binary_to_list(V));
+parse_scope_pattern_syntax_for_schema(V) when is_list(V) ->
+    case string:lowercase(V) of
+        "wildcard" -> wildcard;
+        "regex" -> regex;
+        _ ->
+            cuttlefish:invalid(io_lib:format(
+                "Invalid scope_pattern_syntax: ~tp", [V]))
+    end;
+parse_scope_pattern_syntax_for_schema(V) ->
+    cuttlefish:invalid(io_lib:format(
+        "Invalid scope_pattern_syntax: ~tp", [V])).
 
 mapOauthProviderProperty({Key, Value}) ->
     {Key, case Key of
@@ -291,6 +324,16 @@ mapHttpProperty({Key, Value}) ->
         cacertfile -> validator_pem_file(Key, Value);
         _ -> Value
     end}.
+
+extract_oauth_providers_discovery(Settings) ->
+    ExtractProviderNameFun = fun extract_key_as_binary/1,
+
+    AttributesPerProvider = [{Name, {list_to_atom(Key), V}} ||
+        {[?AUTH_OAUTH2, ?OAUTH_PROVIDERS, Name, "discovery", Key], V} <- Settings ],
+
+    maps:map(fun(_K,V)-> [{discovery, V}] end,
+        maps:groups_from_list(ExtractProviderNameFun, fun({_, V}) -> V end,
+            AttributesPerProvider)).
 
 extract_oauth_providers_algorithm(Settings) ->
     KeyFun = fun extract_key_as_binary/1,

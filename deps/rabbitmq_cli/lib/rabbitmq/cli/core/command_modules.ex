@@ -63,7 +63,7 @@ defmodule RabbitMQ.CLI.Core.CommandModules do
 
     enabled_plugins =
       try do
-        PluginsHelpers.read_enabled(opts)
+        PluginsHelpers.read_enabled(opts, local_fallback: true)
       catch
         err ->
           {:ok, enabled_plugins_file} = PluginsHelpers.enabled_plugins_file(opts)
@@ -80,7 +80,7 @@ defmodule RabbitMQ.CLI.Core.CommandModules do
           []
       end
 
-    all_plugins = PluginsHelpers.list(opts)
+    all_plugins = PluginsHelpers.list(opts, local_fallback: true)
     enabled_with_dep = :rabbit_plugins.dependencies(false, enabled_plugins, all_plugins)
 
     all_enabled_plugins =
@@ -149,10 +149,6 @@ defmodule RabbitMQ.CLI.Core.CommandModules do
 
   defp module_exists?(mod) do
     Code.ensure_loaded?(mod)
-  end
-
-  defp implements_command_behaviour?(nil) do
-    false
   end
 
   defp implements_command_behaviour?(module) do

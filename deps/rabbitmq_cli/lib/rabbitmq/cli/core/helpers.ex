@@ -6,7 +6,6 @@
 
 defmodule RabbitMQ.CLI.Core.Helpers do
   alias RabbitMQ.CLI.Core.{Config, DataCoercion, NodeName}
-  require Record
 
   def get_rabbit_hostname(node_name_type \\ :shortnames) do
     normalise_node(Config.get_option(:node), node_name_type)
@@ -147,6 +146,14 @@ defmodule RabbitMQ.CLI.Core.Helpers do
   end
 
   def cli_acting_user, do: "rmq-cli"
+
+  # Redact shovel, federation upstream URIs before displaying
+  # the values to the user.
+  def redact_uri_credentials(value) do
+    value
+    |> then(&Regex.replace(~r{://(?:[^/?#@]*@)+}, &1, "://"))
+    |> then(&Regex.replace(~r{(://[^"\s?]*)\?[^"\s]*}, &1, "\\1"))
+  end
 
   def string_or_inspect(val) do
     case String.Chars.impl_for(val) do

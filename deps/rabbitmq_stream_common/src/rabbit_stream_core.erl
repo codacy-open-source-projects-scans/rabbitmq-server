@@ -161,7 +161,7 @@
      {metadata, Endpoints :: [endpoint()],
       Metadata ::
           #{stream_name() =>
-                stream_not_found | stream_not_available |
+                stream_not_found | stream_not_available | stream_not_allowed |
                 {Leader :: endpoint() | undefined, Replicas :: [endpoint()]}}} |
      {peer_properties, response_code(), #{binary() => binary()}} |
      {sasl_handshake, response_code(), Mechanisms :: [binary()]} |
@@ -189,9 +189,9 @@ init(Opts) when is_map(Opts) ->
 init(_) ->
     #?MODULE{cfg = #cfg{frame_max = unlimited}}.
 
-%% Updates the frame_max enforced by the parser. Called by the
-%% reader after TUNE so the negotiated value is enforced instead of
-%% the initial ceiling.
+%% Updates the frame_max enforced by the parser. Called by the reader
+%% after a successful `open` (authenticated and authorized) so the
+%% negotiated value is enforced instead of the pre-auth ceiling.
 -spec set_frame_max(non_neg_integer() | unlimited, state()) -> state().
 set_frame_max(FrameMax, #?MODULE{cfg = Cfg} = State) ->
     State#?MODULE{cfg = Cfg#cfg{frame_max = normalise_frame_max(FrameMax)}}.
@@ -374,17 +374,13 @@ frame({tune, FrameMax, Heartbeat}) ->
                     FrameMax:32,
                     Heartbeat:32>>);
 frame({publish_error, PublisherId, ErrCode, PublishingIds}) ->
-    Details =
-        iolist_to_binary(lists:foldr(fun(PubId, Acc) ->
-                                        [<<PubId:64, ErrCode:16>> | Acc]
-                                     end,
-                                     [], PublishingIds)),
-    wrap_in_frame(<<?REQUEST:1,
-                    ?COMMAND_PUBLISH_ERROR:15,
-                    ?VERSION_1:16,
-                    PublisherId:8,
-                    (length(PublishingIds)):32,
-                    Details/binary>>);
+    Details = [<<PubId:64, ErrCode:16>> || PubId <- PublishingIds],
+    wrap_in_frame([<<?REQUEST:1,
+                     ?COMMAND_PUBLISH_ERROR:15,
+                     ?VERSION_1:16,
+                     PublisherId:8,
+                     (length(PublishingIds)):32>>,
+                   Details]);
 frame({request, CorrelationId, Body}) ->
     {CmdTag, BodyBin} = request_body(Body),
     CmdId = command_id(CmdTag),
@@ -498,7 +494,9 @@ response_body({metadata = Tag, Endpoints, Metadata}) ->
                                   stream_not_found ->
                                       ?RESPONSE_CODE_STREAM_DOES_NOT_EXIST;
                                   stream_not_available ->
-                                      ?RESPONSE_CODE_STREAM_NOT_AVAILABLE
+                                      ?RESPONSE_CODE_STREAM_NOT_AVAILABLE;
+                                  stream_not_allowed ->
+                                      ?RESPONSE_CODE_ACCESS_REFUSED
                               end,
                           StreamLength = byte_size(Stream),
                           [<<StreamLength:16,
@@ -713,10 +711,8 @@ request_body({resolve_offset_spec = Tag, Stream, OffsetSpec, Properties}) ->
         end,
     {Tag, [<<?STRING(Stream), OffsetSpecBin/binary>> | PropertiesBin]}.
 
-append_data(Prev, Data) when is_binary(Prev) ->
-    [Prev, Data];
-append_data(Prev, Data) when is_list(Prev) ->
-    Prev ++ [Data].
+append_data(Prev, Data) ->
+    [Prev, Data].
 
 wrap_in_frame(IOData) ->
     Size = iolist_size(IOData),
@@ -1026,6 +1022,12 @@ parse_request(Bin) ->
     {unknown, Bin}.
 
 parse_response(<<?RESPONSE:1,
+                 ?COMMAND_OPEN:15,
+                 ?VERSION_1:16,
+                 CorrelationId:32,
+                 ResponseCode:16>>) ->
+    {response, CorrelationId, {open, ResponseCode, #{}}};
+parse_response(<<?RESPONSE:1,
                  CommandId:15,
                  ?VERSION_1:16,
                  CorrelationId:32,
@@ -1115,7 +1117,9 @@ parse_response_body(?COMMAND_STREAM_STATS,
     {stream_stats, ResponseCode, Info};
 parse_response_body(?COMMAND_RESOLVE_OFFSET_SPEC,
                     <<ResponseCode:16, OffsetType:16, Offset:64>>) ->
-    {resolve_offset_spec, ResponseCode, OffsetType, Offset}.
+    {resolve_offset_spec, ResponseCode, OffsetType, Offset};
+parse_response_body(CommandId, Data) ->
+    {unknown, CommandId, Data}.
 
 offset_spec(OffsetType, OffsetValueBin) ->
     case OffsetType of
@@ -1158,7 +1162,9 @@ parse_meta(<<?STRING(StreamSize, Stream),
             ?RESPONSE_CODE_STREAM_DOES_NOT_EXIST ->
                 stream_not_found;
             ?RESPONSE_CODE_STREAM_NOT_AVAILABLE ->
-                stream_not_available
+                stream_not_available;
+            ?RESPONSE_CODE_ACCESS_REFUSED ->
+                stream_not_allowed
         end,
     parse_meta(Rem, Nodes, Acc#{Stream => StreamDetail}).
 

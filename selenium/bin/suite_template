@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-if [[ ! -z "${DEBUG}" ]]; then
+if [[ ! -z "${DEBUG:-}" ]]; then
   set -x
 fi
 
@@ -144,8 +144,8 @@ init_suite() {
 build_mocha_image() {
   local need_mocha_docker_image="${1:-yes}"
   DOCKER_BUILD_ARGS=""
-  if [[ -n "$MOCHA_DOCKER_FILE" ]]; then 
-    DOCKER_BUILD_ARGS="-f $MOCHA_DOCKER_FILE "
+  if [[ -n "${MOCHA_DOCKER_FILE:-}" ]]; then
+    DOCKER_BUILD_ARGS="-f $MOCHA_DOCKER_FILE --secret id=npmrc,src=$HOME/.npmrc "
   fi
   begin "Ensuring mocha-test image ($DOCKER_BUILD_ARGS) ..."
   if [[ "$need_mocha_docker_image" != "yes" ]]; then
@@ -210,7 +210,11 @@ wait_for_oidc_endpoint_local() {
   do
     echo "Failed $?"
     sleep $DELAY_BETWEEN_ATTEMPTS
-    [[ counter -eq $max_retry ]] && print "Failed!" && exit 1
+    if [[ counter -eq $max_retry ]]; then
+      print "Failed!"
+      save_components_logs_on_wait_failure
+      exit 1
+    fi
     print "Trying again. Try #$counter"
     ((counter++))
   done
@@ -233,7 +237,11 @@ wait_for_oidc_endpoint_docker() {
   until (docker run $DOCKER_ARGS curlimages/curl:7.85.0 $CURL_ARGS ${BASE_URL}/.well-known/openid-configuration >/dev/null 2>&1)
   do
     sleep $DELAY_BETWEEN_ATTEMPTS
-    [[ counter -eq $max_retry ]] && print "Failed!" && exit 1
+    if [[ counter -eq $max_retry ]]; then
+      print "Failed!"
+      save_components_logs_on_wait_failure
+      exit 1
+    fi
     print "Trying again. Try #$counter"
     ((counter++))
   done
@@ -279,7 +287,11 @@ wait_for_url_local() {
   do
     print "Waiting for $url to start (local)"
     sleep 5
-    [[ counter -eq $max_retry ]] && print "Failed!" && exit 1
+    if [[ counter -eq $max_retry ]]; then
+      print "Failed!"
+      save_components_logs_on_wait_failure
+      exit 1
+    fi
     print "Trying again. Try #$counter"
     ((counter++))
   done
@@ -302,7 +314,11 @@ wait_for_url_docker() {
   do
     print "Waiting for $url to start (docker)"
     sleep 5
-    [[ counter -eq $max_retry ]] && print "Failed!" && exit 1
+    if [[ counter -eq $max_retry ]]; then
+      print "Failed!"
+      save_components_logs_on_wait_failure
+      exit 1
+    fi
     print "Trying again. Try #$counter"
     ((counter++))
   done
@@ -360,7 +376,7 @@ _test() {
   kill_container_if_exist mocha
   begin "Running tests against $RMQ_HOSTNAME with these env variable:"
 
-  SELENIUM_TIMEOUT=${SELENIUM_TIMEOUT:-20000}
+  SELENIUM_TIMEOUT=${SELENIUM_TIMEOUT:-40000}
   SELENIUM_POLLING=${SELENIUM_POLLING:-500}
 
   print "> SELENIUM_TIMEOUT: ${SELENIUM_TIMEOUT}"
@@ -371,7 +387,7 @@ _test() {
   print "> RABBITMQ_PATH: ${RABBITMQ_PATH}"
   print "> RABBITMQ_URL: ${RMQ_URL}"
   print "> UAA_URL: ${UAA_URL}"
-  print "> FAKEPORTAL_URL: ${FAKEPORTAL_URL}"
+  print "> FAKEPORTAL_URL: ${FAKEPORTAL_URL:-}"
   mocha_test_tag=($(md5sum $SELENIUM_ROOT_FOLDER/package.json))
 
   generate_node_extra_ca_cert
@@ -392,7 +408,7 @@ _test() {
     --env RABBITMQ_URL=${RMQ_URL} \
     --env RABBITMQ_HOSTNAME=${RMQ_HOSTNAME} \
     --env UAA_URL=${UAA_URL} \
-    --env FAKE_PORTAL_URL=${FAKEPORTAL_URL} \
+    --env FAKE_PORTAL_URL=${FAKEPORTAL_URL:-} \
     --env RUN_LOCAL=false \
     --env SELENIUM_TIMEOUT=${SELENIUM_TIMEOUT} \
     --env SELENIUM_POLLING=${SELENIUM_POLLING} \
@@ -487,7 +503,7 @@ do_generate-ca-server-client-kpi() {
   if [ -f "$FOLDER/openssl.cnf.in" ]; then     
     cat $FOLDER/openssl.cnf.in >> openssl.cnf
   fi 
-  if [[ ! -z "${DEBUG}" ]]; then
+  if [[ ! -z "${DEBUG:-}" ]]; then
     print "Used this openssl.conf"
     cat openssl.cnf >> $CERT_LOG 2>&1
   fi
@@ -580,7 +596,7 @@ run_local_with() {
   generate_env_file
   build_mocha_image no
 
-  if [[ "$PROFILES_FOR_OTHER" != "" ]]
+  if [[ "${PROFILES_FOR_OTHER:-}" != "" ]]
   then 
     export PROFILES_FOR_OTHER="local ${PROFILES_FOR_OTHER}"
     generate_other_env_file
@@ -650,7 +666,7 @@ run_on_docker_with() {
   build_mocha_image
   start_selenium
 
-  if [[ "$PROFILES_FOR_OTHER" != "" ]]
+  if [[ "${PROFILES_FOR_OTHER:-}" != "" ]]
   then 
     export PROFILES_FOR_OTHER=`other_profiles_with_local_or_docker`
     generate_other_env_file    
@@ -760,6 +776,13 @@ teardown_components() {
     fi 
   done
   end "Finished teardown"
+}
+# Called before exiting when a component fails to start. The EXIT trap
+# tears the containers down, so this is the last chance to capture their logs.
+save_components_logs_on_wait_failure() {
+  mkdir -p $LOGS
+  save_container_logs selenium
+  save_components_logs
 }
 save_components_logs() {
   local i

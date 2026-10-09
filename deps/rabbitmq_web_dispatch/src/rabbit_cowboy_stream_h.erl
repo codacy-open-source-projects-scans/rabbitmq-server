@@ -15,11 +15,15 @@
 -export([info/3]).
 -export([terminate/3]).
 -export([early_error/5]).
+-export([set_authenticated_username/2]).
+-export([maybe_strip_allow_header/2]).
 
 -record(state, {
     next :: any(),
     req :: cowboy_req:req()
 }).
+
+-define(AUTH_USER_HEADER, <<"x-rabbitmq-authenticated-user">>).
 
 init(StreamId, Req, Opts) ->
     {Commands, Next} = cowboy_stream:init(StreamId, Req, Opts),
@@ -33,18 +37,23 @@ info(StreamId, Response, State = #state{next = Next, req = Req}) ->
     Response1 = case Response of
         {response, 404, Headers0, <<>>} ->
             log_response(Response, Req),
+            H1 = unset_authenticated_username(Headers0),
             Json = rabbit_json:encode(#{
-                error  => list_to_binary(httpd_util:reason_phrase(404)),
+                error  => not_found,
                 reason => <<"Not Found">>}),
-            Headers1 = maps:put(<<"content-length">>, integer_to_list(iolist_size(Json)), Headers0),
-            Headers = maps:put(<<"content-type">>, <<"application/json">>, Headers1),
-            {response, 404, Headers, Json};
-        {response, _, _, _} ->
+            H2 = maps:put(<<"content-length">>, integer_to_list(iolist_size(Json)), H1),
+            H3 = maps:put(<<"content-type">>, <<"application/json">>, H2),
+            {response, 404, H3, Json};
+        {response, Status, Headers0, Body} ->
             log_response(Response, Req),
-            Response;
-        {headers, _, _} ->
+            H1 = unset_authenticated_username(Headers0),
+            H2 = maybe_strip_allow_header(Status, H1),
+            {response, Status, H2, Body};
+        {headers, Status, Headers0} ->
             log_stream_response(Response, Req),
-            Response;
+            H1 = unset_authenticated_username(Headers0),
+            H2 = maybe_strip_allow_header(Status, H1),
+            {headers, Status, H2};
         _ ->
             Response
     end,
@@ -57,25 +66,52 @@ terminate(StreamId, Reason, #state{next = Next}) ->
 early_error(StreamId, Reason, PartialReq, Resp, Opts) ->
     cowboy_stream:early_error(StreamId, Reason, PartialReq, Resp, Opts).
 
-log_response({response, Status, _Headers, Body}, Req) ->
-    logger:log(info, #{formatted => format_access_log(Status, Body, Req)},
+set_authenticated_username(Username, Req) ->
+    cowboy_req:set_resp_header(?AUTH_USER_HEADER,
+                               rabbit_data_coercion:to_binary(Username), Req).
+
+unset_authenticated_username(Headers) ->
+    maps:remove(?AUTH_USER_HEADER, Headers).
+
+%% Removes the Allow response header from all responses except 405 Method Not Allowed,
+%% when management.http.hide_allow_header is set to true in the management plugin configuration.
+%% This prevents disclosure of supported HTTP methods via responses to normal requests
+%% (including OPTIONS), while still preserving the Allow header on 405 responses as required
+%% by RFC 9110.
+maybe_strip_allow_header(405, Headers) ->
+    Headers;
+maybe_strip_allow_header(_Status, Headers) ->
+    case application:get_env(rabbitmq_management, hide_http_allow_header, false) of
+        true  -> maps:remove(<<"allow">>, Headers);
+        false -> Headers
+    end.
+
+get_authenticated_username(Headers) ->
+    maps:get(?AUTH_USER_HEADER, Headers, <<"-">>).
+
+log_response({response, Status, Headers, Body}, Req) ->
+    Username = get_authenticated_username(Headers),
+    logger:log(info, #{formatted => format_access_log(Status, Body, Username, Req)},
                #{domain => ?RMQLOG_DOMAIN_HTTP_ACCESS}).
 
-log_stream_response({headers, Status, _Headers}, Req) ->
-    logger:log(info, #{formatted => format_access_log(Status, <<>>, Req)},
+log_stream_response({headers, Status, Headers}, Req) ->
+    Username = get_authenticated_username(Headers),
+    logger:log(info, #{formatted => format_access_log(Status, <<>>, Username, Req)},
                #{domain => ?RMQLOG_DOMAIN_HTTP_ACCESS}).
 
-format_access_log(Status, Body, Req) ->
-    User = user_from_req(Req),
+format_access_log(Status, Body, Username, Req) ->
+    User = sanitize(Username),
     Time = format_time(),
     StatusStr = integer_to_list(Status),
     Length = integer_to_list(body_length(Body)),
-    Method = cowboy_req:method(Req),
-    Path = cowboy_req:path(Req),
+    Method = escape_for_quoted_log(cowboy_req:method(Req)),
+    Path = escape_for_quoted_log(cowboy_req:path(Req)),
     {Peer, _Port} = cowboy_req:peer(Req),
     Version = cowboy_req:version(Req),
-    Referer = cowboy_req:header(<<"referer">>, Req, <<>>),
-    UserAgent = cowboy_req:header(<<"user-agent">>, Req, <<>>),
+    Referer = escape_for_quoted_log(
+                cowboy_req:header(<<"referer">>, Req, <<>>)),
+    UserAgent = escape_for_quoted_log(
+                  cowboy_req:header(<<"user-agent">>, Req, <<>>)),
     [fmt_ip(Peer), " - ", User, " ", Time, " \"", Method, " ", Path,
      " ", atom_to_list(Version), "\" ",
      StatusStr, " ", Length, " \"", Referer,
@@ -84,21 +120,8 @@ format_access_log(Status, Body, Req) ->
 body_length({sendfile, _, Length, _}) -> Length;
 body_length(Body) -> iolist_size(Body).
 
-user_from_req(Req) ->
-    try cowboy_req:parse_header(<<"authorization">>, Req) of
-        {basic, Username, _} ->
-            Username;
-        {bearer, _} ->
-            rabbit_data_coercion:to_binary(
-              application:get_env(rabbitmq_management, oauth_client_id, ""));
-        _ ->
-            "-"
-    catch _:_ ->
-        "-"
-    end.
-
 fmt_ip(IP) when is_tuple(IP) ->
-    inet_parse:ntoa(IP).
+    rabbit_misc:ntoa(IP).
 
 format_time() ->
     {{Year, Month, Date}, {Hour, Min, Sec}} = calendar:local_time(),
@@ -134,3 +157,68 @@ zone(Val) when Val < 0 ->
     io_lib:format("-~4..0w", [abs(Val)]);
 zone(Val) when Val >= 0 ->
     io_lib:format("+~4..0w", [Val]).
+
+sanitize(Value) ->
+    Bin0 = rabbit_data_coercion:to_binary(Value),
+    Bin1 = binary:replace(Bin0, [<<"\r">>, <<"\n">>], <<>>, [global]),
+    << <<(case C < 32 orelse C =:= 127 of
+              true  -> $?;
+              false -> C
+          end)>> || <<C>> <= Bin1 >>.
+
+escape_for_quoted_log(Value) ->
+    Bin = sanitize(Value),
+    Bin1 = binary:replace(Bin, <<"\\">>, <<"\\\\">>, [global]),
+    binary:replace(Bin1, <<"\"">>, <<"\\\"">>, [global]).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+maybe_strip_allow_header_preserves_on_405_test() ->
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>},
+    application:set_env(rabbitmq_management, hide_http_allow_header, true),
+    ?assertEqual(Headers, maybe_strip_allow_header(405, Headers)),
+    application:unset_env(rabbitmq_management, hide_http_allow_header).
+
+maybe_strip_allow_header_strips_on_200_when_enabled_test() ->
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>,
+                <<"content-type">> => <<"application/json">>},
+    application:set_env(rabbitmq_management, hide_http_allow_header, true),
+    ?assertEqual(#{<<"content-type">> => <<"application/json">>},
+                 maybe_strip_allow_header(200, Headers)),
+    application:unset_env(rabbitmq_management, hide_http_allow_header).
+
+maybe_strip_allow_header_preserves_on_200_when_disabled_test() ->
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>},
+    application:unset_env(rabbitmq_management, hide_http_allow_header),
+    ?assertEqual(Headers, maybe_strip_allow_header(200, Headers)).
+
+maybe_strip_allow_header_no_allow_header_test() ->
+    Headers = #{<<"content-type">> => <<"application/json">>},
+    application:set_env(rabbitmq_management, hide_http_allow_header, true),
+    ?assertEqual(Headers, maybe_strip_allow_header(200, Headers)),
+    application:unset_env(rabbitmq_management, hide_http_allow_header).
+
+sanitize_test() ->
+    ?assertEqual(<<"hello">>, sanitize(<<"hello">>)),
+    ?assertEqual(<<"hello">>, sanitize("hello")),
+    %% CR/LF are removed (to keep log lines intact)
+    ?assertEqual(<<"helloworld">>, sanitize(<<"hello\nworld">>)),
+    ?assertEqual(<<"helloworld">>, sanitize(<<"hello\r\nworld">>)),
+    %% Other control characters are replaced with ?
+    ?assertEqual(<<"hello?world">>, sanitize(<<"hello\tworld">>)),
+    ?assertEqual(<<"hello?world?">>, sanitize(<<"hello\x00world\x1f">>)),
+    ?assertEqual(<<"abc">>, sanitize(<<"a\rb\nc">>)),
+    ok.
+
+escape_for_quoted_log_test() ->
+    ?assertEqual(<<"hello">>, escape_for_quoted_log(<<"hello">>)),
+    %% A literal backslash in the input gets escaped to \\
+    ?assertEqual(<<"hello\\\\nworld">>, escape_for_quoted_log(<<"hello\\nworld">>)),
+    %% Double quotes are escaped
+    ?assertEqual(<<"say \\\"hi\\\"">>, escape_for_quoted_log(<<"say \"hi\"">>)),
+    %% Combined: controls removed + quotes escaped
+    ?assertEqual(<<"pathwith\\\"quote\\\"">>, escape_for_quoted_log(<<"path\nwith\"quote\"">>)),
+    ok.
+
+-endif.

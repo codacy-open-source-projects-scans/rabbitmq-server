@@ -23,6 +23,7 @@
 -type connection_step() :: tcp_connected | peer_properties_exchanged |
                            authenticating | authenticated | tuning |
                            tuned | opened | failure |
+                           silent_close |
                            closing | close_sent | closing_done.
 
 -record(publisher,
@@ -81,6 +82,7 @@
          virtual_host :: undefined | binary(),
          connection_step :: connection_step(),
          frame_max :: integer(),
+         max_uncompressed_sub_entry_batch_size :: integer(),
          heartbeat :: undefined | integer(),
          heartbeater :: any(),
          client_properties = #{} :: #{binary() => binary()},
@@ -91,6 +93,7 @@
              atomics:atomics_ref(), % number of bytes sent with send_file (for metrics)
          transport :: tcp | ssl,
          proxy_socket :: undefined | ranch_transport:socket(),
+         ranch_ref :: ranch:ref(),
          correlation_id_sequence :: integer(),
          outstanding_requests :: #{integer() => #request{}},
          deliver_version :: rabbit_stream_core:command_version(),

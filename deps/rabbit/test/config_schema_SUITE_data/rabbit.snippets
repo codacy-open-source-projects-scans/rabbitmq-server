@@ -112,6 +112,9 @@ ssl_options.crl_sources.1.path = /var/lib/rabbitmq/crls",
             [{crl_check,true},
              {crl_cache,{ssl_crl_cache,{internal,[{http,5000},{dir,"/var/lib/rabbitmq/crls"}]}}}]}]}],
   []},
+ {listeners_startup_delay,
+  "listeners.startup_delay = 10",
+  [{rabbit, [{listeners_startup_delay, 10}]}], []},
  {tcp_listener,
   "listeners.tcp.default = 5673",
     [{rabbit,[{tcp_listeners,[5673]}]}],[]},
@@ -498,7 +501,31 @@ tcp_listen_options.exit_on_close = false",
   "ranch_connection_max = infinity",
   [{rabbit,[{ranch_connection_max, infinity}]}],
   []},
- {channel_max,
+ {max_connections,
+  "max_connections = 1000",
+  [{rabbit,[{connection_max, 1000}]}],
+  []},
+ {max_connections_infinity,
+  "max_connections = infinity",
+  [{rabbit,[{connection_max, infinity}]}],
+  []},
+ %% `connection_max` is a deprecated alias for `max_connections`
+ %% retained for backwards compatibility.
+ {connection_max_alias,
+  "connection_max = 1000",
+  [{rabbit,[{connection_max, 1000}]}],
+  []},
+ {connection_max_alias_infinity,
+  "connection_max = infinity",
+  [{rabbit,[{connection_max, infinity}]}],
+  []},
+ {max_channels_per_connection,
+  "max_channels_per_connection = 16",
+  [{rabbit,[{channel_max, 16}]}],
+  []},
+ %% `channel_max` is a deprecated alias for `max_channels_per_connection`
+ %% retained for backwards compatibility.
+ {channel_max_alias,
   "channel_max = 16",
   [{rabbit,[{channel_max, 16}]}],
   []},
@@ -534,6 +561,14 @@ tcp_listen_options.exit_on_close = false",
   "consumer_max_per_channel = infinity",
   [{rabbit,[{consumer_max_per_channel, infinity}]}],
   []},
+ {channel_tx_message_max,
+  "channel_tx_message_max = 500",
+  [{rabbit,[{channel_tx_message_max, 500}]}],
+  []},
+ {channel_tx_message_max,
+  "channel_tx_message_max = infinity",
+  [{rabbit,[{channel_tx_message_max, infinity}]}],
+  []},
  {max_message_size,
   "max_message_size = 131072",
   [{rabbit, [{max_message_size, 131072}]}],
@@ -553,6 +588,14 @@ tcp_listen_options.exit_on_close = false",
  {listeners_tcp_ipv6,
   "listeners.tcp.1 = fe80::2acf:e9ff:fe17:f97b:5672",
   [{rabbit,[{tcp_listeners,[{"fe80::2acf:e9ff:fe17:f97b",5672}]}]}],
+  []},
+ {listeners_tcp_uds_local_prefix,
+  "listeners.tcp.1 = local:/var/run/rabbitmq.sock:0",
+  [{rabbit,[{tcp_listeners,[{local,"/var/run/rabbitmq.sock",0}]}]}],
+  []},
+ {listeners_tcp_uds_unix_prefix,
+  "listeners.tcp.1 = unix:/var/run/rabbitmq.sock:0",
+  [{rabbit,[{tcp_listeners,[{local,"/var/run/rabbitmq.sock",0}]}]}],
   []},
  {tcp_options_sndbuf,
   "tcp_listen_options.backlog = 128
@@ -710,6 +753,27 @@ tcp_listen_options.exit_on_close = false",
              {certfile,"test/config_schema_SUITE_data/certs/server_certificate.pem"},
              {keyfile,"test/config_schema_SUITE_data/certs/server_key.pem"},
              {versions,['tlsv1.2','tlsv1.1']}]}]}],
+  []},
+
+ {ssl_options_supported_groups,
+  "listeners.ssl.1 = 5671
+   ssl_options.cacertfile = test/config_schema_SUITE_data/certs/ca_certificate.pem
+   ssl_options.certfile   = test/config_schema_SUITE_data/certs/server_certificate.pem
+   ssl_options.keyfile    = test/config_schema_SUITE_data/certs/server_key.pem
+   ssl_options.versions.1 = tlsv1.3
+   ssl_options.supported_groups.1 = x25519mlkem768
+   ssl_options.supported_groups.2 = x25519
+   ssl_options.supported_groups.3 = secp256r1",
+  [{ssl,[{versions,['tlsv1.3']}]}],
+  [{ssl,[{versions,['tlsv1.3']}]},
+   {rabbit,
+       [{ssl_listeners,[5671]},
+        {ssl_options,
+            [{cacertfile,"test/config_schema_SUITE_data/certs/ca_certificate.pem"},
+             {certfile,"test/config_schema_SUITE_data/certs/server_certificate.pem"},
+             {keyfile,"test/config_schema_SUITE_data/certs/server_key.pem"},
+             {supported_groups, [x25519mlkem768, x25519, secp256r1]},
+             {versions,['tlsv1.3']}]}]}],
   []},
 
  {ssl_options_allow_poodle,
@@ -958,6 +1022,30 @@ credential_validator.regexp = ^abc\\d+",
     ]}],
   []},
 
+ %% DEPRECATED; just for backwards compatibility
+ {mirroring_sync_batch_size,
+  "mirroring_sync_batch_size = 4096",
+  [{rabbit, [
+      {mirroring_sync_batch_size, 4096}
+    ]}],
+  []},
+
+ %% DEPRECATED; just for backwards compatibility
+ {mirroring_sync_max_throughput,
+  "mirroring_sync_max_throughput = 1000000",
+  [{rabbit, [
+      {mirroring_sync_max_throughput, 1000000}
+    ]}],
+  []},
+
+ %% DEPRECATED; just for backwards compatibility
+ {mirroring_sync_max_throughput_unit_suffix,
+  "mirroring_sync_max_throughput = 200MB",
+  [{rabbit, [
+      {mirroring_sync_max_throughput, "200MB"}
+    ]}],
+  []},
+
   {kernel_net_ticktime,
    "net_ticktime = 20",
    [{kernel, [
@@ -969,6 +1057,20 @@ credential_validator.regexp = ^abc\\d+",
    "consumer_timeout = 20000",
    [{rabbit, [
       {consumer_timeout, 20000}
+     ]}],
+   []},
+
+  {rabbit_consumer_timeout_response_notify_consumer,
+   "consumer_timeout_response = notify_consumer",
+   [{rabbit, [
+      {consumer_timeout_response, notify_consumer}
+     ]}],
+   []},
+
+  {rabbit_consumer_timeout_response_close_channel,
+   "consumer_timeout_response = close_channel",
+   [{rabbit, [
+      {consumer_timeout_response, close_channel}
      ]}],
    []},
 
@@ -997,6 +1099,27 @@ credential_validator.regexp = ^abc\\d+",
    "metadata_store.khepri.snapshot_interval = 123456",
    [{rabbit,
      [{khepri_snapshot_interval, 123456}]
+    }],
+   []},
+
+  {sole_connection_tick_interval,
+   "sole_connection.tick_interval = 123456",
+   [{rabbit,
+     [{sole_connection_tick_interval, 123456}]
+    }],
+   []},
+
+  {sole_connection_leader_wait_retry_timeout,
+   "sole_connection.leader_wait_retry_timeout = 123456",
+   [{rabbit,
+     [{sole_connection_leader_wait_retry_timeout, 123456}]
+    }],
+   []},
+
+  {sole_connection_default_timeout,
+   "sole_connection.default_timeout = 123456",
+   [{rabbit,
+     [{sole_connection_default_timeout, 123456}]
     }],
    []},
 
@@ -1064,6 +1187,42 @@ credential_validator.regexp = ^abc\\d+",
             "DHE-DSS-AES128-GCM-SHA256"
             ]}
         ]}
+    ]}]}],
+  []},
+
+  %% modern configuration key, HTTPS source with a tagged (encrypted) URL
+ {definition_files_encrypted_url,
+  "definitions.import_backend = https
+                     definitions.https.url = encrypted:GhC4J5lh2DUkbdyKO0aMI8aYJ54mwe4eEWzou4yRFAHMF82IbD6cRiYAiBa8UIzR",
+  [{rabbit, [
+    {definitions, [
+      {import_backend, rabbit_definitions_import_https},
+      {url, {encrypted, "GhC4J5lh2DUkbdyKO0aMI8aYJ54mwe4eEWzou4yRFAHMF82IbD6cRiYAiBa8UIzR"}}
+    ]}]}],
+  []},
+
+  %% HTTPS URL with a non-default port and userinfo. Exercises URL
+  %% reconstruction when cuttlefish's tagged_string parser splits at the
+  %% first colon and leaves multiple colons in the remainder.
+ {definition_files_https_url_with_port_and_userinfo,
+  "definitions.import_backend = https
+                     definitions.https.url = https://admin:s3cret@rabbitmq.example.com:8443/env-1/case1.json",
+  [{rabbit, [
+    {definitions, [
+      {import_backend, rabbit_definitions_import_https},
+      {url, "https://admin:s3cret@rabbitmq.example.com:8443/env-1/case1.json"}
+    ]}]}],
+  []},
+
+  %% Plain HTTP URL (different scheme than the key name suggests). Exercises
+  %% URL reconstruction for a non-https scheme.
+ {definition_files_http_url,
+  "definitions.import_backend = https
+                     definitions.https.url = http://rabbitmq.example.com/case1.json",
+  [{rabbit, [
+    {definitions, [
+      {import_backend, rabbit_definitions_import_https},
+      {url, "http://rabbitmq.example.com/case1.json"}
     ]}]}],
   []},
 
@@ -1771,5 +1930,21 @@ credential_validator.regexp = ^abc\\d+",
        {certfile,"test/config_schema_SUITE_data/certs/server_certificate.pem"},
        {keyfile,"test/config_schema_SUITE_data/certs/server_key.pem"},
        {psk_identity, "my_identity"}]}]}],
+  []},
+ {channel_interceptor_single_priority,
+  "channel_interceptor.priorities.my_interceptor_module_1 = 5",
+  [{rabbit,
+    [{channel_interceptor_priorities,
+      [{my_interceptor_module_1, 5}]}]}],
+  []},
+ {channel_interceptor_multiple_priorities,
+  "channel_interceptor.priorities.my_interceptor_module_1 = 5
+   channel_interceptor.priorities.my_interceptor_module_2 = 10
+   channel_interceptor.priorities.my_interceptor_module_3 = 15",
+  [{rabbit,
+    [{channel_interceptor_priorities,
+      [{my_interceptor_module_1, 5},
+       {my_interceptor_module_2, 10},
+       {my_interceptor_module_3, 15}]}]}],
   []}
 ].

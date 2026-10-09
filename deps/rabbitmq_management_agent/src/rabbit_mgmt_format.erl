@@ -26,7 +26,8 @@
 
 -export([strip_queue_pids/1]).
 
--export([clean_consumer_details/1, clean_channel_details/1]).
+-export([clean_consumer_details/1, clean_channel_details/1, clean_connection_details/1,
+         clean_owner_pid_details/1]).
 
 -export([args_hash/1]).
 
@@ -137,6 +138,8 @@ format_connection_created({host, Value}) ->
     {host, addr(Value)};
 format_connection_created({peer_host, Value}) ->
     {peer_host, addr(Value)};
+format_connection_created({peer_addr, Value}) ->
+    {peer_addr, addr(Value)};
 format_connection_created({port, Value}) ->
     {port, port(Value)};
 format_connection_created({peer_port, Value}) ->
@@ -191,10 +194,10 @@ print(Val) ->
 %% TODO - can we remove all these "unknown" cases? Coverage never hits them.
 
 ip(unknown) -> unknown;
-ip(IP)      -> list_to_binary(rabbit_misc:ntoa(IP)).
+ip(IP)      -> rabbit_data_coercion:to_utf8_binary(rabbit_misc:ntoa(IP)).
 
 ipb(unknown) -> unknown;
-ipb(IP)      -> list_to_binary(rabbit_misc:ntoab(IP)).
+ipb(IP)      -> iolist_to_binary(rabbit_misc:ntoab(IP)).
 
 addr(S)    when is_list(S); is_atom(S); is_binary(S) -> print("~ts", S);
 addr(Addr) when is_tuple(Addr)                       -> ip(Addr).
@@ -257,9 +260,9 @@ policy(Policy) -> [{policy, Policy}].
 
 internal_user(User) ->
     [{name,              internal_user:get_username(User)},
-     {password_hash,     base64:encode(internal_user:get_password_hash(User))},
      {hashing_algorithm, rabbit_auth_backend_internal:hashing_module_for_user(
                              User)},
+     {has_password,      byte_size(internal_user:get_password_hash(User)) > 0},
      {tags,              tags_as_binaries(internal_user:get_tags(User))},
      {limits,            internal_user:get_limits(User)}].
 
@@ -338,6 +341,15 @@ format_socket_opts([{certs_keys, CertsKeys} | Tail], Acc) when is_list(CertsKeys
     CertsKeysMsg = rabbit_data_coercion:to_utf8_binary(
         io_lib:format("(~b certs_keys entries)", [length(CertsKeys)])),
     format_socket_opts(Tail, [{certs_keys, CertsKeysMsg} | Acc]);
+%% hide sensitive information
+format_socket_opts([{cert, _Value} | Tail], Acc) ->
+    format_socket_opts(Tail, [{cert, '...'} | Acc]);
+format_socket_opts([{key, _Value} | Tail], Acc) ->
+    format_socket_opts(Tail, [{key, '...'} | Acc]);
+format_socket_opts([{password, _Value} | Tail], Acc) ->
+    format_socket_opts(Tail, [{password, '...'} | Acc]);
+format_socket_opts([{stateless_tickets_seed, _Value} | Tail], Acc) ->
+    format_socket_opts(Tail, [{stateless_tickets_seed, '...'} | Acc]);
 %% we do not report SNI host details in the UI,
 %% so skip this option and avoid some recursive formatting
 %% complexity
@@ -611,6 +623,28 @@ clean_channel_details(Obj) ->
 format_channel_details([]) -> #{};
 format_channel_details(Any) -> Any.
 
+-spec clean_connection_details(proplists:proplist()) -> proplists:proplist().
+clean_connection_details(Obj) ->
+    case pget(connection_details, Obj) of
+        undefined -> Obj;
+        Cnd ->
+            pset(connection_details, format_connection_details(Cnd), Obj)
+    end.
+
+format_connection_details([]) -> #{};
+format_connection_details(Any) -> Any.
+
+-spec clean_owner_pid_details(proplists:proplist()) -> proplists:proplist().
+clean_owner_pid_details(Obj) ->
+    case pget(owner_pid_details, Obj) of
+        undefined -> Obj;
+        Opd ->
+            pset(owner_pid_details, format_owner_pid_details(Opd), Obj)
+    end.
+
+format_owner_pid_details([]) -> #{};
+format_owner_pid_details(Any) -> Any.
+
 -spec format_consumer_arguments(proplists:proplist()) -> proplists:proplist().
 format_consumer_arguments(Obj) ->
     %% Make sure arguments is a map and not an empty list
@@ -638,3 +672,31 @@ parse_bool(V)           -> throw({error, {not_boolean, V}}).
 
 args_hash(Args) ->
     list_to_binary(rabbit_misc:base64url(<<(erlang:phash2(Args, 1 bsl 32)):32>>)).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+listener_redacts_ssl_opts_secrets_test() ->
+    Listener = #listener{node = node(), protocol = 'https',
+                         ip_address = {0,0,0,0}, port = 15671,
+                         opts = [{ssl_opts, [{verify, verify_peer},
+                                             {password, "hunter2"},
+                                             {key, {'RSAPrivateKey', <<1, 2, 3>>}},
+                                             {cert, <<4, 5, 6>>},
+                                             {sni_hosts, [{"other.example.com",
+                                                           [{key, {'RSAPrivateKey', <<1, 2, 3>>}}]}]},
+                                             {stateless_tickets_seed, <<10, 11, 12>>},
+                                             {verify_fun, {fun(_,_,_) -> {valid, ok} end,
+                                                           <<"secretstate">>}},
+                                             {user_lookup_fun, {fun(_,_,_) -> ok end,
+                                                               #{<<"client1">> => <<"supersecretpsk">>}}}]}]},
+    Formatted = listener(Listener),
+    {socket_opts, SocketOpts} = lists:keyfind(socket_opts, 1, Formatted),
+    {ssl_opts, SslOpts} = lists:keyfind(ssl_opts, 1, SocketOpts),
+    ?assertEqual(verify_peer, proplists:get_value(verify, SslOpts)),
+    [?assertEqual('...', proplists:get_value(K, SslOpts))
+     || K <- [password, key, cert, stateless_tickets_seed]],
+    [?assertEqual(undefined, proplists:get_value(K, SslOpts))
+     || K <- [sni_hosts, verify_fun, user_lookup_fun]].
+
+-endif.

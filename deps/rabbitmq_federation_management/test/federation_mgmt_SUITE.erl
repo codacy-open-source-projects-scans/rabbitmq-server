@@ -23,7 +23,8 @@ groups() ->
                                federation_links,
                                federation_down_links,
                                restart_link,
-                               restart_link_requires_policymaker
+                               restart_link_requires_policymaker,
+                               restart_link_unknown_node
                               ]}
     ].
 
@@ -100,7 +101,10 @@ federation_links(Config) ->
                                   maps:get(upstream, Link),
                                   maps:get(status, Link)} || Link <- AllLinks],
                        Verify(Result)
-               end).
+               end),
+
+    http_get(Config, "/federation-links?lengths_age=60&lengths_incr=1", ?OK),
+    http_get(Config, "/federation-links?lengths_age=6000&lengths_incr=1", ?BAD_REQUEST).
 
 federation_down_links(Config) ->
     DefaultExchanges = [<<"amq.direct">>, <<"amq.fanout">>, <<"amq.headers">>,
@@ -175,6 +179,11 @@ restart_link_requires_policymaker(Config) ->
         http_delete(Config, "/users/mon"),
         http_delete(Config, "/users/policy")
     end.
+
+restart_link_unknown_node(Config) ->
+    http_delete(Config,
+                "/federation-links/vhost/%2f/no-such-link/no-such-node@no-such-host/restart",
+                "guest", "guest", ?NOT_FOUND).
 
 %% -------------------------------------------------------------------
 %% Helpers

@@ -59,7 +59,7 @@
 -export([collect_info_all/2]).
 
 -export([is_policy_applicable/2, declare_args/0, consume_args/0]).
--export([is_server_named_allowed/1]).
+-export([is_server_named_allowed/1, server_named_queue_prefix/1]).
 
 -export([check_max_age/1]).
 -export([get_queue_type/1, get_queue_type/2, get_resource_vhost_name/1, get_resource_name/1]).
@@ -265,6 +265,8 @@ get_queue_type(Args, DefaultQueueType) ->
             rabbit_queue_type:discover(DefaultQueueType);
         {longstr, <<"undefined">>} ->
             rabbit_queue_type:discover(DefaultQueueType);
+        {longstr, <<>>} ->
+            rabbit_queue_type:discover(DefaultQueueType);
         {_, V} ->
             rabbit_queue_type:discover(V)
     end.
@@ -361,6 +363,19 @@ is_policy_applicable(QName, Policy) ->
 is_server_named_allowed(Args) ->
     Type = get_queue_type(Args),
     rabbit_queue_type:is_server_named_allowed(Type).
+
+-spec server_named_queue_prefix(rabbit_framing:amqp_table()) ->
+    {ok, binary()} | {error, {prefix_too_long, binary()}}.
+server_named_queue_prefix(Args) ->
+    case rabbit_misc:table_lookup(Args, <<"x-name-prefix">>) of
+        {longstr, Prefix} when Prefix =/= <<>> ->
+            case byte_size(Prefix) =< 64 of
+                true  -> {ok, Prefix};
+                false -> {error, {prefix_too_long, Prefix}}
+            end;
+        _ ->
+            {ok, <<"amq.gen">>}
+    end.
 
 -spec lookup(QueueName) -> Ret when
       QueueName :: name(),
@@ -478,7 +493,7 @@ get_resource_vhost_name(#resource{virtual_host = VHostName}) ->
     VHostName.
 
 is_match(Subj, RegEx) ->
-   nomatch /= re:run(Subj, RegEx).
+   rabbit_re:matches(Subj, RegEx).
 
 iterative_rebalance(ByNode, MaxQueuesDesired) ->
     case maybe_migrate(ByNode, MaxQueuesDesired) of
@@ -631,8 +646,32 @@ retry_wait(Q, F, E, RetriesLeft) ->
         false ->
             ok % Expected result
     end,
-    timer:sleep(30),
-    with(Name, F, E, RetriesLeft - 1).
+    case can_pid_be_alive(Q) of
+        true ->
+            timer:sleep(30),
+            with(Name, F, E, RetriesLeft - 1);
+        false ->
+            E({absent, Q, timeout})
+    end.
+
+-spec can_pid_be_alive(amqqueue:amqqueue()) -> boolean().
+%% Determines whether a CQ's stored pid can be from another
+%% incarnation (run) of this node or remote.
+%%
+%% This allows us to avoid waiting for the pid to respond
+%% without reducing timeouts.
+can_pid_be_alive(Q) when ?amqqueue_is_classic(Q) ->
+    QPid = amqqueue:get_pid(Q),
+    Node = node(QPid),
+    case Node =:= node() of
+        true ->
+            rabbit_pid_codec:is_pid_from_this_node_incarnation(QPid);
+        false ->
+            Members = rabbit_nodes:list_members(),
+            Members =:= [] orelse lists:member(Node, Members)
+    end;
+can_pid_be_alive(_Q) ->
+    true.
 
 -spec with(name(), qfun(A)) ->
           A | rabbit_types:error(not_found_or_absent()).
@@ -768,6 +807,7 @@ augment_declare_args(VHost, Durable, Exclusive, AutoDelete, Args0) ->
         #{default_queue_type := DefaultQueueType}
           when is_binary(DefaultQueueType) andalso
                DefaultQueueType =/= <<"undefined">> andalso
+               DefaultQueueType =/= <<>> andalso
                not HasQTypeArg ->
             update_args_table_with_queue_type(DefaultQueueType, Durable, Exclusive, AutoDelete, Args0);
         _ ->
@@ -865,12 +905,28 @@ with_exclusive_access_or_die(Name, ReaderPid, F) ->
                         F(Q)
                 end).
 
-assert_args_equivalence(Q, NewArgs) ->
-    ExistingArgs = amqqueue:get_arguments(Q),
+assert_args_equivalence(Q, NewArgs0) ->
+    ExistingArgs = normalize_max_age(amqqueue:get_arguments(Q)),
+    NewArgs = normalize_max_age(NewArgs0),
     QueueName = amqqueue:get_name(Q),
     Type = amqqueue:get_type(Q),
     QueueTypeArgs = rabbit_queue_type:arguments(queue_arguments, Type),
     rabbit_misc:assert_args_equivalence(ExistingArgs, NewArgs, QueueName, QueueTypeArgs).
+
+%% Stream 'x-max-age' values can be equivalent in ms but different strings (e.g. "1D" vs "24h").
+%% Equivalence checks really should be performed on millisecond values, not the client-provided
+%% strings.
+normalize_max_age(Args) ->
+    case rabbit_misc:table_lookup(Args, <<"x-max-age">>) of
+        {longstr, Val} ->
+            case check_max_age(Val) of
+                {error, _} -> Args;
+                Ms when is_integer(Ms) ->
+                    rabbit_misc:set_table_value(Args, <<"x-max-age">>, longstr, integer_to_binary(Ms))
+            end;
+        _ ->
+            Args
+    end.
 
 -spec maybe_inject_default_queue_type_shortcut_into_args(
     rabbit_framing:amqp_table(), rabbit_queue_type:queue_type()) -> rabbit_framing:amqp_table().
@@ -883,6 +939,8 @@ maybe_inject_default_queue_type_shortcut_into_args(Args0, DefaultQueueType) ->
             inject_default_queue_type_shortcut_into_args(Args0, DefaultQueueType);
         {longstr, <<"undefined">>} ->
             %% Important: use a shortcut such as 'quorum' or 'stream' that for the given queue type module
+            inject_default_queue_type_shortcut_into_args(Args0, DefaultQueueType);
+        {longstr, <<>>} ->
             inject_default_queue_type_shortcut_into_args(Args0, DefaultQueueType);
         _ValueIsAlreadySet ->
             Args0
@@ -956,15 +1014,20 @@ declare_args() ->
      {<<"x-overflow">>, fun check_overflow/2},
      {<<"x-queue-version">>, fun check_queue_version/2},
      {<<"x-single-active-consumer">>, fun check_single_active_consumer_arg/2},
+     {<<"x-consumer-timeout">>, fun check_non_neg_int_arg/2},
+     {<<"x-consumer-disconnected-timeout">>, fun check_non_neg_int_arg/2},
      {<<"x-queue-type">>, fun check_queue_type/2},
      {<<"x-quorum-initial-group-size">>, fun check_initial_cluster_size_arg/2},
      {<<"x-max-age">>, fun check_max_age_arg/2},
      {<<"x-stream-max-segment-size-bytes">>, fun check_non_neg_int_arg/2},
      {<<"x-stream-filter-size-bytes">>, fun check_non_neg_int_arg/2},
+     {<<"x-stream-initial-offset">>, fun check_non_neg_int_arg/2},
      {<<"x-initial-cluster-size">>, fun check_initial_cluster_size_arg/2},
-     {<<"x-queue-leader-locator">>, fun check_queue_leader_locator_arg/2}].
+     {<<"x-queue-leader-locator">>, fun check_queue_leader_locator_arg/2},
+     {<<"x-member-placement-tag">>, fun check_member_placement_tag_arg/2}].
 
 consume_args() -> [{<<"x-priority">>,              fun check_int_arg/2},
+                   {<<"x-consumer-timeout">>,      fun check_non_neg_int_arg/2},
                    {<<"x-stream-offset">>, fun check_stream_offset_arg/2}].
 
 check_int_arg({Type, _}, _) ->
@@ -1062,14 +1125,13 @@ check_max_age_arg({Type,    _}, _Args) ->
     {error, {unacceptable_type, Type}}.
 
 check_max_age(MaxAge) ->
-    case re:run(MaxAge, "(^[0-9]*)(.*)", [{capture, all_but_first, list}]) of
+    case re:run(MaxAge, "(^[0-9]+)(.*)", [{capture, all_but_first, list}]) of
         {match, [Value, Unit]} ->
             case list_to_integer(Value) of
                 I when I > 0 ->
                     case lists:member(Unit, ["Y", "M", "D", "h", "m", "s"]) of
                         true ->
-                            Int = list_to_integer(Value),
-                            Int * unit_value_in_ms(Unit);
+                            I * unit_value_in_ms(Unit);
                         false ->
                             {error, invalid_max_age}
                     end;
@@ -1161,6 +1223,17 @@ check_queue_leader_locator_arg(Val, _Args) when is_binary(Val) ->
     end;
 check_queue_leader_locator_arg(_Val, _Args) ->
     {error, invalid_queue_locator_arg}.
+
+check_member_placement_tag_arg({longstr, Val}, _Args) when byte_size(Val) > 0 ->
+    ok;
+check_member_placement_tag_arg({longstr, _}, _Args) ->
+    {error, invalid_member_placement_tag_arg};
+check_member_placement_tag_arg({Type, _}, _Args) ->
+    {error, {unacceptable_type, Type}};
+check_member_placement_tag_arg(Val, _Args) when is_binary(Val) andalso byte_size(Val) > 0 ->
+    ok;
+check_member_placement_tag_arg(_Val, _Args) ->
+    {error, invalid_member_placement_tag_arg}.
 
 check_stream_offset_arg(Val, _Args) ->
     case rabbit_stream_queue:parse_offset_arg(Val) of
@@ -1587,19 +1660,9 @@ consumers(Q) when ?amqqueue_is_classic(Q) ->
     end;
 consumers(Q) when ?amqqueue_is_quorum(Q) ->
     QPid = amqqueue:get_pid(Q),
-    case ra:local_query(QPid, fun rabbit_fifo:query_consumers/1) of
+    case rabbit_fifo_client:local_query(QPid, query_consumers) of
         {ok, {_, Result}, _} ->
             maps:values(Result);
-        {error, _} ->
-            %% try a prior module in case we're in mixed versions
-            %% TODO: hack, replace this with something that can actually
-            %% resolve the correct module to use
-            case ra:local_query(QPid, fun rabbit_fifo_v7:query_consumers/1) of
-                {ok, {_, Result}, _} ->
-                    maps:values(Result);
-                _  ->
-                    []
-            end;
         _ ->
             []
     end;
@@ -1607,6 +1670,10 @@ consumers(Q) when ?amqqueue_is_stream(Q) ->
     %% TODO how??? they only exist on the channel
     %% we could list the offset listener on the writer but we don't even have a consumer tag,
     %% only a (channel) pid and offset
+    [];
+consumers(Q) when ?amqqueue_is_mqtt_qos0(Q) ->
+    %% MQTT QoS 0 queues deliver directly to the connection process and
+    %% don't track consumers the way other queue types do.
     [].
 
 -spec consumer_info_keys() -> rabbit_types:info_keys().
@@ -1828,7 +1895,7 @@ basic_get(Q, NoAck, LimiterPid, CTag, QStates) ->
     rabbit_queue_type:dequeue(Q, NoAck, LimiterPid, CTag, QStates).
 
 
--spec basic_consume(amqqueue:amqqueue(), boolean(), pid(), pid(), boolean(),
+-spec basic_consume(amqqueue:amqqueue(), boolean(), pid(), pid() | 'none', boolean(),
                     non_neg_integer(), rabbit_types:ctag(), boolean(),
                     rabbit_framing:amqp_table(), any(), rabbit_types:username(),
                     rabbit_queue_type:state()) ->

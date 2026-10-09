@@ -3152,6 +3152,41 @@ purge_nodes_test(Config) ->
                  rabbit_fifo:tick(1, State)),
     ok.
 
+ingress_only_node_purge_test(Config) ->
+    %% A node that only ever published, and whose enqueuer has since gone
+    %% down for good (as opposed to merely being disconnected), no longer
+    %% appears in consumers/enqueuers/waiting_consumers. all_nodes/1 must
+    %% still surface it via ingress_bytes_by_node, otherwise it can never
+    %% be detected as stale and its entry there leaks forever.
+    Node = ingress_only@node,
+    EnqPid = test_util:fake_pid(Node),
+
+    State0 = init(#{name => ?FUNCTION_NAME,
+                    queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+                    single_active_consumer_on => false}),
+    {State1, _, _} = apply(meta(Config, 1, ?LINE, {notify, 1, EnqPid}),
+                           rabbit_fifo:make_enqueue(EnqPid, 1, msg1),
+                           State0),
+    %% the enqueuer's process is gone for good, not just network-partitioned
+    {State2, _, _} = apply(meta(Config, ?LINE), {down, EnqPid, noproc},
+                           State1),
+    ?assertMatch(#rabbit_fifo{enqueuers = Enqs} when map_size(Enqs) == 0,
+                 State2),
+    ?assertMatch(#{Node := _}, State2#rabbit_fifo.ingress_bytes_by_node),
+
+    %% no live consumer/enqueuer/waiting entry is left anywhere in the
+    %% state, yet the node must still surface via ingress_bytes_by_node
+    ?assertMatch([{aux, {handle_tick, [#resource{}, _Metrics, [Node]]}}],
+                 rabbit_fifo:tick(1, State2)),
+
+    {State, _, _} = apply(meta(Config, ?LINE),
+                          rabbit_fifo:make_purge_nodes([Node]),
+                          State2),
+    ?assertNot(maps:is_key(Node, State#rabbit_fifo.ingress_bytes_by_node)),
+    ?assertMatch([{aux, {handle_tick, [#resource{}, _Metrics, []]}}],
+                 rabbit_fifo:tick(1, State)),
+    ok.
+
 meta(Config, Idx) ->
     meta(Config, Idx, 0).
 
@@ -3560,6 +3595,48 @@ delayed_retry_explicit_overrides_config_test(Config) ->
                    next_delayed_at := 9999}, rabbit_fifo:overview(State3)),
     ok.
 
+delivery_time_on_enqueue_test(Config) ->
+    %% A message enqueued with a `dt` annotation (set by rabbit_quorum_queue
+    %% when a client provides x-opt-delivery-time in the future) should be
+    %% delayed on its very first delivery, not just on redelivery/return.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Msg = mc:set_annotation(dt, 5000, mk_mc(<<"m1">>)),
+    {State1, _} = enq_ts(Config, 1, 1, Msg, 100, State0),
+    ?assertMatch(#{num_ready_messages := 0,
+                   num_delayed_messages := 1,
+                   next_delayed_at := 5000}, rabbit_fifo:overview(State1)),
+    ok.
+
+delivery_time_on_enqueue_past_test(Config) ->
+    %% A `dt` annotation that has already elapsed by enqueue time should not
+    %% delay the message - it should be ready for delivery straight away.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Msg = mc:set_annotation(dt, 50, mk_mc(<<"m1">>)),
+    {State1, _} = enq_ts(Config, 1, 1, Msg, 100, State0),
+    ?assertMatch(#{num_ready_messages := 1,
+                   num_delayed_messages := 0}, rabbit_fifo:overview(State1)),
+    ok.
+
+delivery_time_on_untracked_enqueue_test(Config) ->
+    %% Untracked enqueues (used for stateless deliveries such as
+    %% at-most-once dead-lettering) must also honour a future `dt`
+    %% annotation instead of enqueueing straight into the ready queue.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Msg = mc:set_annotation(dt, 5000, mk_mc(<<"m1">>)),
+    {State1, _, _} = apply(meta(Config, 1, 100),
+                           rabbit_fifo:make_enqueue(undefined, undefined, Msg),
+                           State0),
+    ?assertMatch(#{num_ready_messages := 0,
+                   num_delayed_messages := 1,
+                   next_delayed_at := 5000}, rabbit_fifo:overview(State1)),
+    ok.
+
 delayed_retry_counts_towards_limit_test(Config) ->
     %% Delayed messages should count towards max_length limit.
     %% The limit check uses messages_ready + delayed (not checked_out).
@@ -3590,6 +3667,140 @@ delayed_retry_counts_towards_limit_test(Config) ->
     {State6, _} = enq(Config, 6, 3, msg3, State5),
     %% Total should still be 2 (one ready message was dropped)
     ?assertEqual(2, rabbit_fifo:query_messages_total(State6)),
+    ok.
+
+max_length_drops_delayed_when_nothing_ready_test(Config) ->
+    %% Delayed messages count towards max_length but cannot be reached by
+    %% take_next_msg, so an overshoot made up entirely of delayed messages
+    %% used to leave drop_head with nothing to drop and evaluate_limit0
+    %% looping forever inside apply/3.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+             max_length => 1,
+             overflow_strategy => drop_head},
+    State0 = init(Conf),
+    Msg1 = mc:set_annotation(dt, 5000, mk_mc(<<"m1">>)),
+    Msg2 = mc:set_annotation(dt, 6000, mk_mc(<<"m2">>)),
+    {State1, _} = enq_ts(Config, 1, 1, Msg1, 100, State0),
+    ?assertMatch(#{num_ready_messages := 0,
+                   num_delayed_messages := 1}, rabbit_fifo:overview(State1)),
+    %% 2 delayed > max_length 1, and there is nothing ready to drop
+    {State2, _} = enq_ts(Config, 2, 2, Msg2, 100, State1),
+    ?assertMatch(#{num_ready_messages := 0,
+                   num_delayed_messages := 1}, rabbit_fifo:overview(State2)),
+    ?assertEqual(1, rabbit_fifo:query_messages_total(State2)),
+    ok.
+
+max_length_prefers_ready_over_delayed_test(Config) ->
+    %% Ready messages remain the preferred drop_head victims: the delayed
+    %% tree is only touched once there is nothing ready or returned left.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+             max_length => 3,
+             overflow_strategy => drop_head},
+    State0 = init(Conf),
+    Delayed = mc:set_annotation(dt, 5000, mk_mc(<<"delayed">>)),
+    {State1, _} = enq_ts(Config, 1, 1, Delayed, 100, State0),
+    {State2, _} = enq_ts(Config, 2, 2, mk_mc(<<"r1">>), 100, State1),
+    {State3, _} = enq_ts(Config, 3, 3, mk_mc(<<"r2">>), 100, State2),
+    %% at the limit, nothing dropped yet
+    ?assertMatch(#{num_ready_messages := 2,
+                   num_delayed_messages := 1}, rabbit_fifo:overview(State3)),
+    %% over the limit: a ready message goes, the delayed one stays
+    {State4, _} = enq_ts(Config, 4, 4, mk_mc(<<"r3">>), 100, State3),
+    ?assertMatch(#{num_ready_messages := 2,
+                   num_delayed_messages := 1}, rabbit_fifo:overview(State4)),
+    ?assertEqual(3, rabbit_fifo:query_messages_total(State4)),
+    ok.
+
+max_length_drops_soonest_delayed_first_test(Config) ->
+    %% Among delayed messages the one with the soonest delivery time is
+    %% dropped first.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+             max_length => 2,
+             overflow_strategy => drop_head},
+    State0 = init(Conf),
+    {State1, _} = enq_ts(Config, 1, 1,
+                         mc:set_annotation(dt, 1000, mk_mc(<<"soon">>)),
+                         100, State0),
+    {State2, _} = enq_ts(Config, 2, 2,
+                         mc:set_annotation(dt, 10000, mk_mc(<<"later">>)),
+                         100, State1),
+    ?assertMatch(#{num_delayed_messages := 2,
+                   next_delayed_at := 1000}, rabbit_fifo:overview(State2)),
+    {State3, _} = enq_ts(Config, 3, 3,
+                         mc:set_annotation(dt, 3600000, mk_mc(<<"far">>)),
+                         100, State2),
+    ?assertMatch(#{num_ready_messages := 0,
+                   num_delayed_messages := 2,
+                   next_delayed_at := 10000}, rabbit_fifo:overview(State3)),
+    ok.
+
+max_length_delayed_drop_accounting_test(Config) ->
+    %% A delayed message dropped for max_length is accounted for exactly as
+    %% a ready one: it leaves messages_total and the enqueue byte count, and
+    %% it is dead lettered with reason maxlen.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+             max_length => 1,
+             overflow_strategy => drop_head,
+             dead_letter_handler => undefined},
+    State0 = init(Conf),
+    {State1, _} = enq_ts(Config, 1, 1,
+                         mc:set_annotation(dt, 5000, mk_mc(<<"m1">>)),
+                         100, State0),
+    #{enqueue_message_bytes := Bytes1} = rabbit_fifo:overview(State1),
+    {State2, _, Effects} =
+        apply(meta(Config, 2, 100, {notify, 2, self()}),
+              rabbit_fifo:make_enqueue(
+                self(), 2, mc:set_annotation(dt, 6000, mk_mc(<<"m2">>))),
+              State1),
+    ?assertEqual(1, rabbit_fifo:query_messages_total(State2)),
+    #{enqueue_message_bytes := Bytes2} = rabbit_fifo:overview(State2),
+    ?assertEqual(Bytes1, Bytes2),
+    ?ASSERT_EFF({mod_call, rabbit_global_counters, messages_dead_lettered,
+                 [maxlen, rabbit_quorum_queue, disabled, 1]}, Effects),
+    ok.
+
+max_length_delayed_drop_removes_deferral_token_test(Config) ->
+    %% Dropping a parked message for max_length must take its deferral token
+    %% with it, otherwise a later claim resolves a token whose message is
+    %% gone.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+             max_length => 1,
+             overflow_strategy => drop_head},
+    State0 = init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {State1, _} = enq_ts(Config, 1, 1, mk_mc(<<"m1">>), 100, State0),
+    {State2, #{key := CKey, next_msg_id := MsgId}, _} =
+        checkout_ts(Config, 2, 100, Cid, {auto, {simple_prefetch, 2}}, State1),
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    {State3, _, _} = apply(meta(Config, 3, 100),
+                           rabbit_fifo:make_modify(CKey, [MsgId], false, false,
+                                                   Anns),
+                           State2),
+    ?assertMatch(#{num_delayed_messages := 1}, rabbit_fifo:overview(State3)),
+    %% push over the limit with a second delayed message so the parked one
+    %% is dropped
+    {State4, _} = enq_ts(Config, 4, 2,
+                         mc:set_annotation(dt, 20000, mk_mc(<<"m2">>)),
+                         100, State3),
+    ?assertMatch(#{num_delayed_messages := 1,
+                   next_delayed_at := 20000}, rabbit_fifo:overview(State4)),
+    %% the token no longer resolves to anything
+    {State5, ok, _} = apply(meta(Config, 5, 100),
+                            rabbit_fifo:make_delayed(
+                              {assign_deferred, CKey, [Token]}),
+                            State4),
+    ?assertMatch(#{num_checked_out := 0,
+                   num_delayed_messages := 1}, rabbit_fifo:overview(State5)),
+    ?assertMatch(#rabbit_fifo{consumers = #{CKey := #consumer{
+                                                      deferred_claims = #{}}}},
+                 State5),
     ok.
 
 delayed_retry_all_command_test(Config) ->
@@ -3692,10 +3903,10 @@ delayed_retry_empty_command_test(Config) ->
     ok.
 
 delayed_assign_deferred_test(Config) ->
-    %% Test assigning deferred messages by token to a specific consumer
+    %% Test claiming a deferred message by token for a specific consumer.
+    %% A deferral token only parks a message when x-opt-delivery-time is also set.
     Conf = #{name => ?FUNCTION_NAME,
-             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
-             delayed_retry => {all, 10000, 10000}},
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
     State0 = init(Conf),
     Cid = {?FUNCTION_NAME_B, self()},
     %% Enqueue a message
@@ -3703,57 +3914,369 @@ delayed_assign_deferred_test(Config) ->
     %% Checkout the message
     {State2, #{key := CKey, next_msg_id := MsgId}, _} =
         checkout_ts(Config, 2, 100, Cid, {auto, {simple_prefetch, 2}}, State1),
-    %% Return with deferral token via modify
+    %% Return with deferral token and explicit delivery time via modify
     Token1 = <<"token-1">>,
-    Anns = #{<<"x-opt-deferral-token">> => Token1},
+    Anns = #{<<"x-opt-deferral-token">> => Token1,
+             <<"x-opt-delivery-time">> => 10000},
     Modify = rabbit_fifo:make_modify(CKey, [MsgId], false, false, Anns),
     {State3, _, _} = apply(meta(Config, 3, 100), Modify, State2),
     ?assertMatch(#{num_delayed_messages := 1,
                    num_checked_out := 0}, rabbit_fifo:overview(State3)),
-    %% Assign the deferred message back to the consumer
+    %% Claim the deferred message. The consumer has credit, so the claim is
+    %% drained straight away.
     Cmd = rabbit_fifo:make_delayed({assign_deferred, CKey, [Token1]}),
-    {State4, {ok, 1}, _} = apply(meta(Config, 4, 100), Cmd, State3),
+    {State4, ok, _} = apply(meta(Config, 4, 100), Cmd, State3),
     ?assertMatch(#{num_delayed_messages := 0,
                    num_checked_out := 1}, rabbit_fifo:overview(State4)),
+    ?assertMatch(#rabbit_fifo{consumers = #{CKey := #consumer{
+                                                      deferred_claims = #{}}}},
+                 State4),
     ok.
 
-delayed_assign_deferred_insufficient_credit_test(Config) ->
-    %% Test that assign_deferred fails when consumer has insufficient credit
+delayed_assign_deferred_multiple_messages_test(Config) ->
+    %% A single deferral token may address more than one message,
+    %% e.g. as a result of a ranged DISPOSITION (first =/= last) settling
+    %% several deliveries with the same MODIFIED annotations.
     Conf = #{name => ?FUNCTION_NAME,
-             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
-             delayed_retry => {all, 10000, 10000}},
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
     State0 = init(Conf),
     Cid = {?FUNCTION_NAME_B, self()},
-    %% Enqueue 2 messages
+    %% Enqueue 2 messages.
     {State1, _} = enq(Config, 1, 1, msg1, State0),
     {State2, _} = enq(Config, 2, 2, msg2, State1),
-    %% Checkout both messages with prefetch 2
+    %% Checkout both messages with prefetch 2.
     {State3, #{key := CKey, next_msg_id := MsgId}, _} =
         checkout_ts(Config, 3, 100, Cid, {auto, {simple_prefetch, 2}}, State2),
-    %% Return both with deferral tokens
-    Token1 = <<"token-1">>,
-    Token2 = <<"token-2">>,
-    Anns1 = #{<<"x-opt-deferral-token">> => Token1},
-    Anns2 = #{<<"x-opt-deferral-token">> => Token2},
-    Mod1 = rabbit_fifo:make_modify(CKey, [MsgId], false, false, Anns1),
-    {State4, _, _} = apply(meta(Config, 4, 100), Mod1, State3),
-    Mod2 = rabbit_fifo:make_modify(CKey, [MsgId+1], false, false, Anns2),
-    {State5, _, _} = apply(meta(Config, 5, 100), Mod2, State4),
+    %% Return both in a single modify command under the same token, as a
+    %% ranged DISPOSITION would.
+    Token = <<"token-shared">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    Modify = rabbit_fifo:make_modify(CKey, [MsgId, MsgId + 1], false, false, Anns),
+    {State4, _, _} = apply(meta(Config, 4, 100), Modify, State3),
     ?assertMatch(#{num_delayed_messages := 2,
-                   num_checked_out := 0}, rabbit_fifo:overview(State5)),
-    %% Consumer has credit 2 (returned), try to assign both - should succeed
-    Tokens = [Token1, Token2],
-    Cmd = rabbit_fifo:make_delayed({assign_deferred, CKey, Tokens}),
-    {State6, {ok, 2}, _} = apply(meta(Config, 6, 100), Cmd, State5),
+                   num_checked_out := 0}, rabbit_fifo:overview(State4)),
+    %% Claiming the shared token returns both messages.
+    Cmd = rabbit_fifo:make_delayed({assign_deferred, CKey, [Token]}),
+    {State5, ok, _} = apply(meta(Config, 5, 100), Cmd, State4),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_checked_out := 2}, rabbit_fifo:overview(State5)),
+    %% The token is now fully consumed: claiming it again finds nothing.
+    Cmd2 = rabbit_fifo:make_delayed({assign_deferred, CKey, [Token]}),
+    {State6, ok, _} = apply(meta(Config, 6, 100), Cmd2, State5),
     ?assertMatch(#{num_delayed_messages := 0,
                    num_checked_out := 2}, rabbit_fifo:overview(State6)),
     ok.
 
-delayed_assign_deferred_not_found_test(Config) ->
-    %% Test that assign_deferred returns partial when some tokens not found
+delayed_assign_deferred_insufficient_credit_test(Config) ->
+    %% Claiming does not depend on link credit: the messages stay parked and
+    %% claimed until enough credit arrives, over as many credit top-ups as it
+    %% takes, and the client does not have to submit the token again.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, _} = enq(Config, 2, 2, msg2, State1),
+    %% A credited consumer never replenishes its own credit, so the test
+    %% controls exactly how much is available.
+    {State3, #{key := CKey}, _} =
+        checkout_ts(Config, 3, 100, Cid, {auto, {credited, 0}}, State2),
+    {State4, _} = credit(Config, CKey, 4, 2, 0, false, State3),
+    ?assertMatch(#{num_checked_out := 2}, rabbit_fifo:overview(State4)),
+    %% Park both under one token.
+    Token = <<"token-shared">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    Modify = rabbit_fifo:make_modify(CKey, [0, 1], false, false, Anns),
+    {State5, _, _} = apply(meta(Config, 5, 100), Modify, State4),
+    ?assertMatch(#{num_delayed_messages := 2,
+                   num_checked_out := 0}, rabbit_fifo:overview(State5)),
+    %% Claim with no credit at all: nothing is delivered, both stay parked.
+    Cmd = rabbit_fifo:make_delayed({assign_deferred, CKey, [Token]}),
+    {State6, ok, _} = apply(meta(Config, 6, 100), Cmd, State5),
+    ?assertMatch(#{num_delayed_messages := 2,
+                   num_checked_out := 0}, rabbit_fifo:overview(State6)),
+    ?assertMatch(#rabbit_fifo{consumers =
+                              #{CKey := #consumer{
+                                           deferred_claims = #{Token := [_, _]}}}},
+                 State6),
+    %% One credit delivers one of them, the other stays parked and claimed.
+    {State7, _} = credit(Config, CKey, 7, 1, 2, false, State6),
+    ?assertMatch(#{num_delayed_messages := 1,
+                   num_checked_out := 1}, rabbit_fifo:overview(State7)),
+    ?assertMatch(#rabbit_fifo{consumers =
+                              #{CKey := #consumer{
+                                           deferred_claims = #{Token := [_]}}}},
+                 State7),
+    %% More credit drains the rest without the token being submitted again.
+    {State8, _} = credit(Config, CKey, 8, 1, 3, false, State7),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_checked_out := 2}, rabbit_fifo:overview(State8)),
+    ?assertMatch(#rabbit_fifo{consumers = #{CKey := #consumer{
+                                                      deferred_claims = #{}}}},
+                 State8),
+    ok.
+
+delayed_assign_deferred_released_on_consumer_disconnect_timeout_test(Config) ->
+    %% A competing consumer that claims a token and then never comes back
+    %% (its node partitions and the client reconnects as a different
+    %% consumer instead) must not strand the token on the dead entry: once
+    %% its disconnected timeout returns its other messages, the claim must
+    %% go back to the shared map so another consumer can claim it.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    CPid1 = test_util:fake_pid(n1@banana),
+    Cid1 = {?FUNCTION_NAME_B, CPid1},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, #{key := CKey1, next_msg_id := MsgId}, _} =
+        checkout_ts(Config, 2, 100, Cid1, {auto, {credited, 0}}, State1),
+    {State3, _} = credit(Config, CKey1, 3, 1, 0, false, State2),
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    Modify = rabbit_fifo:make_modify(CKey1, [MsgId], false, false, Anns),
+    {State4, _, _} = apply(meta(Config, 4, 100), Modify, State3),
+    %% consumer 1 has no credit, so the claim just parks on it
+    Cmd1 = rabbit_fifo:make_delayed({assign_deferred, CKey1, [Token]}),
+    {State5, ok, _} = apply(meta(Config, 5, 100), Cmd1, State4),
+    ?assertMatch(#rabbit_fifo{consumers =
+                              #{CKey1 := #consumer{
+                                           deferred_claims = #{Token := [_]}}}},
+                 State5),
+    %% consumer 1's node disconnects, and the disconnected timeout fires
+    {State6, _, _} = apply(meta(Config, 6, 100),
+                           {down, CPid1, noconnection}, State5),
+    {State7, _, _} = apply(meta(Config, 7, 200),
+                           {timeout, {consumer_disconnected_timeout, CKey1}},
+                           State6),
+    ?assertMatch(#rabbit_fifo{consumers = #{CKey1 := #consumer{
+                                                      deferred_claims = #{}}}},
+                 State7),
+    %% a different consumer can now claim the same token
+    CPid2 = test_util:fake_pid(n2@banana),
+    Cid2 = {?FUNCTION_NAME_B, CPid2},
+    {State8, #{key := CKey2}, _} =
+        checkout_ts(Config, 8, 300, Cid2, {auto, {simple_prefetch, 1}}, State7),
+    Cmd2 = rabbit_fifo:make_delayed({assign_deferred, CKey2, [Token]}),
+    {State9, ok, _} = apply(meta(Config, 9, 300), Cmd2, State8),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_checked_out := 1}, rabbit_fifo:overview(State9)),
+    ?assertMatch(#rabbit_fifo{consumers = #{CKey2 := #consumer{
+                                                      deferred_claims = #{}}}},
+                 State9),
+    ok.
+
+delayed_assign_deferred_precedence_test(Config) ->
+    %% A claimed message is delivered ahead of the ready backlog: the credit
+    %% granted alongside a claim must reach the messages the client asked for,
+    %% not whatever else happens to be queued.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, _} = enq(Config, 2, 2, msg2, State1),
+    {State3, #{key := CKey}, _} =
+        checkout_ts(Config, 3, 100, Cid, {auto, {credited, 0}}, State2),
+    %% Take msg1 only, leaving msg2 ready.
+    {State4, _} = credit(Config, CKey, 4, 1, 0, false, State3),
+    ?assertMatch(#{num_checked_out := 1,
+                   num_ready_messages := 1}, rabbit_fifo:overview(State4)),
+    %% Park msg1 under a token.
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    Modify = rabbit_fifo:make_modify(CKey, [0], false, false, Anns),
+    {State5, _, _} = apply(meta(Config, 5, 100), Modify, State4),
+    ?assertMatch(#{num_delayed_messages := 1,
+                   num_ready_messages := 1}, rabbit_fifo:overview(State5)),
+    %% Claim it while there is no credit, then grant exactly one credit.
+    Cmd = rabbit_fifo:make_delayed({assign_deferred, CKey, [Token]}),
+    {State6, ok, _} = apply(meta(Config, 6, 100), Cmd, State5),
+    {State7, _} = credit(Config, CKey, 7, 1, 1, false, State6),
+    %% The parked message went out and msg2 is still waiting its turn.
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_ready_messages := 1,
+                   num_checked_out := 1}, rabbit_fifo:overview(State7)),
+    ok.
+
+delayed_assign_deferred_exclusive_test(Config) ->
+    %% Claiming takes the token out of the shared deferred map, so two
+    %% consumers can never be assigned the same parked message.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    C1 = {<<"ctag-1">>, self()},
+    C2 = {<<"ctag-2">>, self()},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, #{key := CKey1}, _} =
+        checkout_ts(Config, 2, 100, C1, {auto, {credited, 0}}, State1),
+    {State3, _} = credit(Config, CKey1, 3, 1, 0, false, State2),
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    {State4, _, _} = apply(meta(Config, 4, 100),
+                           rabbit_fifo:make_modify(CKey1, [0], false, false, Anns),
+                           State3),
+    %% The first consumer claims the token while it has no credit.
+    {State5, ok, _} = apply(meta(Config, 5, 100),
+                            rabbit_fifo:make_delayed(
+                              {assign_deferred, CKey1, [Token]}),
+                            State4),
+    %% A second, credited consumer claims the very same token.
+    {State6, #{key := CKey2}, _} =
+        checkout_ts(Config, 6, 100, C2, {auto, {credited, 0}}, State5),
+    {State7, _} = credit(Config, CKey2, 7, 1, 0, false, State6),
+    {State8, ok, _} = apply(meta(Config, 8, 100),
+                            rabbit_fifo:make_delayed(
+                              {assign_deferred, CKey2, [Token]}),
+                            State7),
+    %% It gets nothing: the message is still parked, still the first
+    %% consumer's, even though the second one is the one with credit.
+    ?assertMatch(#{num_delayed_messages := 1,
+                   num_checked_out := 0}, rabbit_fifo:overview(State8)),
+    ?assertMatch(#rabbit_fifo{consumers =
+                              #{CKey1 := #consumer{
+                                            deferred_claims = #{Token := [_]}},
+                                CKey2 := #consumer{deferred_claims = #{}}}},
+                 State8),
+    %% Crediting the first consumer delivers it.
+    {State9, _} = credit(Config, CKey1, 9, 1, 1, false, State8),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_checked_out := 1}, rabbit_fifo:overview(State9)),
+    ok.
+
+delayed_assign_deferred_released_on_cancel_test(Config) ->
+    %% A claim is a lease, not a destructive take: when the consumer holding
+    %% it goes away the still-parked messages become claimable again instead
+    %% of being reachable only by their delivery time.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    C1 = {<<"ctag-1">>, self()},
+    C2 = {<<"ctag-2">>, self()},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, #{key := CKey1}, _} =
+        checkout_ts(Config, 2, 100, C1, {auto, {credited, 0}}, State1),
+    {State3, _} = credit(Config, CKey1, 3, 1, 0, false, State2),
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    {State4, _, _} = apply(meta(Config, 4, 100),
+                           rabbit_fifo:make_modify(CKey1, [0], false, false, Anns),
+                           State3),
+    {State5, ok, _} = apply(meta(Config, 5, 100),
+                            rabbit_fifo:make_delayed(
+                              {assign_deferred, CKey1, [Token]}),
+                            State4),
+    %% Cancel the claiming consumer while the message is still parked.
+    {State6, _, _} = apply(meta(Config, 6, 100),
+                           rabbit_fifo:make_checkout(C1, cancel, #{}), State5),
+    ?assertMatch(#{num_delayed_messages := 1}, rabbit_fifo:overview(State6)),
+    %% Another consumer can now claim the same token and receive the message.
+    {State7, #{key := CKey2}, _} =
+        checkout_ts(Config, 7, 100, C2, {auto, {credited, 0}}, State6),
+    {State8, _} = credit(Config, CKey2, 8, 1, 0, false, State7),
+    {State9, ok, _} = apply(meta(Config, 9, 100),
+                            rabbit_fifo:make_delayed(
+                              {assign_deferred, CKey2, [Token]}),
+                            State8),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_checked_out := 1}, rabbit_fifo:overview(State9)),
+    ok.
+
+delayed_assign_deferred_released_on_waiting_consumer_down_test(Config) ->
+    %% A claim held by a waiting (non-active) single-active-consumer backup
+    %% must also be released back to the shared deferred map when that
+    %% consumer's channel goes down, the same as when it's cancelled
+    %% explicitly.
     Conf = #{name => ?FUNCTION_NAME,
              queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
-             delayed_retry => {all, 10000, 10000}},
+             single_active_consumer_on => true},
+    State0 = init(Conf),
+    Pid2 = spawn(fun() -> ok end),
+    C1 = {<<"ctag-1">>, self()},
+    C2 = {<<"ctag-2">>, Pid2},
+    CK1 = ?LINE,
+    CK2 = ?LINE,
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    Entries = [
+               {CK1, make_checkout(C1, {auto, {credited, 0}}, #{})},
+               {CK2, make_checkout(C2, {auto, {credited, 0}}, #{})}
+              ],
+    {State2, _} = run_log(Config, State1, Entries),
+    ?assertMatch(#{single_active_consumer_id := C1,
+                   single_active_num_waiting_consumers := 1},
+                 rabbit_fifo:overview(State2)),
+    %% The active consumer parks the message under a token.
+    {State3, _} = credit(Config, CK1, 3, 1, 0, false, State2),
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    {State4, _, _} = apply(meta(Config, 4, 100),
+                           rabbit_fifo:make_modify(CK1, [0], false, false, Anns),
+                           State3),
+    %% The waiting backup consumer claims it while it's still inactive.
+    {State5, ok, _} = apply(meta(Config, 5, 100),
+                            rabbit_fifo:make_delayed(
+                              {assign_deferred, CK2, [Token]}),
+                            State4),
+    ?assertMatch(#rabbit_fifo{waiting_consumers =
+                              [{CK2, #consumer{
+                                        deferred_claims = #{Token := [_]}}}]},
+                 State5),
+    %% Its channel goes down while it's still waiting, without ever having
+    %% been credited enough to collect the claim.
+    {State6, _, _} = apply(meta(Config, 6, 100), {down, Pid2, noproc}, State5),
+    ?assertMatch(#{single_active_num_waiting_consumers := 0}, rabbit_fifo:overview(State6)),
+    %% The token was released, not lost: it is claimable again.
+    ?assertMatch(#rabbit_fifo{waiting_consumers = [],
+                              delayed = #delayed{deferred = #{Token := [_]}}},
+                 State6),
+    ok.
+
+delayed_assign_deferred_delivery_time_still_fires_test(Config) ->
+    %% A claim does not pin a message: if the client never grants the credit
+    %% to collect it, the delivery time still promotes it into normal
+    %% circulation and the stale claim is dropped.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, #{key := CKey}, _} =
+        checkout_ts(Config, 2, 100, Cid, {auto, {credited, 0}}, State1),
+    {State3, _} = credit(Config, CKey, 3, 1, 0, false, State2),
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 5000},
+    {State4, _, _} = apply(meta(Config, 4, 100),
+                           rabbit_fifo:make_modify(CKey, [0], false, false, Anns),
+                           State3),
+    {State5, ok, _} = apply(meta(Config, 5, 100),
+                            rabbit_fifo:make_delayed(
+                              {assign_deferred, CKey, [Token]}),
+                            State4),
+    ?assertMatch(#{num_delayed_messages := 1}, rabbit_fifo:overview(State5)),
+    %% The delivery time passes with the consumer still out of credit.
+    {State6, _, _} = apply(meta(Config, 6, 5000),
+                           {timeout, {expire_msgs, shallow}}, State5),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_ready_messages := 1}, rabbit_fifo:overview(State6)),
+    %% The message is delivered by the ordinary path. The claim now points at
+    %% nothing; it is dropped the next time it is consulted.
+    {State7, _} = credit(Config, CKey, 7, 1, 1, false, State6),
+    ?assertMatch(#{num_ready_messages := 0,
+                   num_checked_out := 1}, rabbit_fifo:overview(State7)),
+    ok.
+
+delayed_assign_deferred_not_found_test(Config) ->
+    %% A token that was never issued is silently skipped, alongside one that
+    %% resolves.
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
     State0 = init(Conf),
     Cid = {?FUNCTION_NAME_B, self()},
     %% Enqueue a message
@@ -3761,31 +4284,35 @@ delayed_assign_deferred_not_found_test(Config) ->
     %% Checkout the message
     {State2, #{key := CKey, next_msg_id := MsgId}, _} =
         checkout_ts(Config, 2, 100, Cid, {auto, {simple_prefetch, 2}}, State1),
-    %% Return with deferral token
+    %% Return with deferral token and explicit delivery time
     Token1 = <<"token-1">>,
-    Anns = #{<<"x-opt-deferral-token">> => Token1},
+    Anns = #{<<"x-opt-deferral-token">> => Token1,
+             <<"x-opt-delivery-time">> => 10000},
     Mod = rabbit_fifo:make_modify(CKey, [MsgId], false, false, Anns),
     {State3, _, _} = apply(meta(Config, 3, 100), Mod, State2),
-    %% Try to assign with one valid and one invalid token
+    %% Claim one valid and one unknown token
     Tokens = [Token1, <<"invalid-token">>],
     Cmd = rabbit_fifo:make_delayed({assign_deferred, CKey, Tokens}),
-    {State4, {partial, 1, [<<"invalid-token">>]}, _} =
-        apply(meta(Config, 4, 100), Cmd, State3),
+    {State4, ok, _} = apply(meta(Config, 4, 100), Cmd, State3),
     ?assertMatch(#{num_delayed_messages := 0,
                    num_checked_out := 1}, rabbit_fifo:overview(State4)),
+    ?assertMatch(#rabbit_fifo{consumers = #{CKey := #consumer{
+                                                      deferred_claims = #{}}}},
+                 State4),
     ok.
 
 delayed_assign_deferred_consumer_not_found_test(Config) ->
-    %% Test that assign_deferred fails when consumer doesn't exist
+    %% A claim for a consumer that does not exist is ignored
     Conf = #{name => ?FUNCTION_NAME,
-             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
-             delayed_retry => {all, 10000, 10000}},
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
     State0 = init(Conf),
-    %% Try to assign to non-existent consumer
-    {_State, {error, consumer_not_found}, []} =
+    {State, ok, []} =
         apply(meta(Config, 1, 100),
               rabbit_fifo:make_delayed({assign_deferred, 999, [<<"token">>]}),
               State0),
+    ?assertMatch(#{num_consumers := 0,
+                   num_delayed_messages := 0,
+                   num_checked_out := 0}, rabbit_fifo:overview(State)),
     ok.
 
 delayed_retry_monotonic_timestamp_test(Config) ->
@@ -4007,6 +4534,154 @@ aux_test(_) ->
     meck:unload(),
     ok.
 
+aux_decorators_test(_) ->
+    _ = ra_machine_ets:start_link(),
+    Aux0 = init_aux(?FUNCTION_NAME),
+    RaAux = #{machine_state =>
+              init(#{name => ?FUNCTION_NAME,
+                     queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+                     single_active_consumer_on => false}),
+              log => mock_log,
+              cfg => #cfg{},
+              last_applied => 0},
+    ok = meck:new(ra_log, []),
+    meck:expect(ra_log, last_index_term, fun (_) -> {0, 0} end),
+    ok = meck:new(ra_aux, [passthrough]),
+    meck:expect(ra_aux, effective_machine_version,
+                fun (_) -> rabbit_fifo:version() end),
+    meck:expect(ra_aux, wal_fill_ratio, fun (_) -> 0.0 end),
+    ok = meck:new(rabbit_quorum_queue, [passthrough]),
+    meck:expect(rabbit_quorum_queue, has_decorators, fun (_) -> false end),
+    {no_reply, Aux1, _, Effects1} = handle_aux(leader, cast, eval, Aux0, RaAux),
+    ?assertNot(has_notify_decorators(Effects1)),
+    {no_reply, Aux2, _, Effects2} = handle_aux(leader, cast, eval, Aux1, RaAux),
+    ?assertNot(has_notify_decorators(Effects2)),
+    ?assertEqual(1, meck:num_calls(rabbit_quorum_queue, has_decorators, '_')),
+
+    meck:expect(rabbit_quorum_queue, has_decorators, fun (_) -> true end),
+    {no_reply, Aux3, _, Effects3} = handle_aux(leader, cast, eval, Aux2, RaAux),
+    ?assertNot(has_notify_decorators(Effects3)),
+    ?assertEqual(1, meck:num_calls(rabbit_quorum_queue, has_decorators, '_')),
+    meck:expect(rabbit_quorum_queue, handle_tick, fun (_, _, _) -> undefined end),
+    Tick = {handle_tick, [rabbit_misc:r("/", queue, ?FUNCTION_NAME_B), #{}, []]},
+    {no_reply, Aux4, _, Effects4} = handle_aux(leader, cast, Tick, Aux3, RaAux),
+    ?assert(has_notify_decorators(Effects4)),
+    {no_reply, Aux5, _, Effects5} = handle_aux(leader, cast, eval, Aux4, RaAux),
+    ?assertNot(has_notify_decorators(Effects5)),
+    ?assertEqual(2, meck:num_calls(rabbit_quorum_queue, has_decorators, '_')),
+
+    meck:expect(rabbit_quorum_queue, has_decorators, fun (_) -> false end),
+    {no_reply, Aux6, _, Effects6} = handle_aux(leader, cast, Tick, Aux5, RaAux),
+    ?assertNot(has_notify_decorators(Effects6)),
+    meck:expect(rabbit_quorum_queue, has_decorators, fun (_) -> true end),
+    {no_reply, Aux7, _, Effects7} = handle_aux(leader, cast, Tick, Aux6, RaAux),
+    ?assert(has_notify_decorators(Effects7)),
+    {no_reply, Aux8, _, Effects8} = handle_aux(leader, cast, Tick, Aux7, RaAux),
+    ?assertNot(has_notify_decorators(Effects8)),
+
+    {no_reply, Aux9, _, []} = handle_aux(follower, cast, Tick, Aux8, RaAux),
+    {no_reply, _, _, _} = handle_aux(leader, cast, eval, Aux9, RaAux),
+    ?assertEqual(6, meck:num_calls(rabbit_quorum_queue, has_decorators, '_')),
+    meck:unload(),
+    ok.
+
+has_notify_decorators(Effects) ->
+    lists:any(fun ({mod_call, rabbit_quorum_queue, spawn_notify_decorators, _}) ->
+                      true;
+                  (_) ->
+                      false
+              end, Effects).
+
+%% covers upgrades from aux states as old as 3.13, e.g. 3.13 -> 4.2 -> 4.3
+aux_upgrade_from_v1_test(_) ->
+    _ = ra_machine_ets:start_link(),
+    Name = ?FUNCTION_NAME,
+    %% shape of the aux state as used by rabbit_fifo_v0 / rabbit_fifo_v1
+    AuxV1 = {aux, Name, unused_capacity, unused_gc},
+    LastApplied = 0,
+    State0 = #{machine_state =>
+               init(#{name => Name,
+                      queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+                      single_active_consumer_on => false}),
+               log => mock_log,
+               cfg => #cfg{},
+               last_applied => LastApplied},
+    ok = meck:new(ra_log, []),
+    meck:expect(ra_log, last_index_term, fun (_) -> {0, 0} end),
+    {no_reply, Aux, _, []} = handle_aux(leader, cast, tick, AuxV1, State0),
+    ?assertEqual(aux_v5, element(1, Aux)),
+    ?assertEqual(Name, element(2, Aux)),
+    meck:unload(),
+    ok.
+
+aux_upgrade_from_v2_test(_) ->
+    _ = ra_machine_ets:start_link(),
+    Name = ?FUNCTION_NAME,
+    %% shape of the aux state as used by an earlier version of rabbit_fifo
+    AuxV2 = {aux_v2, Name, unused_last_decorators_state, unused_capacity,
+              unused_gc, unused_tick_pid, unused_cache},
+    LastApplied = 0,
+    State0 = #{machine_state =>
+               init(#{name => Name,
+                      queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+                      single_active_consumer_on => false}),
+               log => mock_log,
+               cfg => #cfg{},
+               last_applied => LastApplied},
+    ok = meck:new(ra_log, []),
+    meck:expect(ra_log, last_index_term, fun (_) -> {0, 0} end),
+    {no_reply, Aux, _, []} = handle_aux(leader, cast, tick, AuxV2, State0),
+    ?assertEqual(aux_v5, element(1, Aux)),
+    ?assertEqual(Name, element(2, Aux)),
+    meck:unload(),
+    ok.
+
+aux_upgrade_from_v3_test(_) ->
+    _ = ra_machine_ets:start_link(),
+    Name = ?FUNCTION_NAME,
+    %% shape of the aux state as used by an earlier version of rabbit_fifo
+    AuxV3 = {aux_v3, Name, unused_last_decorators_state, unused_capacity,
+             {aux_gc, 0}, unused_tick_pid, unused_cache, unused_last_checkpoint,
+             unused_bytes_in, unused_bytes_out},
+    LastApplied = 0,
+    State0 = #{machine_state =>
+               init(#{name => Name,
+                      queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+                      single_active_consumer_on => false}),
+               log => mock_log,
+               cfg => #cfg{},
+               last_applied => LastApplied},
+    ok = meck:new(ra_log, []),
+    meck:expect(ra_log, last_index_term, fun (_) -> {0, 0} end),
+    {no_reply, Aux, _, []} = handle_aux(leader, cast, tick, AuxV3, State0),
+    ?assertEqual(aux_v5, element(1, Aux)),
+    ?assertEqual(Name, element(2, Aux)),
+    meck:unload(),
+    ok.
+
+aux_upgrade_from_v4_test(_) ->
+    _ = ra_machine_ets:start_link(),
+    Name = ?FUNCTION_NAME,
+    %% shape of the aux state as used by an earlier version of rabbit_fifo,
+    %% before per-node ingress tracking was added
+    AuxV4 = {aux_v4, Name, unused_last_decorators_state, unused_consumer_timeout,
+             {aux_gc, 0}, unused_tick_pid, unused_cache, unused_last_checkpoint},
+    LastApplied = 0,
+    State0 = #{machine_state =>
+               init(#{name => Name,
+                      queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+                      single_active_consumer_on => false}),
+               log => mock_log,
+               cfg => #cfg{},
+               last_applied => LastApplied},
+    ok = meck:new(ra_log, []),
+    meck:expect(ra_log, last_index_term, fun (_) -> {0, 0} end),
+    {no_reply, Aux, _, []} = handle_aux(leader, cast, tick, AuxV4, State0),
+    ?assertEqual(aux_v5, element(1, Aux)),
+    ?assertEqual(Name, element(2, Aux)),
+    meck:unload(),
+    ok.
+
 %% machine version conversion test
 
 machine_version_test(Config) ->
@@ -4030,7 +4705,7 @@ machine_version_test(Config) ->
                   consumers = #{3 := #consumer{cfg = #consumer_cfg{priority = 0}}},
                   service_queue = S,
                   messages = Msgs}, ok,
-     [_|_]} = apply(meta(Config, Idx), {machine_version, 7, 8}, S1),
+     [_|_]} = apply(meta(Config, Idx), {machine_version, 7, 9}, S1),
 
     ?assertEqual(1, rabbit_fifo_pq:len(Msgs)),
     ?assert(priority_queue:is_queue(S)),
@@ -4058,16 +4733,16 @@ machine_version_waiting_consumer_test(Config) ->
                                                  #consumer_cfg{priority = 0}}},
                   service_queue = S,
                   messages = Msgs}, ok, _} = apply(meta(Config, Idx),
-                                                    {machine_version, 7, 8}, S1),
+                                                    {machine_version, 7, 9}, S1),
     %% validate message conversion to lqueue
     ?assertEqual(0, rabbit_fifo_pq:len(Msgs)),
     ?assert(priority_queue:is_queue(S)),
     ?assertEqual(1, priority_queue:len(S)),
     ok.
 
-convert_v7_to_v8_test(Config) ->
+convert_v7_to_v9_test(Config) ->
     ConfigV7 = [{machine_version, 7} | Config],
-    ConfigV8 = [{machine_version, 8} | Config],
+    ConfigV9 = [{machine_version, 9} | Config],
 
     EPid = test_util:fake_pid(node()),
     Pid1 = test_util:fake_pid(node()),
@@ -4092,12 +4767,79 @@ convert_v7_to_v8_test(Config) ->
     {StateV7, _} = run_log(rabbit_fifo_v7, ConfigV7, Init, Entries,
                            fun (_) -> true end),
     {#rabbit_fifo{consumers = Consumers}, ok, _} =
-        apply(meta(ConfigV8, ?LINE), {machine_version, 7, 8}, StateV7),
+        apply(meta(ConfigV9, ?LINE), {machine_version, 7, 9}, StateV7),
 
     ?assertMatch(#consumer{status = {suspected_down, up}},
                  maps:get(Cid1, Consumers)),
     ok.
 
+versioned_query_resolves_frozen_module_test(Config) ->
+    %% A queue whose effective machine version is still 8 holds a v8-shaped
+    %% state, which the v9 query functions cannot match. local_query/3
+    %% catches that and retries via versioned_query/3, which must resolve
+    %% the frozen module from the version reported in the query context.
+    ConfigV8 = [{machine_version, 8} | Config],
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    S0 = rabbit_fifo_v8:init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {S1, _, _} = rabbit_fifo_v8:apply(
+                   meta(ConfigV8, 1, 0, {notify, 1, self()}),
+                   rabbit_fifo_v8:make_enqueue(self(), 1, msg1), S0),
+    {S2, {ok, _}, _} =
+        rabbit_fifo_v8:apply(
+          meta(ConfigV8, 2, 100),
+          rabbit_fifo_v8:make_checkout(Cid, {auto, {simple_prefetch, 1}}, #{}),
+          S1),
+
+    %% the v9 module cannot read a v8 state, and neither can v7, which is
+    %% what local_query/3 used to fall back to unconditionally
+    ?assertError(function_clause, rabbit_fifo:query_consumers(S2)),
+    ?assertError(function_clause, rabbit_fifo_v7:query_consumers(S2)),
+
+    %% resolving the module from the context does read it
+    Ctx = #{index => 2, term => 1, machine_version => 8},
+    Consumers = rabbit_fifo_client:versioned_query(query_consumers, Ctx, S2),
+    ?assertEqual(1, map_size(Consumers)),
+    ok.
+
+convert_v8_to_v9_deferred_test(Config) ->
+    %% v8's #delayed.deferred map stored a single delayed_key() per token
+    %% v9 allows a single token to address multiple messages.
+    ConfigV8 = [{machine_version, 8} | Config],
+    ConfigV9 = [{machine_version, 9} | Config],
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    S0 = rabbit_fifo_v8:init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+
+    {S1, _, _} = rabbit_fifo_v8:apply(
+                   meta(ConfigV8, 1, 0, {notify, 1, self()}),
+                   rabbit_fifo_v8:make_enqueue(self(), 1, msg1), S0),
+    {S2, {ok, #{key := CKey, next_msg_id := MsgId}}, _} =
+        rabbit_fifo_v8:apply(
+          meta(ConfigV8, 2, 100),
+          rabbit_fifo_v8:make_checkout(Cid, {auto, {simple_prefetch, 1}}, #{}),
+          S1),
+    Token = <<"v8-token">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    Modify = rabbit_fifo_v8:make_modify(CKey, [MsgId], false, false, Anns),
+    {StateV8, _, _} = rabbit_fifo_v8:apply(meta(ConfigV8, 3, 100), Modify, S2),
+    ?assertMatch(#{num_delayed_messages := 1}, rabbit_fifo_v8:overview(StateV8)),
+
+    %% Upgrade to v9. Before the fix, the deferred entry stayed a bare key.
+    {StateV9, ok, _} = rabbit_fifo:apply(meta(ConfigV9, 4),
+                                         {machine_version, 8, 9}, StateV8),
+    ?assertMatch(#{num_delayed_messages := 1}, rabbit_fifo:overview(StateV9)),
+
+    %% Claiming the v8-deferred token must not crash, and must find the
+    %% message (this failed with a function_clause before the fix).
+    Cmd = rabbit_fifo:make_delayed({assign_deferred, CKey, [Token]}),
+    {StateV9b, ok, _} = rabbit_fifo:apply(meta(ConfigV9, 5), Cmd, StateV9),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_checked_out := 1}, rabbit_fifo:overview(StateV9b)),
+    ok.
 
 queue_ttl_test(C) ->
     QName = rabbit_misc:r(<<"/">>, queue, <<"test">>),
@@ -4388,6 +5130,183 @@ modify_test(Config) ->
 
     ok.
 
+%% A consumer settling the same message repeatedly with `modified' and
+%% fresh annotation keys must not grow the message header's `anns' map
+%% without bound, since that map is part of the replicated Ra machine state.
+modify_anns_capped_test(Config) ->
+    MaxAnnsSize = 32,
+    S0 = init(#{name => ?FUNCTION_NAME,
+                dead_letter_handler => at_least_once,
+                queue_resource =>
+                    rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)}),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {S1, _} = enq(Config, 1, 1, msg1, S0),
+    {S2, #{key := CK1}, _} = checkout(Config, 2, Cid, 1, S1),
+    NumModifies = MaxAnnsSize * 2,
+    {SFinal0, LastMsgId} =
+        lists:foldl(
+          fun (I, {StateIn, PrevMsgId}) ->
+                  Key = integer_to_binary(I),
+                  {StateOut, _, _} =
+                      apply(meta(Config, 100 + I),
+                            rabbit_fifo:make_modify(CK1, [PrevMsgId], false,
+                                                    false, #{Key => <<"v">>}),
+                            StateIn),
+                  {StateOut, PrevMsgId + 1}
+          end, {S2, 0}, lists:seq(1, NumModifies)),
+    #consumer{checked_out = Checked0} = maps:get(CK1, SFinal0#rabbit_fifo.consumers),
+    [?C_MSG(?MSG(_, #{anns := Anns0}))] = maps:values(Checked0),
+    ?assertEqual(MaxAnnsSize, map_size(Anns0)),
+    %% the first keys, sent before the cap was reached, were kept
+    ?assert(maps:is_key(integer_to_binary(1), Anns0)),
+    ?assert(maps:is_key(integer_to_binary(MaxAnnsSize), Anns0)),
+    %% new keys sent after the cap was reached were dropped
+    ?assertNot(maps:is_key(integer_to_binary(MaxAnnsSize + 1), Anns0)),
+    ?assertNot(maps:is_key(integer_to_binary(NumModifies), Anns0)),
+    %% an already-present key can still be updated once the cap is reached
+    {SFinal, _, _} =
+        apply(meta(Config, 100 + NumModifies + 1),
+              rabbit_fifo:make_modify(CK1, [LastMsgId], false, false,
+                                      #{integer_to_binary(1) => <<"updated">>}),
+              SFinal0),
+    #consumer{checked_out = Checked} = maps:get(CK1, SFinal#rabbit_fifo.consumers),
+    [?C_MSG(?MSG(_, #{anns := Anns}))] = maps:values(Checked),
+    ?assertEqual(MaxAnnsSize, map_size(Anns)),
+    ?assertEqual(<<"updated">>, maps:get(integer_to_binary(1), Anns)),
+    ok.
+
+%% When a single `modified' command's annotations have more new keys than
+%% there are cap slots left, which of those keys survive is itself part of
+%% the resulting replicated state, so it must not depend on the unordered
+%% traversal of a plain maps:fold/3 -- that could let replicas diverge on
+%% the very same command. merge_msg_anns/2 must therefore pick
+%% deterministically, in ascending term order of the new keys.
+%% Below the flat/HAMT map size threshold, plain maps:fold/3 already
+%% happens to iterate in ascending term order, so this needs more than
+%% ?MAX_MSG_ANNS_SIZE new keys in the one command to actually exercise a
+%% HAMT map's unordered traversal and tell the two implementations apart.
+modify_anns_capped_deterministic_order_test(Config) ->
+    MaxAnnsSize = 32,
+    NumNewKeys = MaxAnnsSize + 8,
+    S0 = init(#{name => ?FUNCTION_NAME,
+                queue_resource =>
+                    rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)}),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {S1, _} = enq(Config, 1, 1, msg1, S0),
+    {S2, #{key := CK1, next_msg_id := MsgId}, _} =
+        checkout(Config, 2, Cid, 1, S1),
+    %% Zero-padded so lexicographic (term) order matches numeric order.
+    Key = fun (N) -> iolist_to_binary(io_lib:format("~2..0B", [N])) end,
+    NewAnns = maps:from_list([{Key(N), N} || N <- lists:seq(1, NumNewKeys)]),
+    {SFinal, _, _} =
+        apply(meta(Config, 3),
+              rabbit_fifo:make_modify(CK1, [MsgId], false, false, NewAnns),
+              S2),
+    #consumer{checked_out = Checked} = maps:get(CK1, SFinal#rabbit_fifo.consumers),
+    [?C_MSG(?MSG(_, #{anns := Anns}))] = maps:values(Checked),
+    ?assertEqual(MaxAnnsSize, map_size(Anns)),
+    %% The 32 smallest keys, in term order, are kept.
+    [?assert(maps:is_key(Key(N), Anns)) || N <- lists:seq(1, MaxAnnsSize)],
+    [?assertNot(maps:is_key(Key(N), Anns))
+     || N <- lists:seq(MaxAnnsSize + 1, NumNewKeys)],
+    ok.
+
+%% The deferral token and its accompanying delivery time must survive the
+%% ?MAX_MSG_ANNS_SIZE cap even when `anns' is already full of unrelated
+%% keys. should_delay/5 records the token in #delayed.deferred straight
+%% from the client-supplied Anns, regardless of the cap; if the cap then
+%% dropped the token from the stored header, get_deferral_token/1 could
+%% never find it again to clean the #delayed.deferred entry up, leaking it
+%% forever.
+modify_anns_capped_preserves_deferral_token_test(Config) ->
+    MaxAnnsSize = 32,
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, #{key := CKey}, _} =
+        checkout_ts(Config, 2, 100, Cid, {auto, {simple_prefetch, 1}}, State1),
+    %% Fill anns to the cap with unrelated keys before any deferral token
+    %% is ever sent, so the token below is a "new" key to merge_msg_anns.
+    {SFilled, LastMsgId} =
+        lists:foldl(
+          fun (I, {StateIn, PrevMsgId}) ->
+                  Key = integer_to_binary(I),
+                  Modify = rabbit_fifo:make_modify(CKey, [PrevMsgId], false,
+                                                   false, #{Key => <<"v">>}),
+                  {StateOut, _, _} = apply(meta(Config, 100 + I, 100),
+                                           Modify, StateIn),
+                  {StateOut, PrevMsgId + 1}
+          end, {State2, 0}, lists:seq(1, MaxAnnsSize)),
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+    Modify = rabbit_fifo:make_modify(CKey, [LastMsgId], false, false, Anns),
+    {SFinal, _, _} = apply(meta(Config, 200, 100), Modify, SFilled),
+    ?assertMatch(#{num_delayed_messages := 1,
+                   num_checked_out := 0}, rabbit_fifo:overview(SFinal)),
+    #rabbit_fifo{delayed = #delayed{deferred = Deferred, tree = Tree}} = SFinal,
+    ?assertMatch(#{Token := [_Key]}, Deferred),
+    ?assertEqual(1, map_size(Deferred)),
+    [Msg] = gb_trees:values(Tree),
+    ?MSG(_, ParkedHeader) = Msg,
+    #{anns := ParkedAnns} = ParkedHeader,
+    %% 32 filler keys plus the two reserved keys
+    ?assertEqual(MaxAnnsSize + 2, map_size(ParkedAnns)),
+    ?assertEqual(Token, maps:get(<<"x-opt-deferral-token">>, ParkedAnns)),
+    ?assertEqual(10000, maps:get(<<"x-opt-delivery-time">>, ParkedAnns)),
+    ok.
+
+%% The number of ordinary (non-reserved) keys that fit under
+%% ?MAX_MSG_ANNS_SIZE must not depend on whether the reserved keys were
+%% merged in before or after them: merge_msg_anns/2 must count only
+%% non-reserved keys against the cap, since map_size/1 on the accumulator
+%% also counts the (unlimited) reserved keys. This sends the reserved
+%% keys first -- the opposite order of
+%% modify_anns_capped_preserves_deferral_token_test -- and still expects
+%% all 32 ordinary fillers plus both reserved keys to survive.
+modify_anns_capped_order_independent_test(Config) ->
+    MaxAnnsSize = 32,
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    State0 = init(Conf),
+    Cid = {?FUNCTION_NAME_B, self()},
+    {State1, _} = enq(Config, 1, 1, msg1, State0),
+    {State2, #{key := CKey, next_msg_id := MsgId0}, _} =
+        checkout_ts(Config, 2, 100, Cid, {auto, {simple_prefetch, 1}}, State1),
+    %% x-opt-delivery-time is not in the future relative to Ts=100, so this
+    %% does not park the message: it merges both reserved keys into anns
+    %% and the message stays immediately available for redelivery, just
+    %% like an ordinary return.
+    ReservedAnns = #{<<"x-opt-deferral-token">> => <<"token-1">>,
+                     <<"x-opt-delivery-time">> => 0},
+    ModifyReserved = rabbit_fifo:make_modify(CKey, [MsgId0], false, false,
+                                             ReservedAnns),
+    {State3, _, _} = apply(meta(Config, 3, 100), ModifyReserved, State2),
+    ?assertMatch(#{num_delayed_messages := 0,
+                   num_checked_out := 1}, rabbit_fifo:overview(State3)),
+    {SFinal, _LastMsgId} =
+        lists:foldl(
+          fun (I, {StateIn, PrevMsgId}) ->
+                  Key = integer_to_binary(I),
+                  Modify = rabbit_fifo:make_modify(CKey, [PrevMsgId], false,
+                                                   false, #{Key => <<"v">>}),
+                  {StateOut, _, _} = apply(meta(Config, 3 + I, 100),
+                                           Modify, StateIn),
+                  {StateOut, PrevMsgId + 1}
+          end, {State3, MsgId0 + 1}, lists:seq(1, MaxAnnsSize)),
+    #consumer{checked_out = Checked} = maps:get(CKey, SFinal#rabbit_fifo.consumers),
+    [?C_MSG(?MSG(_, #{anns := Anns}))] = maps:values(Checked),
+    %% 32 ordinary fillers plus the two reserved keys: none of the
+    %% fillers were dropped just because the reserved keys went in first.
+    ?assertEqual(MaxAnnsSize + 2, map_size(Anns)),
+    [?assert(maps:is_key(integer_to_binary(N), Anns))
+     || N <- lists:seq(1, MaxAnnsSize)],
+    ?assertEqual(<<"token-1">>, maps:get(<<"x-opt-deferral-token">>, Anns)),
+    ?assertEqual(0, maps:get(<<"x-opt-delivery-time">>, Anns)),
+    ok.
+
 priorities_expire_test(Config) ->
     State0 = init(#{name => ?FUNCTION_NAME,
                     queue_resource => rabbit_misc:r("/", queue,
@@ -4575,6 +5494,143 @@ consumer_disconnected_timeout_test(Config) ->
                                              checked_out = Ch}},
                           next_consumer_timeout = _Timeout2}
                when map_size(Ch) == 0)
+    ],
+    {_State1, _} = run_log(Config, State0, Entries),
+    ok.
+
+%% a `once' lifetime consumer, such as an unsettled `basic.get', spends its
+%% only credit on the message it is given, so `consumer_disconnected_timeout'
+%% returns that message and removes the consumer in the same step
+%%
+%% this must not crash even though `update_or_remove_con/4' has already
+%% dropped the consumer by the time `apply_/3' looks for it again
+once_consumer_disconnected_timeout_test(Config) ->
+    R = rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+    State0 = init(#{name => ?FUNCTION_NAME,
+                    queue_resource => R}),
+
+    {CK1, {_, C1Pid} = C1} = {0, {?LINE_B, test_util:fake_pid(n1)}},
+    EnqIdx = 1,
+    DownIdx = 2,
+    TimeoutIdx = 3,
+
+    Entries =
+    [
+     {CK1, make_checkout(C1, {once, {simple_prefetch, 1}}, #{})},
+     {EnqIdx, rabbit_fifo:make_enqueue(self(), 1, one)},
+     ?ASSERT(#rabbit_fifo{consumers = #{CK1 := #consumer{credit = 0,
+                                                          checked_out = Ch}}}
+               when map_size(Ch) == 1),
+     {DownIdx, {down, C1Pid, noconnection}},
+     ?ASSERT(#rabbit_fifo{consumers =
+                          #{CK1 := #consumer{status = {suspected_down, up}}}}),
+     {TimeoutIdx, {timeout, {consumer_disconnected_timeout, CK1}}},
+     %% the consumer's sole checked-out message is returned, and with no
+     %% credit left, it is removed at the same time
+     ?ASSERT(#rabbit_fifo{consumers = Cons} when map_size(Cons) == 0)
+    ],
+    {_State1, _} = run_log(Config, State0, Entries),
+    ok.
+
+%% same as above, but this `once' consumer still has one message's worth of
+%% unspent credit, so `update_or_remove_con/4' keeps it instead of removing
+%% it on timeout
+%%
+%% this exercises the other branch of the fix, where the consumer is still
+%% present and `release_deferred_claims/3' is called on it directly
+once_consumer_disconnected_timeout_with_remaining_credit_test(Config) ->
+    R = rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+    State0 = init(#{name => ?FUNCTION_NAME,
+                    queue_resource => R}),
+
+    {CK1, {_, C1Pid} = C1} = {0, {?LINE_B, test_util:fake_pid(n1)}},
+    EnqIdx = 1,
+    DownIdx = 2,
+    TimeoutIdx = 3,
+
+    Entries =
+    [
+     {CK1, make_checkout(C1, {once, {simple_prefetch, 2}}, #{})},
+     {EnqIdx, rabbit_fifo:make_enqueue(self(), 1, one)},
+     ?ASSERT(#rabbit_fifo{consumers = #{CK1 := #consumer{credit = 1,
+                                                          checked_out = Ch}}}
+               when map_size(Ch) == 1),
+     {DownIdx, {down, C1Pid, noconnection}},
+     ?ASSERT(#rabbit_fifo{consumers =
+                          #{CK1 := #consumer{status = {suspected_down, up}}}}),
+     {TimeoutIdx, {timeout, {consumer_disconnected_timeout, CK1}}},
+     %% the checked-out message is returned, but the consumer still has
+     %% unspent credit so it is kept around rather than removed
+     ?ASSERT(#rabbit_fifo{consumers =
+                          #{CK1 := #consumer{credit = 1,
+                                             checked_out = Ch}}}
+               when map_size(Ch) == 0)
+    ],
+    {_State1, _} = run_log(Config, State0, Entries),
+    ok.
+
+%% same as `once_consumer_disconnected_timeout_test/1' above, but this
+%% consumer is given a second message to park under a deferred claim
+%%
+%% `release_deferred_claims/3' must hand that claim back to the shared
+%% deferred map rather than lose it when `update_or_remove_con/4' removes
+%% the consumer while returning its last checked-out message
+once_consumer_disconnected_timeout_releases_claim_test(Config) ->
+    R = rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+    State0 = init(#{name => ?FUNCTION_NAME,
+                    queue_resource => R}),
+
+    {CK1, {_, C1Pid} = C1} = {0, {?LINE_B, test_util:fake_pid(n1)}},
+    Enq1Idx = 1,
+    Enq2Idx = 2,
+    ModifyIdx = 3,
+    ClaimIdx = 4,
+    DownIdx = 5,
+    TimeoutIdx = 6,
+    {CK2, C2} = {7, {?LINE_B, test_util:fake_pid(n2)}},
+    Claim2Idx = 8,
+    Token = <<"token-1">>,
+    Anns = #{<<"x-opt-deferral-token">> => Token,
+             <<"x-opt-delivery-time">> => 10000},
+
+    Entries =
+    [
+     {CK1, make_checkout(C1, {once, {simple_prefetch, 2}}, #{})},
+     {Enq1Idx, rabbit_fifo:make_enqueue(self(), 1, one)},
+     {Enq2Idx, rabbit_fifo:make_enqueue(self(), 2, two)},
+     ?ASSERT(#rabbit_fifo{consumers = #{CK1 := #consumer{credit = 0,
+                                                          checked_out = Ch}}}
+               when map_size(Ch) == 2),
+     %% park the second checked-out message under a token and immediately
+     %% re-claim it: the consumer now holds a deferred claim while its
+     %% credit is fully spent
+     {ModifyIdx, rabbit_fifo:make_modify(CK1, [1], false, false, Anns)},
+     {ClaimIdx, rabbit_fifo:make_delayed({assign_deferred, CK1, [Token]})},
+     ?ASSERT(#rabbit_fifo{consumers =
+                          #{CK1 := #consumer{credit = 0,
+                                             deferred_claims =
+                                               #{Token := [_]}}},
+                          claimed_consumers = #{CK1 := true}}),
+     {DownIdx, {down, C1Pid, noconnection}},
+     ?ASSERT(#rabbit_fifo{consumers =
+                          #{CK1 := #consumer{status = {suspected_down, up}}}}),
+     {TimeoutIdx, {timeout, {consumer_disconnected_timeout, CK1}}},
+     %% the consumer's last checked-out message is returned, and with no
+     %% credit left, the consumer is removed
+     %%
+     %% its claim must survive in the shared deferred map rather than be
+     %% dropped along with the consumer, and it must no longer be tracked
+     %% as a claim holder
+     ?ASSERT(#rabbit_fifo{consumers = Cons,
+                          delayed = #delayed{deferred = #{Token := [_]}},
+                          claimed_consumers = Claimed}
+               when map_size(Cons) == 0 andalso map_size(Claimed) == 0),
+     %% a different consumer can now claim and receive the same token,
+     %% proving it is reachable rather than merely present in the map
+     {CK2, make_checkout(C2, {auto, {simple_prefetch, 1}}, #{})},
+     {Claim2Idx, rabbit_fifo:make_delayed({assign_deferred, CK2, [Token]})},
+     ?ASSERT(#rabbit_fifo{consumers = #{CK2 := #consumer{checked_out = Ch2}}}
+               when map_size(Ch2) == 1)
     ],
     {_State1, _} = run_log(Config, State0, Entries),
     ok.
@@ -4889,6 +5945,14 @@ query_single_active_consumer_v7_test(Config) ->
 
     ok.
 
+enqueue_negative_priority_test(Config) ->
+    S0 = test_init(test),
+    Msg = mk_mc(<<"msg">>, #'P_basic'{priority = -1}),
+    {S1, _E1} = enq(Config, ?LINE, 1, Msg, S0),
+    #{detail := Detail} = rabbit_fifo_pq:overview(S1#rabbit_fifo.messages),
+    ?assertEqual(#{0 => 1}, Detail),
+    ok.
+
 query_single_active_consumer_consumer_info_test(Config) ->
     S0 = rabbit_fifo:init(#{name => ?FUNCTION_NAME,
                             single_active_consumer_on => true,
@@ -4917,6 +5981,64 @@ query_single_active_consumer_consumer_info_test(Config) ->
                    consumer_strategy := single_active,
                    num_checked_out := 0}, Info2),
     ok.
+
+
+%% Ingress tracking tests
+
+ingress_bytes_by_node_accumulates_on_enqueue_test(Config) ->
+    S0 = test_init(ingress_accumulates),
+    Msg = mk_mc(<<"hello">>),
+    Pid = self(),
+    Enq = make_enqueue(Pid, 1, Msg),
+    {S1, _, _} = apply(meta(Config, 1, 0, {notify, 1, Pid}), Enq, S0),
+    Ingress = S1#rabbit_fifo.ingress_bytes_by_node,
+    ?assert(maps:get(node(Pid), Ingress, 0) > 0),
+    ok.
+
+ingress_bytes_by_node_survives_snapshot_test(Config) ->
+    S0 = test_init(ingress_snapshot),
+    Msg = mk_mc(<<"test">>),
+    {MetaSize, BodySize} = mc:size(Msg),
+    ExpectedBytes = MetaSize + BodySize,
+    Pid = self(),
+    Enq = make_enqueue(Pid, 1, Msg),
+    {S1, _, _} = apply(meta(Config, 1, 0, {notify, 1, Pid}), Enq, S0),
+    Ingress = S1#rabbit_fifo.ingress_bytes_by_node,
+    ?assertEqual(#{node(Pid) => ExpectedBytes}, Ingress),
+    %% Simulate the generic term serialization Ra's default snapshot
+    %% mechanism performs; the exact recorded byte count, not just the
+    %% map's shape, must come through unchanged
+    S2 = binary_to_term(term_to_binary(S1)),
+    Ingress2 = S2#rabbit_fifo.ingress_bytes_by_node,
+    ?assertEqual(#{node(Pid) => ExpectedBytes}, Ingress2),
+    ok.
+
+
+update_ingress_seeds_baseline_on_first_observation_test(_Config) ->
+    %% ingress_bytes_by_node is cumulative since queue creation; the first
+    %% time a node is observed (fresh aux, restart, or a first-time leader
+    %% promotion) update_ingress/3 must seed a baseline rather than feed
+    %% the whole lifetime total in as a single tick's delta
+    _ = ra_machine_ets:start_link(),
+    Node = node(),
+    Aux0 = rabbit_fifo:init_aux(?FUNCTION_NAME),
+    Ingress0 = element(9, Aux0),
+
+    Overview1 = #{ingress_bytes_by_node => #{Node => 10_000_000}},
+    Ingress1 = rabbit_fifo:update_ingress(Overview1, [Node], Ingress0),
+    ?assertEqual(#{}, rabbit_fifo:compute_ingress_rates(Ingress1)),
+
+    Overview2 = #{ingress_bytes_by_node => #{Node => 10_000_060}},
+    Ingress2 = rabbit_fifo:update_ingress(Overview2, [Node], Ingress1),
+    Rates2 = rabbit_fifo:compute_ingress_rates(Ingress2),
+    Rate2 = maps:get(Node, Rates2),
+    ?assert(Rate2 > 0),
+    %% a spike from the whole ~10M cumulative total leaking through would
+    %% be several orders of magnitude larger than this
+    ?assert(Rate2 < 1000),
+    ok.
+
+%% Ingress tracking tests end
 
 
 %% Utility

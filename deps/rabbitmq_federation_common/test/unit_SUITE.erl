@@ -26,7 +26,23 @@ all() -> [
     terminate_all_shutdown_kills_non_trapping_processes,
     terminate_all_timeout_force_kill,
     terminate_all_paced_batching,
-    terminate_all_timeout_kills_remaining_batches
+    terminate_all_timeout_kills_remaining_batches,
+    to_params_returns_error_on_unparseable_uri,
+    to_params_error_strips_credentials,
+    to_params_error_on_malformed_uri_strips_credentials,
+    to_params_falls_back_to_valid_uri,
+    to_params_error_redacts_query_secrets,
+    redact_params_network,
+    redact_params_direct,
+    redact_params_ssl_options_password,
+    redact_params_ssl_options_none,
+    validate_max_hops_accepts_bounds,
+    validate_max_hops_rejects_out_of_range,
+    validate_max_hops_rejects_non_integers,
+    max_hops_keeps_valid_values,
+    max_hops_normalizes_legacy_values,
+    cluster_name_parameter_set_triggers_federation_adjust,
+    unrelated_global_parameter_set_does_not_trigger_federation_adjust
 ].
 
 init_per_suite(Config) ->
@@ -173,4 +189,195 @@ await_all_dead(Pids, AttemptsLeft) ->
         false ->
             timer:sleep(10),
             await_all_dead(Pids, AttemptsLeft - 1)
+    end.
+
+%% -------------------------------------------------------------------
+%% rabbit_federation_upstream:to_params/2 error handling
+%% -------------------------------------------------------------------
+
+%% Regression test for the boot-time crash observed when a persisted
+%% federation-upstream URI contains an `auth_mechanism` value that is not an
+%% existing atom (for example, an invisible U+2028 injected by a copy-paste).
+%% Before the fix, `amqp_uri:parse/2` returning `{error, _}` would badmatch
+%% inside `to_params/2` and crash the link's supervisor. It must now return
+%% an error tuple that callers can handle.
+to_params_returns_error_on_unparseable_uri(_Config) ->
+    %% "external" + U+2028 (UTF-8: E2 80 A8) + "connect" is not a SASL mechanism
+    %% atom, matching the value seen in production.
+    BadURI = <<"amqp://guest:guest@localhost/?auth_mechanism=external",
+               16#E2, 16#80, 16#A8, "connect">>,
+    Upstream = #upstream{uris = [BadURI], name = <<"u">>},
+    XorQ = #resource{virtual_host = <<"/">>, kind = exchange, name = <<"x">>},
+    ?assertMatch({error, {{unknown_mechanism, _}, _SafeURI}},
+                 rabbit_federation_upstream:to_params(Upstream, XorQ)),
+    ok.
+
+%% The URI returned inside the error tuple must have credentials removed so
+%% that error logs cannot leak the upstream password.
+to_params_error_strips_credentials(_Config) ->
+    BadURI = <<"amqp://alice:s3cret@localhost/?auth_mechanism=zzz_no_such_mech">>,
+    Upstream = #upstream{uris = [BadURI], name = <<"u">>},
+    XorQ = #resource{virtual_host = <<"/">>, kind = exchange, name = <<"x">>},
+    {error, {_Info, SafeURI}} =
+        rabbit_federation_upstream:to_params(Upstream, XorQ),
+    ?assertEqual(nomatch, binary:match(SafeURI, <<"s3cret">>)),
+    ?assertEqual(nomatch, binary:match(SafeURI, <<"alice">>)),
+    ok.
+
+%% A structurally malformed URI must not crash `to_params/2`. Such URIs also
+%% crash `amqp_uri:remove_credentials/1`, so the error branch has to strip
+%% credentials without relying on it.
+to_params_error_on_malformed_uri_strips_credentials(_Config) ->
+    BadURI = <<"amqp://alice:s3cret@:::">>,
+    Upstream = #upstream{uris = [BadURI], name = <<"u">>},
+    XorQ = #resource{virtual_host = <<"/">>, kind = exchange, name = <<"x">>},
+    {error, {Info, SafeURI}} =
+        rabbit_federation_upstream:to_params(Upstream, XorQ),
+    ?assertEqual(nomatch, binary:match(SafeURI, <<"s3cret">>)),
+    ?assertEqual(nomatch, binary:match(SafeURI, <<"alice">>)),
+    %% The parse-error `Info` for a malformed URI embeds the raw URI, so it
+    %% must be sanitized as well or the credentials leak into the logs.
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(io_lib:format("~tp", [Info])),
+                                       <<"s3cret">>)),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(io_lib:format("~tp", [Info])),
+                                       <<"alice">>)),
+    ok.
+
+%% The URIs of an upstream are interchangeable failover endpoints, so a single
+%% unparseable URI must not prevent the link from using a valid one.
+to_params_falls_back_to_valid_uri(_Config) ->
+    BadURI = <<"amqp://guest:guest@localhost/?auth_mechanism=zzz_no_such_mech">>,
+    GoodURI = <<"amqp://guest:guest@localhost">>,
+    X = #exchange{name = #resource{virtual_host = <<"/">>,
+                                   kind = exchange, name = <<"x">>}},
+    %% Try both orderings since `to_params/2` shuffles the URIs.
+    lists:foreach(
+      fun(URIs) ->
+              Upstream = #upstream{uris = URIs, name = <<"u">>,
+                                   exchange_name = <<"x">>},
+              ?assertMatch({ok, _},
+                           rabbit_federation_upstream:to_params(Upstream, X))
+      end,
+      [[BadURI, GoodURI], [GoodURI, BadURI]]),
+    ok.
+
+%% Some `amqp_uri:parse/2` error shapes embed the full query string, which can
+%% carry a TLS `password` or other secret. The error tuple must not leak it.
+to_params_error_redacts_query_secrets(_Config) ->
+    BadURI = <<"amqps://guest:guest@localhost/?depth=notanumber&password=s3cret">>,
+    Upstream = #upstream{uris = [BadURI], name = <<"u">>},
+    XorQ = #resource{virtual_host = <<"/">>, kind = exchange, name = <<"x">>},
+    {error, {Info, _SafeURI}} =
+        rabbit_federation_upstream:to_params(Upstream, XorQ),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(io_lib:format("~tp", [Info])),
+                                       <<"s3cret">>)),
+    ok.
+
+%% -------------------------------------------------------------------
+%% rabbit_federation_util:redact_params/1
+%% -------------------------------------------------------------------
+
+redact_params_network(_Config) ->
+    Params = #amqp_params_network{username = <<"fed">>, password = <<"s3cret">>,
+                                  host = "localhost"},
+    Redacted = rabbit_federation_util:redact_params(Params),
+    Formatted = iolist_to_binary(io_lib:format("~tp", [Redacted])),
+    ?assertEqual(nomatch, binary:match(Formatted, <<"s3cret">>)),
+    ?assertNotEqual(nomatch, binary:match(Formatted, <<"fed">>)),
+    ?assertNotEqual(nomatch, binary:match(Formatted, <<"localhost">>)),
+    ok.
+
+redact_params_direct(_Config) ->
+    Params = #amqp_params_direct{username = <<"fed">>, password = <<"s3cret">>},
+    Redacted = rabbit_federation_util:redact_params(Params),
+    Formatted = iolist_to_binary(io_lib:format("~tp", [Redacted])),
+    ?assertEqual(nomatch, binary:match(Formatted, <<"s3cret">>)),
+    ?assertNotEqual(nomatch, binary:match(Formatted, <<"fed">>)),
+    ok.
+
+redact_params_ssl_options_password(_Config) ->
+    Params = #amqp_params_network{ssl_options = [{password, "kp"}, {verify, verify_peer}]},
+    Redacted = rabbit_federation_util:redact_params(Params),
+    Formatted = iolist_to_binary(io_lib:format("~tp", [Redacted])),
+    ?assertEqual(nomatch, binary:match(Formatted, <<"kp">>)),
+    ?assertNotEqual(nomatch, binary:match(Formatted, <<"verify_peer">>)),
+    ok.
+
+redact_params_ssl_options_none(_Config) ->
+    Params = #amqp_params_network{ssl_options = none},
+    ?assertMatch(#amqp_params_network{ssl_options = none},
+                 rabbit_federation_util:redact_params(Params)),
+    ok.
+
+%% -------------------------------------------------------------------
+%% max-hops validation and normalization
+%% -------------------------------------------------------------------
+
+validate_max_hops_accepts_bounds(_Config) ->
+    [?assertEqual([], validation_errors(V)) || V <- [0, 1, 2, 32766, 32767]],
+    ok.
+
+validate_max_hops_rejects_out_of_range(_Config) ->
+    [?assertMatch([{error, _, _}], validation_errors(V)) ||
+        V <- [-1, -32768, 32768, 100000]],
+    ok.
+
+validate_max_hops_rejects_non_integers(_Config) ->
+    [?assertMatch([{error, _, _}], validation_errors(V)) ||
+        V <- [1.5, 1.0, <<"1">>, "1", true, undefined, [1], {1}]],
+    ok.
+
+max_hops_keeps_valid_values(_Config) ->
+    [?assertEqual(V, rabbit_federation_upstream:max_hops(V)) ||
+        V <- [0, 1, 2, 32766, 32767]],
+    ok.
+
+%% Values persisted by versions that did not validate `max-hops` are read
+%% back as is.
+max_hops_normalizes_legacy_values(_Config) ->
+    ?assertEqual(32767, rabbit_federation_upstream:max_hops(40000)),
+    ?assertEqual(32767, rabbit_federation_upstream:max_hops(40000.5)),
+    ?assertEqual(2, rabbit_federation_upstream:max_hops(2.7)),
+    ?assertEqual(0, rabbit_federation_upstream:max_hops(0)),
+    ?assertEqual(0, rabbit_federation_upstream:max_hops(0.5)),
+    ?assertEqual(0, rabbit_federation_upstream:max_hops(-100)),
+    ?assertEqual(0, rabbit_federation_upstream:max_hops(<<"many">>)),
+    ok.
+
+%% Goes through the upstream set component because, unlike the upstream one,
+%% it has no mandatory URI to validate.
+validation_errors(MaxHops) ->
+    Results = rabbit_federation_parameters:validate(
+                <<"/">>, <<"federation-upstream-set">>,
+                <<"a-name">>, [[{<<"upstream">>, <<"an-upstream">>},
+                                {<<"max-hops">>, MaxHops}]], none),
+    [R || Rs <- Results, R <- Rs, R =/= ok].
+
+%% -------------------------------------------------------------------
+%% rabbit_federation_event: cluster name change detection
+%% -------------------------------------------------------------------
+
+%% Regression test: cluster_name used to be an atom, it's now a binary
+cluster_name_parameter_set_triggers_federation_adjust(_Config) ->
+    ok = meck:new(rabbit_federation_parameters, [passthrough]),
+    ok = meck:expect(rabbit_federation_parameters, adjust, fun(_) -> ok end),
+    try
+        Event = #event{type  = parameter_set,
+                       props = [{component, global}, {name, <<"cluster_name">>}]},
+        {ok, []} = rabbit_federation_event:handle_event(Event, []),
+        ?assert(meck:called(rabbit_federation_parameters, adjust, [everything]))
+    after
+        meck:unload(rabbit_federation_parameters)
+    end.
+
+unrelated_global_parameter_set_does_not_trigger_federation_adjust(_Config) ->
+    ok = meck:new(rabbit_federation_parameters, [passthrough]),
+    ok = meck:expect(rabbit_federation_parameters, adjust, fun(_) -> ok end),
+    try
+        Event = #event{type  = parameter_set,
+                       props = [{component, global}, {name, <<"cluster_tags">>}]},
+        {ok, []} = rabbit_federation_event:handle_event(Event, []),
+        ?assertNot(meck:called(rabbit_federation_parameters, adjust, '_'))
+    after
+        meck:unload(rabbit_federation_parameters)
     end.

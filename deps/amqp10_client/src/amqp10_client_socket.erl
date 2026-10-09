@@ -6,8 +6,6 @@
 %%
 -module(amqp10_client_socket).
 
--feature(maybe_expr, enable).
-
 -export([connect/3,
          set_active_once/1,
          send/2,
@@ -24,6 +22,8 @@
                    {active, false},
                    {nodelay, true}]).
 
+-define(DEFAULT_CONNECT_TIMEOUT, 90_000).
+
 -spec connect(inet:hostname() | inet:ip_address(),
               inet:port_number(),
               amqp10_client_connection:connection_config()) ->
@@ -38,7 +38,7 @@ connect(Host, Port, #{ws_path := Path} = Opts) ->
         {ok, _Started} ?= application:ensure_all_started(gun),
         {ok, Pid} ?= gun:open(Host, Port, GunOpts),
         MRef = monitor(process, Pid),
-        {ok, HttpVsn} ?= gun:await_up(Pid, MRef),
+        {ok, HttpVsn} ?= gun:await_up(Pid, maps:get(connect_timeout, Opts, 5000), MRef),
         ok ?= case HttpVsn of
             http ->
                 ok;
@@ -53,16 +53,18 @@ connect(Host, Port, #{ws_path := Path} = Opts) ->
         {ok, StreamRef} ?= ws_upgrade(Pid, Path),
         {ok, {ws, Pid, StreamRef}}
     end;
-connect(Host, Port, #{tls_opts := {secure_port, Opts0}}) ->
+connect(Host, Port, #{tls_opts := {secure_port, Opts0}} = Config) ->
     Opts = rabbit_ssl_options:fix_client(Opts0),
-    case ssl:connect(Host, Port, ?TCP_OPTS ++ Opts) of
+    case ssl:connect(Host, Port, ?TCP_OPTS ++ Opts,
+                     maps:get(connect_timeout, Config, ?DEFAULT_CONNECT_TIMEOUT)) of
         {ok, S} ->
             {ok, {ssl, S}};
         Err ->
             Err
     end;
-connect(Host, Port, _) ->
-    case gen_tcp:connect(Host, Port, ?TCP_OPTS) of
+connect(Host, Port, Config) ->
+    case gen_tcp:connect(Host, Port, ?TCP_OPTS,
+                         maps:get(connect_timeout, Config, ?DEFAULT_CONNECT_TIMEOUT)) of
         {ok, S} ->
             {ok, {tcp, S}};
         Err ->
@@ -73,7 +75,8 @@ ws_upgrade(Pid, Path) ->
     StreamRef = gun:ws_upgrade(Pid,
                                Path,
                                [{<<"cache-control">>, <<"no-cache">>}],
-                               #{protocols => [{<<"amqp">>, gun_ws_h}]}),
+                               #{protocols => [{<<"amqp">>, gun_ws_h}],
+                                 max_frame_size => 16_000_000}),
     receive
         {gun_upgrade, Pid, StreamRef, [<<"websocket">>], _Headers} ->
             {ok, StreamRef};

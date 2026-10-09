@@ -37,12 +37,18 @@
          auth_mechanism = sasl_init_unprocessed :: sasl_init_unprocessed | {binary(), module()},
          auth_state = unauthenticated :: term(),
          credential_timer :: undefined | reference(),
-         properties :: undefined | {map, list(tuple())}
+         properties :: undefined | {map, list(tuple())},
+         %% Whether the peer advertised itself as a JMS client.
+         is_jms = false :: boolean()
         }).
 
 -record(v1,
         {parent :: pid(),
          helper_sup :: pid(),
+         %% A Ranch listener reference, used to enforce the per-node
+         %% `connection_max` limit.
+         %% Will be `undefined` for AMQP-over-WebSockets connections.
+         ranch_ref = undefined :: undefined | ranch:ref(),
          writer = none :: none | pid(),
          heartbeater = none :: none | rabbit_heartbeat:heartbeaters(),
          session_sup = none :: none | pid(),

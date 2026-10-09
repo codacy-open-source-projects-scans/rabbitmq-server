@@ -150,6 +150,39 @@ format_response_test_() ->
                 {error, "Internal Server Error",
                     {[{"Content-Type", "text/xml"}], [{"error", "Boom"}]}},
             ?assertEqual(Expectation, rabbitmq_aws:format_response(Response))
+        end},
+        {"ok, undecodable body", fun() ->
+            Response =
+                {ok, {
+                    {"HTTP/1.1", 200, "OK"}, [{"content-type", "text/xml"}], "not xml"
+                }},
+            Expectation =
+                {error, "Malformed response body", {[{"content-type", "text/xml"}], "not xml"}},
+            ?assertEqual(Expectation, rabbitmq_aws:format_response(Response))
+        end},
+        {"error, undecodable body keeps the status message", fun() ->
+            Response =
+                {ok, {
+                    {"HTTP/1.1", 400, "Bad Request"}, [{"content-type", "text/xml"}], "not xml"
+                }},
+            Expectation =
+                {error, "Bad Request", {[{"content-type", "text/xml"}], "not xml"}},
+            ?assertEqual(Expectation, rabbitmq_aws:format_response(Response))
+        end},
+        {"no content-type header, empty body", fun() ->
+            Response = {ok, {{"HTTP/1.1", 200, "OK"}, [], ""}},
+            ?assertMatch({error, "Malformed response body", _}, rabbitmq_aws:format_response(Response))
+        end},
+        {"3xx status code does not crash", fun() ->
+            Response =
+                {ok, {
+                    {"HTTP/1.1", 301, "Moved Permanently"}, [{"content-type", "text/xml"}],
+                    "<test>Value</test>"
+                }},
+            Expectation =
+                {error, "Moved Permanently",
+                    {[{"content-type", "text/xml"}], "<test>Value</test>"}},
+            ?assertEqual(Expectation, rabbitmq_aws:format_response(Response))
         end}
     ].
 
@@ -195,7 +228,7 @@ gen_server_call_test_() ->
                             {"https://ec2.us-east-1.amazonaws.com/?Action=DescribeTags&Version=2015-10-01",
                                 _Headers},
                             _Options,
-                            []
+                            [{headers_as_is, true}]
                         ) ->
                             {ok, {
                                 {"HTTP/1.0", 200, "OK"},
@@ -366,6 +399,11 @@ maybe_decode_body_test_() ->
             ContentType = {"text", "html"},
             Body = "<html><head></head><body></body></html>",
             ?assertEqual(Body, rabbitmq_aws:maybe_decode_body(ContentType, Body))
+        end},
+        {"text/xml, not xml", fun() ->
+            ContentType = {"text", "xml"},
+            Body = "not xml",
+            ?assertMatch({error, _}, rabbitmq_aws:maybe_decode_body(ContentType, Body))
         end}
     ].
 
@@ -415,7 +453,7 @@ perform_request_test_() ->
                     meck:expect(
                         httpc,
                         request,
-                        fun(get, {URI, _Headers}, _Options, []) ->
+                        fun(get, {URI, _Headers}, _Options, [{headers_as_is, true}]) ->
                             case URI of
                                 ExpectURI ->
                                     {ok, {
@@ -452,7 +490,14 @@ perform_request_test_() ->
                     Body = "",
                     Options = [],
                     Host = undefined,
-                    meck:expect(httpc, request, fun(get, {_URI, _Headers}, _Options, []) ->
+                    meck:expect(httpc, request, fun(
+                        get,
+                        {_URI, _Headers},
+                        _Options,
+                        [
+                            {headers_as_is, true}
+                        ]
+                    ) ->
                         {ok, {
                             {"HTTP/1.0", 400, "RequestFailure"},
                             [{"content-type", "application/json"}],
@@ -502,6 +547,83 @@ perform_request_test_() ->
                     State = #state{error = unit_test},
                     Expectation = {{error, {credentials, State#state.error}}, State},
                     ?assertEqual(Expectation, rabbitmq_aws:perform_request_creds_error(State))
+                end
+            }
+        ]
+    }.
+
+perform_request_headers_as_is_test_() ->
+    {
+        foreach,
+        fun() ->
+            meck:new(httpc, []),
+            meck:new(rabbitmq_aws_config, []),
+            [httpc, rabbitmq_aws_config]
+        end,
+        fun meck:unload/1,
+        [
+            {
+                "body-less request passes {headers_as_is, true} so the signed "
+                "content-length header is not stripped by httpc (SignatureDoesNotMatch)",
+                fun() ->
+                    State = #state{
+                        access_key = "AKIDEXAMPLE",
+                        secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                        region = "us-east-1"
+                    },
+                    meck:expect(httpc, request, fun(get, {_URI, _Headers}, _Options, HTTPCOpts) ->
+                        put(httpc_options, HTTPCOpts),
+                        {ok, {
+                            {"HTTP/1.0", 200, "OK"},
+                            [{"content-type", "application/json"}],
+                            "{\"pass\": true}"
+                        }}
+                    end),
+                    rabbitmq_aws:perform_request(
+                        State,
+                        "s3",
+                        get,
+                        [],
+                        "/bucket/key",
+                        "",
+                        [],
+                        undefined
+                    ),
+                    ?assertEqual([{headers_as_is, true}], get(httpc_options)),
+                    meck:validate(httpc)
+                end
+            },
+            {
+                "body-bearing request is unaffected (httpc keeps content-length "
+                "when a body is present), so headers_as_is is not added",
+                fun() ->
+                    State = #state{
+                        access_key = "AKIDEXAMPLE",
+                        secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                        region = "us-east-1"
+                    },
+                    meck:expect(httpc, request, fun(
+                        post, {_URI, _Headers, _ContentType, _Body}, _Options, HTTPCOpts
+                    ) ->
+                        put(httpc_options, HTTPCOpts),
+                        {ok, {
+                            {"HTTP/1.0", 200, "OK"},
+                            [{"content-type", "application/json"}],
+                            "{\"pass\": true}"
+                        }}
+                    end),
+                    rabbitmq_aws:perform_request(
+                        State,
+                        "s3",
+                        post,
+                        [{"content-type", "application/x-amz-json-1.0"}],
+                        "/bucket/key",
+                        "{\"some\": \"body\"}",
+                        [],
+                        undefined
+                    ),
+                    ?assertNot(lists:member({headers_as_is, true}, get(httpc_options))),
+                    meck:validate(httpc)
                 end
             }
         ]

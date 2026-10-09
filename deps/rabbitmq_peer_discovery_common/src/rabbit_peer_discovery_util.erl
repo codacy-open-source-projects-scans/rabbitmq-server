@@ -21,7 +21,8 @@
          as_proplist/1,
          as_map/1,
          stringify_error/1,
-         maybe_backend_configured/4
+         maybe_backend_configured/4,
+         redact_secrets/1
         ]).
 
 -include_lib("kernel/include/logger.hrl").
@@ -37,6 +38,12 @@
                  {dstaddr,inet:ip_address()} | {hwaddr,[byte()]}.
 
 -type stringifyable() :: atom() | binary() | string() | integer().
+
+%% Config keys across all peer discovery backends whose values are
+%% credentials and must never appear in logs, even at debug level.
+-define(SECRET_CONFIG_KEYS, [aws_access_key, aws_secret_key,
+                              consul_acl_token, etcd_password,
+                              ssl_options]).
 
 
 -spec getenv(Key :: string() | undefined) -> string() | false.
@@ -59,7 +66,7 @@ getenv(Key) ->
 -spec process_getenv_value(Key :: string(), Value :: string() | false)
     -> string() | false.
 process_getenv_value(Key, false) ->
-  maybe_getenv_with_subkey(Key, string:left(Key, 9));
+  maybe_getenv_with_subkey(Key, string:slice(Key, 0, 9));
 process_getenv_value(_, Value) -> Value.
 
 
@@ -250,7 +257,7 @@ node_name_parse(Value) ->
     -> string().
 node_name_parse(true, Value) -> Value;
 node_name_parse(false, Value) ->
-  Parts = string:tokens(Value, "."),
+  Parts = string:lexemes(Value, "."),
   node_name_parse(length(Parts), Value, Parts).
 
 
@@ -283,7 +290,7 @@ node_prefix() ->
       false -> ?DEFAULT_NODE_PREFIX;
       Value ->
           _ = rabbit_data_coercion:to_list(getenv("RABBITMQ_NODENAME")),
-          lists:nth(1, string:tokens(Value, "@"))
+          hd(string:lexemes(Value, "@"))
   end.
 
 
@@ -295,7 +302,7 @@ node_prefix() ->
 %%--------------------------------------------------------------------
 -spec parse_port(Value :: integer() | string()) -> integer().
 parse_port(Value) when is_list(Value) ->
-  as_integer(lists:last(string:tokens(Value, ":")));
+  as_integer(lists:last(string:lexemes(Value, ":")));
 parse_port(Value) -> as_integer(Value).
 
 
@@ -386,7 +393,7 @@ maybe_backend_configured(BackendConfigKey,
         {ok, ClusterFormation} ->
             ?LOG_DEBUG(
                "Peer discovery: translated cluster formation configuration: ~tp",
-               [ClusterFormation],
+               [redact_secrets(ClusterFormation)],
                #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
             case proplists:get_value(BackendConfigKey, ClusterFormation) of
                 undefined ->
@@ -394,11 +401,45 @@ maybe_backend_configured(BackendConfigKey,
                 Proplist  ->
                     ?LOG_DEBUG(
                        "Peer discovery: cluster formation backend configuration: ~tp",
-                       [Proplist],
+                       [redact_secrets(Proplist)],
                        #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
                     ConfiguredFun(Proplist)
             end
     end.
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Return a copy of a peer discovery config map or proplist with the
+%% values of any known credential keys replaced with "...".
+%% @end
+%%--------------------------------------------------------------------
+-spec redact_secrets(map() | proplists:proplist()) -> map() | proplists:proplist().
+redact_secrets(Map) when is_map(Map) ->
+    maps:map(fun redact_secret_map_value/2, Map);
+redact_secrets(Proplist) when is_list(Proplist) ->
+    lists:map(fun redact_secret_entry/1, Proplist).
+
+-spec redact_secret_map_value(Key :: atom(), Value :: term()) -> term().
+redact_secret_map_value(Key, Value) ->
+    case lists:member(Key, ?SECRET_CONFIG_KEYS) of
+        true  -> "...";
+        false -> Value
+    end.
+
+-spec redact_secret_entry(Entry :: term()) -> term().
+redact_secret_entry({Key, Value}) ->
+    case lists:member(Key, ?SECRET_CONFIG_KEYS) of
+        true  -> {Key, "..."};
+        false -> {Key, redact_nested_proplist(Value)}
+    end;
+redact_secret_entry(Other) ->
+    Other.
+
+-spec redact_nested_proplist(Value :: term()) -> term().
+redact_nested_proplist([{Key, _} | _] = Proplist) when is_atom(Key) ->
+    redact_secrets(Proplist);
+redact_nested_proplist(Other) ->
+    Other.
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -411,7 +452,7 @@ as_list(Value) when is_atom(Value) ; is_integer(Value) ; is_binary(Value) ->
   [Value];
 as_list(Value) when is_list(Value) ->
   Parse = fun(T) ->
-    S = string:strip(T),
+    S = string:trim(T),
     case string:to_float(S) of
       {Float, []} -> Float;
       _ -> case string:to_integer(S) of
@@ -421,7 +462,7 @@ as_list(Value) when is_list(Value) ->
     end
   end,
   case io_lib:printable_list(Value) or io_lib:printable_unicode_list(Value) of
-    true -> [Parse(T) || T <- string:tokens(Value, ",")];
+    true -> [Parse(T) || T <- string:lexemes(Value, ",")];
     false -> Value
   end;
 as_list(Value) ->

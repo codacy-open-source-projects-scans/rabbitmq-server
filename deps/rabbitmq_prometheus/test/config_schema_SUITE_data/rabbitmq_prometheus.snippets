@@ -17,6 +17,84 @@
                          ]}],
    [rabbitmq_prometheus]},
 
+   {additional_tcp_listeners,
+    "prometheus.listeners.tcp.1 = 15680
+     prometheus.listeners.tcp.2 = 192.168.1.2:15681",
+    [{rabbitmq_prometheus,[
+                           {tcp_listeners, [15680, {"192.168.1.2", 15681}]}
+                          ]}],
+    [rabbitmq_prometheus]},
+
+   {additional_ipv6_listener,
+    "prometheus.listeners.tcp.1 = 127.0.0.1:15680
+     prometheus.listeners.tcp.2 = ::1:15681",
+    [{rabbitmq_prometheus,[
+                           {tcp_listeners, [{"127.0.0.1", 15680}, {"::1", 15681}]}
+                          ]}],
+    [rabbitmq_prometheus]},
+
+   {additional_ssl_listeners,
+    "prometheus.ssl.ip   = 192.168.1.2
+     prometheus.ssl.port = 15691
+     prometheus.ssl.cacertfile = test/config_schema_SUITE_data/certs/ca_certificate.pem
+     prometheus.ssl.certfile = test/config_schema_SUITE_data/certs/server_certificate.pem
+     prometheus.ssl.keyfile = test/config_schema_SUITE_data/certs/server_key.pem
+     prometheus.ssl.verify   = verify_none
+     prometheus.ssl.fail_if_no_peer_cert = false
+     prometheus.listeners.ssl.1 = 127.0.0.1:15682
+     prometheus.listeners.ssl.2 = 15683",
+    [{rabbitmq_prometheus,[
+                           {ssl_config,[
+                                        {ip, "192.168.1.2"},
+                                        {port,15691},
+                                        {ssl_opts, [
+                                          {cacertfile,"test/config_schema_SUITE_data/certs/ca_certificate.pem"},
+                                          {certfile,"test/config_schema_SUITE_data/certs/server_certificate.pem"},
+                                          {keyfile,"test/config_schema_SUITE_data/certs/server_key.pem"},
+                                          {verify, verify_none},
+                                          {fail_if_no_peer_cert, false}
+                                        ]}
+                                    ]},
+                           {ssl_listeners, [{"127.0.0.1", 15682}, 15683]}
+                          ]}],
+    [rabbitmq_prometheus]},
+
+   {tcp_listener_with_additional_listeners,
+    "prometheus.tcp.port = 15692
+     prometheus.listeners.tcp.1 = 127.0.0.1:15680",
+    [{rabbitmq_prometheus,[
+                           {tcp_config,[
+                                        {port,15692}
+                                       ]},
+                           {tcp_listeners, [{"127.0.0.1", 15680}]}
+                          ]}],
+    [rabbitmq_prometheus]},
+
+   {tcp_options_with_additional_listeners,
+    "prometheus.tcp.compress = true
+     prometheus.tcp.idle_timeout = 120
+     prometheus.listeners.tcp.1 = 15680",
+    [
+     {rabbitmq_prometheus, [
+                            {tcp_config, [{cowboy_opts, [{compress,     true},
+                                                       {idle_timeout, 120}]}]},
+                            {tcp_listeners, [15680]}
+                           ]}
+    ], [rabbitmq_prometheus]
+   },
+
+   {one_key_listener_with_additional_listeners,
+    "prometheus.tcp.listener = 192.1.1.2:15676
+     prometheus.listeners.tcp.1 = 15680",
+    [{rabbitmq_prometheus,[
+                           {tcp_config,[
+                                        {ip, "192.1.1.2"},
+                                        {port,15676}
+                                       ]},
+                           {tcp_listeners, [15680]}
+                          ]}],
+    [rabbitmq_prometheus]},
+
    %%
    %% TCP listener
    %%
@@ -103,6 +181,24 @@
     [
      {rabbitmq_prometheus, [
                             {tcp_config, [{cowboy_opts, [{max_keepalive, 120}]}]}
+                           ]}
+    ], [rabbitmq_prometheus]
+   },
+
+   {tcp_listener_max_connections_integer,
+    "prometheus.tcp.max_connections = 4096",
+    [
+     {rabbitmq_prometheus, [
+                            {tcp_config, [{max_connections, 4096}]}
+                           ]}
+    ], [rabbitmq_prometheus]
+   },
+
+   {tcp_listener_max_connections_infinity,
+    "prometheus.tcp.max_connections = infinity",
+    [
+     {rabbitmq_prometheus, [
+                            {tcp_config, [{max_connections, infinity}]}
                            ]}
     ], [rabbitmq_prometheus]
    },
@@ -298,6 +394,24 @@
     ], [rabbitmq_prometheus]
    },
 
+   {tls_listener_max_connections_integer,
+    "prometheus.ssl.max_connections = 4096",
+    [
+     {rabbitmq_prometheus, [
+                            {ssl_config, [{max_connections, 4096}]}
+                           ]}
+    ], [rabbitmq_prometheus]
+   },
+
+   {tls_listener_max_connections_infinity,
+    "prometheus.ssl.max_connections = infinity",
+    [
+     {rabbitmq_prometheus, [
+                            {ssl_config, [{max_connections, infinity}]}
+                           ]}
+    ], [rabbitmq_prometheus]
+   },
+
   {authentication,
     "prometheus.authentication.enabled = true",
     [
@@ -305,5 +419,27 @@
                             {authentication, [{enabled, true}]}
                            ]}
     ], [rabbitmq_prometheus]
-   }
+   },
+
+   {tls_listener_password_plain,
+    "prometheus.ssl.password = t0p$3cr3t",
+    [{rabbitmq_prometheus,[
+                           {ssl_config,[
+                                        {ssl_opts, [
+                                          {password, <<"t0p$3cr3t">>}
+                                        ]}
+                                       ]}
+                          ]}],
+    [rabbitmq_prometheus]},
+
+   {tls_listener_password_encrypted,
+    "prometheus.ssl.password = encrypted:GhC4J5lh2DUkbdyKO0aMI8aYJ54mwe4eEWzou4yRFAHMF82IbD6cRiYAiBa8UIzR",
+    [{rabbitmq_prometheus,[
+                           {ssl_config,[
+                                        {ssl_opts, [
+                                          {password, {encrypted, <<"GhC4J5lh2DUkbdyKO0aMI8aYJ54mwe4eEWzou4yRFAHMF82IbD6cRiYAiBa8UIzR">>}}
+                                        ]}
+                                       ]}
+                          ]}],
+    [rabbitmq_prometheus]}
 ].

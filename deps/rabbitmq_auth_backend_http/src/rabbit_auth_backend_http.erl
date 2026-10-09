@@ -51,7 +51,7 @@ user_login_authentication(Username, AuthProps) ->
                     {refused, "Denied by the backing HTTP service", []};
                 "allow" ++ Rest ->
                     Tags = [rabbit_data_coercion:to_atom(T)
-                            || T <- string:tokens(Rest, " ")],
+                            || T <- string:lexemes(Rest, " ")],
                     {ok, #auth_user{
                             username = Username,
                             tags = Tags,
@@ -247,7 +247,7 @@ do_http_req(Path0, Query) ->
             ?LOG_DEBUG("auth_backend_http: response code is ~tp, body: '~ts'", [Code, Body]),
             case lists:member(Code, ?SUCCESSFUL_RESPONSE_CODES) of
                 true ->
-                    string:strip(Body);
+                    string:trim(Body);
                 false ->
                     {error, {Code, Body}}
             end;
@@ -294,10 +294,7 @@ join_tags(Tags) ->
 parse_peeraddr(unknown) ->
     rabbit_data_coercion:to_list(unknown);
 parse_peeraddr(PeerAddr) ->
-    handle_inet_ntoa_peeraddr(inet:ntoa(PeerAddr), PeerAddr).
-
--spec handle_inet_ntoa_peeraddr({'error', term()} | string(), inet:ip_address() | unknown) -> string().
-handle_inet_ntoa_peeraddr({error, einval}, PeerAddr) ->
-    rabbit_data_coercion:to_list(PeerAddr);
-handle_inet_ntoa_peeraddr(PeerAddrStr, _PeerAddr0) ->
-    PeerAddrStr.
+    case rabbit_misc:ntoa(PeerAddr) of
+        {error, einval} -> rabbit_data_coercion:to_list(PeerAddr);
+        Str             -> Str
+    end.

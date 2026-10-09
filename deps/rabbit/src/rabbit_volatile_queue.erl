@@ -169,18 +169,43 @@ exists(#resource{kind = queue,
 supports_stateful_delivery() ->
     false.
 
+%% A reply carries a single reply-to name; this clause keeps that hot path
+%% free of the dedup bookkeeping below.
+deliver([{Q, stateless}], Msg, #{correlation := Corr})
+  when Corr =/= undefined ->
+    deliver0(Q, Msg),
+    {[], [{settled, amqqueue:get_name(Q), [Corr]}]};
+deliver([{Q, stateless}], Msg, #{}) ->
+    deliver0(Q, Msg),
+    {[], []};
+%% Multiple targets can point to the same target PID. Make sure we cast only one message per PID.
 deliver(Qs, Msg, #{correlation := Corr})
   when Corr =/= undefined ->
     Corrs = [Corr],
-    Actions = lists:map(fun({Q, stateless}) ->
-                                deliver0(Q, Msg),
-                                {settled, amqqueue:get_name(Q), Corrs}
-                        end, Qs),
+    {Actions, _Seen} =
+        lists:mapfoldl(fun({Q, stateless}, Seen) ->
+                               Pid = amqqueue:get_pid(Q),
+                               Seen1 = case Seen of
+                                           #{Pid := _} ->
+                                               Seen;
+                                           _ ->
+                                               deliver0(Q, Msg),
+                                               Seen#{Pid => []}
+                                       end,
+                               {{settled, amqqueue:get_name(Q), Corrs}, Seen1}
+                       end, #{}, Qs),
     {[], Actions};
 deliver(Qs, Msg, #{}) ->
-    lists:foreach(fun({Q, stateless}) ->
-                          deliver0(Q, Msg)
-                  end, Qs),
+    _ = lists:foldl(fun({Q, stateless}, Seen) ->
+                            Pid = amqqueue:get_pid(Q),
+                            case Seen of
+                                #{Pid := _} ->
+                                    Seen;
+                                _ ->
+                                    deliver0(Q, Msg),
+                                    Seen#{Pid => []}
+                            end
+                    end, #{}, Qs),
     {[], []}.
 
 deliver0(Q, Msg) ->
@@ -208,7 +233,7 @@ local_call(Pid, Request) ->
 
 is_local(Pid) ->
     rabbit_amqp_session:is_local(Pid) orelse
-    pg_local:in_group(rabbit_channels, Pid).
+    rabbit_channel:is_local(Pid).
 
 handle_event(QName, {deliver, Msg}, #?STATE{name = QName,
                                             ctag = Ctag,
@@ -341,7 +366,12 @@ policy_apply_to_name() ->
     rabbit_misc:resource_name().
 new_name() ->
     EncodedPid = encode_pid(self()),
-    EncodedKey = base64:encode(rabbit_guid:gen()),
+    %% The suffix is a delivery capability, not a consumption one:
+    %% `consume/3` checks the caller's pid regardless of it, but
+    %% `rabbit_queue_type:handle_event/3` matches deliveries on the full
+    %% name. `gen/0` advances a per-process chain reversibly, so a party
+    %% that has seen one suffix can derive the next; `gen_secure/0` can't.
+    EncodedKey = base64:encode(rabbit_guid:gen_secure()),
     <<?PREFIX, EncodedPid/binary, ".", EncodedKey/binary>>.
 
 %% This pid encoding function produces values that are of mostly fixed size
@@ -377,19 +407,30 @@ pid_from_name(<<?PREFIX, Bin/binary>>, CandidateNodes) ->
     try
         [PidBase64, _KeyBase64] = binary:split(Bin, Cp),
         PidBin = base64:decode(PidBase64),
-        PidParts0 = #{node := ShortenedNodename} = rabbit_pid_codec:decompose_from_binary(PidBin),
-        {_, NodeHash} = rabbit_nodes_common:parts(ShortenedNodename),
-        case maps:get(list_to_integer(NodeHash), CandidateNodes, undefined) of
-            undefined ->
-                error;
-            Candidate ->
-                PidParts = maps:update(node, Candidate, PidParts0),
-                {ok, rabbit_pid_codec:recompose(PidParts)}
+        case rabbit_pid_codec:decompose_from_binary(PidBin) of
+            {ok, #{node := ShortenedNodename} = PidParts0} ->
+                NodeHash = node_hash_from_binary(ShortenedNodename),
+                case maps:get(NodeHash, CandidateNodes, undefined) of
+                    undefined ->
+                        error;
+                    Candidate ->
+                        PidParts = maps:update(node, Candidate, PidParts0),
+                        {ok, rabbit_pid_codec:recompose(PidParts)}
+                end;
+            error ->
+                error
         end
     catch error:_ -> error
     end;
 pid_from_name(_, _) ->
     error.
+
+%% Returns the integer hash following "@" in a synthetic node-name binary
+%% such as <<"reply@1234567">>. Malformed input raises and is caught by
+%% the surrounding try.
+node_hash_from_binary(NodeBin) ->
+    [_Prefix, Suffix] = binary:split(NodeBin, <<"@">>),
+    binary_to_integer(Suffix).
 
 nodes_with_hashes() ->
     #{erlang:phash2(Node) => Node || Node <- rabbit_nodes:list_members()}.

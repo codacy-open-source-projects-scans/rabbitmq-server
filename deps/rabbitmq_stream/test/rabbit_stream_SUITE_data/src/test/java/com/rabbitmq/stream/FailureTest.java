@@ -359,7 +359,9 @@ public class FailureTest {
       // stop the first node (this is where the stream leader is)
       Host.rabbitmqctl("stop_app");
 
-      assertThat(reconnectionLatch.await(10, TimeUnit.SECONDS)).isTrue();
+      // the coordinator can back off a failed member action by up to ~10 seconds
+      // before electing the new leader, so give the reconnection task headroom
+      assertThat(reconnectionLatch.await(30, TimeUnit.SECONDS)).isTrue();
 
       // let's publish for a bit of time
       Thread.sleep(2000);
@@ -373,8 +375,10 @@ public class FailureTest {
 
     Client metadataClient = cf.get(new Client.ClientParameters().port(streamPortNode2()));
     // wait until all the replicas are there
+    // the coordinator can back off a failed member action by up to ~10 seconds
+    // before retrying, so give this more headroom than a single retry cycle
     waitAtMost(
-        Duration.ofSeconds(5),
+        Duration.ofSeconds(15),
         () -> {
           Client.StreamMetadata m = metadataClient.metadata(stream).get(stream);
           return m.getReplicas().size() == 2;
@@ -429,6 +433,7 @@ public class FailureTest {
 
   @Test
   void consumerReattachesToOtherReplicaWhenReplicaGoesAway() throws Exception {
+    LOGGER.info("Stream name is {}", stream);
     executorService = Executors.newCachedThreadPool();
     Client metadataClient = cf.get(new Client.ClientParameters().port(streamPortNode1()));
     Map<String, Client.StreamMetadata> metadata = metadataClient.metadata(stream);
@@ -514,42 +519,64 @@ public class FailureTest {
 
     CountDownLatch reconnectionLatch = new CountDownLatch(1);
     AtomicReference<Client.ShutdownListener> shutdownListenerReference = new AtomicReference<>();
+    Runnable resubscribe =
+        () -> {
+          AtomicInteger newReplicaPort = new AtomicInteger(-1);
+          waitAtMost(
+              Duration.ofSeconds(5),
+              () -> {
+                try {
+                  Client.StreamMetadata m = metadataClient.metadata(stream).get(stream);
+                  newReplicaPort.set(m.getReplicas().get(0).getPort());
+                  LOGGER.info("Metadata: {}", m);
+                  return true;
+                } catch (Exception e) {
+                  return false;
+                }
+              });
+          LOGGER.info("Replica port is {}", newReplicaPort);
+
+          Client newConsumer =
+              cf.get(
+                  new Client.ClientParameters()
+                      .port(newReplicaPort.get())
+                      .shutdownListener(shutdownListenerReference.get())
+                      .chunkListener(credit())
+                      .messageListener(messageListener));
+
+          LOGGER.info("Subscribing...");
+          newConsumer.subscribe(
+              (byte) 1, stream, OffsetSpecification.offset(lastProcessedOffset.get() + 1), 10);
+          LOGGER.info("Subscribed");
+
+          generation.incrementAndGet();
+          reconnectionLatch.countDown();
+          LOGGER.info("Shutdown listener done");
+        };
     Client.ShutdownListener shutdownListener =
         shutdownContext -> {
+          LOGGER.info("Shutdown reason: {}", shutdownContext.getShutdownReason());
           if (shutdownContext.getShutdownReason()
               == Client.ShutdownContext.ShutdownReason.UNKNOWN) {
             // avoid long-running task in the IO thread
             executorService.submit(
                 () -> {
-                  AtomicInteger newReplicaPort = new AtomicInteger(-1);
-                  waitAtMost(
-                      Duration.ofSeconds(5),
-                      () -> {
-                        try {
-                          Client.StreamMetadata m = metadataClient.metadata(stream).get(stream);
-                          newReplicaPort.set(m.getReplicas().get(0).getPort());
-                          return true;
-                        } catch (Exception e) {
-                          return false;
-                        }
-                      });
-
-                  Client newConsumer =
-                      cf.get(
-                          new Client.ClientParameters()
-                              .port(newReplicaPort.get())
-                              .shutdownListener(shutdownListenerReference.get())
-                              .chunkListener(credit())
-                              .messageListener(messageListener));
-
-                  newConsumer.subscribe(
-                      (byte) 1,
-                      stream,
-                      OffsetSpecification.offset(lastProcessedOffset.get() + 1),
-                      10);
-
-                  generation.incrementAndGet();
-                  reconnectionLatch.countDown();
+                  int attempts = 0;
+                  while (attempts < 3) {
+                    try {
+                      resubscribe.run();
+                      break;
+                    } catch (RuntimeException e) {
+                      LOGGER.warn("Error while re-subscribing: {}", e.getMessage());
+                      try {
+                        Thread.sleep(1000);
+                      } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        break;
+                      }
+                      attempts++;
+                    }
+                  }
                 });
           }
         };

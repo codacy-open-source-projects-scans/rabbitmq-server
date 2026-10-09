@@ -12,6 +12,7 @@
 
 -import(rabbit_ct_helpers, [eventually/1]).
 -import(shovel_test_utils, [await_autodelete/2,
+                            with_duration_floor/3,
                             invalid_param/2, invalid_param/3,
                             valid_param/2, valid_param/3,
                             with_amqp091_ch/2, amqp091_publish_expect/5,
@@ -39,9 +40,14 @@ groups() ->
           headers,
           restart,
           validation,
+          runtime_parse_failure,
           security_validation,
           get_connection_name,
-          credit_flow
+          credit_flow,
+          delete_after_duration_autodeletes,
+          delete_after_duration_runs,
+          delete_after_duration_runs_long,
+          delete_after_duration_expired_handled
         ]},
     {quorum_queue_tests, [], [
           quorum_queues
@@ -300,6 +306,17 @@ validation(Config) ->
     invalid_param(Config,
                   [{<<"src-delete-after">>,    <<"whenever">>} | QURIs]),
 
+    valid_param(Config,
+                [{<<"src-delete-after-duration">>, 60} | QURIs]),
+    invalid_param(Config,
+                  [{<<"src-delete-after-duration">>, 0} | QURIs]),
+    invalid_param(Config,
+                  [{<<"src-delete-after-duration">>, <<"whenever">>} | QURIs]),
+    invalid_param(Config,
+                  [{<<"src-delete-after-duration">>, 100 * 365 * 24 * 60 * 60} | QURIs]),
+    valid_param(Config,
+                [{<<"src-delete-after-duration">>, 1} | QURIs]),
+
     %% Check properties have to look property-ish
     valid_param(Config,
                 [{<<"src-exchange">>, <<"test">>},
@@ -330,6 +347,49 @@ validation(Config) ->
                   [{<<"delete-after">>,    1},
                    {<<"ack-mode">>,        <<"no-ack">>} | QURIs]),
     ok.
+
+%% A definition that fails to parse at worker startup, e.g. one that
+%% declaration-time validation could not reject, must stop the worker
+%% with the quiet `{shutdown, restart}` reason and leave an inspectable
+%% status entry rather than crash with a stack trace.
+runtime_parse_failure(Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, ?MODULE, runtime_parse_failure1, []).
+
+runtime_parse_failure1() ->
+    Name = {<<"/">>, <<"runtime-parse-failure">>},
+    %% An unknown publish property fails in rabbit_shovel_parameters:parse/3,
+    %% past the declaration-time validation this definition never went through.
+    Def = #{<<"src-uri">>            => <<"amqp://">>,
+            <<"dest-uri">>           => <<"amqp://">>,
+            <<"src-queue">>          => <<"src">>,
+            <<"dest-queue">>         => <<"dest">>,
+            <<"publish-properties">> => #{<<"nonexistent">> => <<>>}},
+    {ok, Pid} = gen_server2:start(rabbit_shovel_worker, [dynamic, Name, Def], []),
+    MRef = erlang:monitor(process, Pid),
+    receive
+        {'DOWN', MRef, process, Pid, Reason} ->
+            {shutdown, restart} = Reason
+    after 30_000 ->
+            exit(shovel_worker_did_not_stop)
+    end,
+    %% rabbit_shovel_status:report/3 is asynchronous, so the worker's exit
+    %% can be observed before the status entry lands.
+    Expected = {terminated, "failed to parse configuration"},
+    ok = await_status(Name, Expected, 50),
+    ok = rabbit_shovel_status:remove(Name).
+
+await_status(Name, _Expected, 0) ->
+    exit({shovel_status_not_reported, Name, rabbit_shovel_status:status()});
+await_status(Name, Expected, Retries) ->
+    case lists:any(fun(Status) ->
+                           element(1, Status) =:= Name andalso
+                               element(3, Status) =:= Expected
+                   end, rabbit_shovel_status:status()) of
+        true  -> ok;
+        false -> timer:sleep(100),
+                 await_status(Name, Expected, Retries - 1)
+    end.
 
 security_validation(Config) ->
     ok = rabbit_ct_broker_helpers:rpc(Config, 0,
@@ -450,7 +510,15 @@ credit_flow(Config) ->
                             Cnt =:= 0
                     end,
                     5000),
-                  #{messages := 1000} = message_count(Config, <<"dest">>),
+                  %% With on-publish ack mode the shovel acks in src when it publishes
+                  %% to dest (no confirms), so src reaching 0 does not guarantee that
+                  %% dest has already received all messages from the broker's perspective.
+                  rabbit_ct_helpers:await_condition(
+                    fun() ->
+                            #{messages := Cnt} = message_count(Config, <<"dest">>),
+                            Cnt =:= 1000
+                    end,
+                    5000),
                   [{_, P, _}] =
                       rabbit_ct_broker_helpers:rpc(
                         Config, 0, recon, proc_count, [message_queue_len, 1]),
@@ -466,6 +534,55 @@ credit_flow(Config) ->
                   set_default_credit(Config, OrigCredit)
               end
       end).
+
+delete_after_duration_autodeletes(Config) ->
+    %% duration to be coerced to the floor
+    Duration = 1,
+    Floor = 15,
+    with_duration_floor(Config, Floor, fun() ->
+        Before = erlang:monotonic_time(millisecond),
+        shovel_test_utils:set_param(
+          Config, <<"test">>,
+          [{<<"src-queue">>,                 <<"src">>},
+           {<<"dest-queue">>,                <<"dest">>},
+           {<<"src-delete-after">>,          <<"never">>},
+           {<<"src-delete-after-duration">>, Duration}]),
+
+        await_autodelete(Config, <<"test">>),
+
+        Elapsed = erlang:monotonic_time(millisecond) - Before,
+        ?assert(Elapsed >= Floor * 1000)
+    end),
+    ok.
+
+delete_after_duration_runs(Config) ->
+    with_amqp091_ch(Config,
+      fun (Ch) ->
+              shovel_test_utils:set_param(
+                Config, <<"test">>,
+                [{<<"src-queue">>,                 <<"src">>},
+                 {<<"dest-queue">>,                <<"dest">>},
+                 {<<"src-delete-after-duration">>, 300}]),
+              amqp091_publish_expect(Ch, <<>>, <<"src">>, <<"dest">>, <<"hello">>),
+              ?assertEqual(running,
+                           shovel_test_utils:get_shovel_status(Config, <<"test">>))
+      end).
+
+delete_after_duration_runs_long(Config) ->
+    MaxSeconds = 10 * 365 * 24 * 60 * 60,
+    shovel_test_utils:set_param(
+      Config, <<"test">>,
+      [{<<"src-queue">>,                 <<"src">>},
+       {<<"dest-queue">>,                <<"dest">>},
+       {<<"src-delete-after-duration">>, MaxSeconds}]),
+    ?assertEqual(running,
+                 shovel_test_utils:get_shovel_status(Config, <<"test">>)).
+
+delete_after_duration_expired_handled(_Config) ->
+    ?assertEqual({stop, {shutdown, autodelete}},
+                 rabbit_amqp091_shovel:handle_source(
+                   {internal, delete_after_duration_expired}, #{})),
+    ok.
 
 %%----------------------------------------------------------------------------
 publish_count(Ch, X, Key, M, Count) ->
@@ -520,7 +637,9 @@ spawn_suspender_proc(Pid) ->
         spawn(
           fun() ->
                   register(suspender, self()),
-                  Res = catch (true = erlang:suspend_process(Pid)),
+                  Res = try true = erlang:suspend_process(Pid)
+                          catch _:E -> E
+                          end,
                   ReqPid ! {suspend_res, self(), Res},
                   %% wait indefinitely
                   receive stop -> ok end
@@ -535,7 +654,10 @@ find_shovel_pid(Config) ->
     [ShovelPid] = [P || P <- rabbit_ct_broker_helpers:rpc(
                                Config, 0, erlang, processes, []),
                         rabbit_shovel_worker ==
-                            (catch element(1, erpc:call(node(P), proc_lib, initial_call, [P])))],
+                            (try element(1, erpc:call(
+                                               node(P), proc_lib, initial_call, [P]))
+                             catch _:_ -> undefined
+                             end)],
     ShovelPid.
 
 get_shovel_state(ShovelPid) ->

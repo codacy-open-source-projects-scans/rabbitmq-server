@@ -42,7 +42,7 @@
          get_global_counters/3, get_global_counters/4,
          expect_publishes/3,
          connect/2, connect/3, connect/4,
-         get_events/1, assert_event_type/2, assert_event_prop/2,
+         get_events/1, await_events/2, assert_event_type/2, assert_event_prop/2,
          await_exit/1, await_exit/2,
          publish_qos1_timeout/4,
          non_clean_sess_opts/0]).
@@ -601,11 +601,12 @@ events(Config) ->
     ok = rabbit_ct_broker_helpers:add_code_path_to_all_nodes(Config, event_recorder),
     Server = get_node_config(Config, 0, nodename),
     ok = gen_event:add_handler({rabbit_event, Server}, event_recorder, []),
-
+    %% Drain any residual events left over from a previous test case.
+    _ = get_events(Server),
     ClientId = atom_to_binary(?FUNCTION_NAME),
     C = connect(ClientId, Config),
 
-    [E0, E1] = get_events(Server),
+    [E0, E1] = await_events(Server, 2),
     assert_event_type(user_authentication_success, E0),
     assert_event_prop([{name, <<"guest">>},
                        {connection_type, network}],
@@ -636,7 +637,7 @@ events(Config) ->
 
     QueueNameBin = <<"mqtt-subscription-", ClientId/binary, "qos0">>,
     QueueName = {resource, <<"/">>, queue, QueueNameBin},
-    [E2, E3] = get_events(Server),
+    [E2, E3] = await_events(Server, 2),
     assert_event_type(queue_created, E2),
     assert_event_prop([{name, QueueName},
                        {durable, true},
@@ -665,12 +666,12 @@ events(Config) ->
 
     {ok, _, _} = emqtt:unsubscribe(C, MqttTopic),
 
-    [E4] = get_events(Server),
+    [E4] = await_events(Server, 1),
     assert_event_type(binding_deleted, E4),
 
     ok = emqtt:disconnect(C),
 
-    [E5, E6] = get_events(Server),
+    [E5, E6] = await_events(Server, 2),
     assert_event_type(connection_closed, E5),
     ?assertEqual(E1#event.props, E5#event.props,
                  "connection_closed event props should match connection_created event props. "
@@ -884,8 +885,9 @@ consuming_classic_queue_down(Config) ->
     ok = rabbit_ct_broker_helpers:start_node(Config, Server1),
     C3 = connect(ClientId, Config, Server3, [{clean_start, true}]),
     ok = emqtt:disconnect(C3),
-    ?assertEqual([],
-                 rpc(Config, Server1, rabbit_amqqueue, list, [])),
+    ?awaitMatch([],
+                rpc(Config, Server1, rabbit_amqqueue, list, []),
+                30_000),
     ok.
 
 delete_create_queue(Config) ->
@@ -969,10 +971,7 @@ session_expiry(Config) ->
     ok = emqtt:disconnect(C),
 
     ?assertEqual(2, rpc(Config, rabbit_amqqueue, count, [])),
-    timer:sleep(timer:seconds(Seconds) + 100),
-    %% On a slow machine, this test might fail. Let's consider
-    %% the expiry on a longer time window
-    ?awaitMatch(0,  rpc(Config, rabbit_amqqueue, count, []), 15_000, 1000),
+    ?awaitMatch(0, rpc(Config, rabbit_amqqueue, count, []), 15_000, 1000),
 
     ok = rpc(Config, application, set_env, [App, Par, DefaultVal]).
 
@@ -1234,11 +1233,16 @@ rabbit_mqtt_qos0_queue_kill_node(Config) ->
     ok = emqtt:publish(Pub, Topic1, <<"m0">>, qos0),
     ok = expect_publishes(Sub0, Topic1, [<<"m0">>]),
 
+    [Node0 | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
     process_flag(trap_exit, true),
     ok = rabbit_ct_broker_helpers:kill_node(Config, 0),
     ok = await_exit(Sub0),
-    %% Wait to run rabbit_amqqueue:on_node_down/1 on both live nodes.
-    timer:sleep(500),
+    %% Wait for the live nodes to detect that node 0 has gone down,
+    %% otherwise the subsequent reconnect on node 1 may briefly stall
+    %% on cluster lookups that try to reach node 0.
+    rabbit_ct_helpers:await_condition(
+        fun() -> not lists:member(Node0, rpc(Config, 1, rabbit_nodes, list_running, [])) end,
+        10_000),
     %% Re-connect to a live node with same MQTT client ID.
     Sub1 = connect(SubscriberId, Config, 1, []),
     {ok, _, [0]} = emqtt:subscribe(Sub1, Topic2, qos0),
@@ -1263,7 +1267,7 @@ rabbit_mqtt_qos0_queue_kill_node(Config) ->
     ok = emqtt:disconnect(Sub2),
     ok = emqtt:disconnect(Pub),
     ok = rabbit_ct_broker_helpers:start_node(Config, 1),
-    ?assertEqual([], rpc(Config, rabbit_db_binding, get_all, [])).
+    ?awaitMatch([], rpc(Config, rabbit_db_binding, get_all, []), 30_000).
 
 cli_close_all_connections(Config) ->
     ClientId = atom_to_binary(?FUNCTION_NAME),
@@ -1389,12 +1393,15 @@ maintenance(Config) ->
     C1b = connect(<<"client-1b">>, Config, 1, []),
     ClientsNode1 = [C1a, C1b],
 
-    timer:sleep(500),
+    rabbit_ct_helpers:await_condition(
+        fun() -> length(all_connection_pids(Config)) =:= 3 end,
+        10_000),
 
     ok = drain_node(Config, 2),
     ok = revive_node(Config, 2),
-    timer:sleep(500),
-    [?assert(erlang:is_process_alive(C)) || C <- [C0, C1a, C1b]],
+    rabbit_ct_helpers:await_condition(
+        fun() -> lists:all(fun erlang:is_process_alive/1, [C0, C1a, C1b]) end,
+        10_000),
 
     process_flag(trap_exit, true),
     ok = drain_node(Config, 1),
@@ -1543,8 +1550,10 @@ block(Config) ->
     {ok, _} = emqtt:publish(C, Topic, <<"Not blocked yet">>, [{qos, 1}]),
 
     ok = rpc(Config, vm_memory_monitor, set_vm_memory_high_watermark, [0]),
-    %% Let it block
-    timer:sleep(100),
+    rabbit_ct_helpers:await_condition(fun() ->
+        Alarms = rpc(Config, rabbit_alarm, get_alarms, []),
+        lists:any(fun({{resource_limit, memory, _}, _}) -> true; (_) -> false end, Alarms)
+    end, 10_000),
 
     %% Blocked, but still will publish when unblocked
     puback_timeout = publish_qos1_timeout(C, Topic, <<"Now blocked">>, 1000),
@@ -1574,8 +1583,10 @@ block_only_publisher(Config) ->
     ok = expect_publishes(PubSub, Topic, [<<"from Pub">>, <<"from PubSub">>]),
 
     ok = rpc(Config, vm_memory_monitor, set_vm_memory_high_watermark, [0]),
-    %% Let it block
-    timer:sleep(100),
+    rabbit_ct_helpers:await_condition(fun() ->
+        Alarms = rpc(Config, rabbit_alarm, get_alarms, []),
+        lists:any(fun({{resource_limit, memory, _}, _}) -> true; (_) -> false end, Alarms)
+    end, 10_000),
 
     %% We expect that the publishing connections are blocked.
     [?assertEqual({error, ack_timeout}, emqtt:ping(Pid)) || Pid <- [Pub, PubSub]],
@@ -1593,8 +1604,10 @@ block_only_publisher(Config) ->
     ?assertEqual(pong, emqtt:ping(Sub)),
 
     rpc(Config, vm_memory_monitor, set_vm_memory_high_watermark, [0.6]),
-    %% Let it unblock
-    timer:sleep(100),
+    rabbit_ct_helpers:await_condition(fun() ->
+        Alarms = rpc(Config, rabbit_alarm, get_alarms, []),
+        not lists:any(fun({{resource_limit, memory, _}, _}) -> true; (_) -> false end, Alarms)
+    end, 10_000),
 
     %% All connections are unblocked.
     [?assertEqual(pong, emqtt:ping(Pid)) || Pid <- [Con, Sub, Pub, PubSub]],
@@ -1640,7 +1653,7 @@ clean_session_node_down(NodeDown, Config) ->
 
     %% After terminating a clean session by a node crash, we expect any session
     %% state to be cleaned up on the server once the server comes back up.
-    ?assertEqual(0, rpc(Config, rabbit_amqqueue, count, [])).
+    ?awaitMatch(0, rpc(Config, rabbit_amqqueue, count, []), 30_000).
 
 rabbit_status_connection_count(Config) ->
     _Pid = rabbit_ct_client_helpers:open_connection(Config, 0),
@@ -1686,10 +1699,10 @@ trace(Config) ->
                    <<"routed_queues">> := [<<"mqtt-subscription-trace_subscriberqos0">>]},
                  rabbit_misc:amqp_table(PublishHeaders)),
 
-    {#'basic.get_ok'{routing_key = <<"deliver.mqtt-subscription-trace_subscriberqos0">>},
-     #amqp_msg{props = #'P_basic'{headers = DeliverHeaders},
-               payload = Payload}} =
-    amqp_channel:call(Ch, #'basic.get'{queue = TraceQ}),
+    {_, #amqp_msg{props = #'P_basic'{headers = DeliverHeaders}, payload = Payload}} =
+        ?awaitMatch({#'basic.get_ok'{routing_key = <<"deliver.mqtt-subscription-trace_subscriberqos0">>}, _},
+                    amqp_channel:call(Ch, #'basic.get'{queue = TraceQ}),
+                    5_000),
     ?assertMatch(#{<<"exchange_name">> := <<"amq.topic">>,
                    <<"routing_keys">> := [Topic],
                    <<"connection">> := <<"127.0.0.1:", _/binary>>,
@@ -1906,7 +1919,9 @@ retained_message_conversion(Config) ->
     Payload = <<"my retained msg">>,
     OldMqttMsgFormat = {mqtt_msg, _Retain = true, _QoS = 1, Topic, _Dup = false, _PktId = 1, Payload},
     RetainerPid = rpc(Config, rabbit_mqtt_retainer_sup, start_child_for_vhost, [<<"/">>]),
-    {rabbit_mqtt_retainer, StoreState, _} = sys:get_state(RetainerPid),
+    RetainerState = sys:get_state(RetainerPid),
+    rabbit_mqtt_retainer = element(1, RetainerState),
+    StoreState = element(2, RetainerState),
     ok = rpc(Config, rabbit_mqtt_retained_msg_store, insert, [Topic, OldMqttMsgFormat, StoreState]),
 
     C = connect(?FUNCTION_NAME, Config),

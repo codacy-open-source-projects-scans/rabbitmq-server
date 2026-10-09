@@ -11,7 +11,7 @@
 -include_lib("rabbit/include/amqqueue.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 
--export([federate/1, for/1, for/2, params_to_string/1, to_params/2]).
+-export([federate/1, for/1, for/2, params_to_string/1, to_params/2, max_hops/1]).
 %% For testing
 -export([from_set/2, from_pattern/2, remove_credentials/1]).
 
@@ -66,16 +66,47 @@ params_to_string(#upstream_params{safe_uri = SafeURI,
 remove_credentials(URI) ->
     list_to_binary(amqp_uri:remove_credentials(binary_to_list(URI))).
 
+%% Returns `{ok, #upstream_params{}}` on success or `{error, {Info, SafeURI}}`
+%% (credentials stripped) when none of the upstream URIs can be parsed. The
+%% URIs of an upstream are interchangeable failover endpoints, so each is
+%% tried, in a random order to spread load, until one parses.
 to_params(Upstream = #upstream{uris = URIs}, XorQ) ->
-    URI = lists:nth(rand:uniform(length(URIs)), URIs),
-    {ok, Params} = amqp_uri:parse(binary_to_list(URI), vhost(XorQ)),
-    XorQ1 = with_name(Upstream, vhost(Params), XorQ),
-    SafeURI = remove_credentials(URI),
-    #upstream_params{params   = Params,
-                     uri      = URI,
-                     x_or_q   = XorQ1,
-                     safe_uri = SafeURI,
-                     table    = params_table(SafeURI, XorQ)}.
+    to_params(shuffle(URIs), Upstream, XorQ, undefined).
+
+to_params([], _Upstream, _XorQ, LastError) ->
+    LastError;
+to_params([URI | Rest], Upstream, XorQ, _LastError) ->
+    case amqp_uri:parse(binary_to_list(URI), vhost(XorQ)) of
+        {ok, Params} ->
+            XorQ1 = with_name(Upstream, vhost(Params), XorQ),
+            SafeURI = remove_credentials(URI),
+            {ok, #upstream_params{params   = Params,
+                                  uri      = URI,
+                                  x_or_q   = XorQ1,
+                                  safe_uri = SafeURI,
+                                  table    = params_table(SafeURI, XorQ)}};
+        {error, {Info, _UnsafeURI}} ->
+            Error = {error, {sanitize_parse_error(Info), remove_credentials(URI)}},
+            to_params(Rest, Upstream, XorQ, Error)
+    end.
+
+%% `amqp_uri:parse/2` embeds the full query string in some error `Info`
+%% shapes, and a TLS `password` (or other secret) can appear there. Redact
+%% the offending value and query before the error reaches the logs.
+sanitize_parse_error({invalid_ssl_parameter, Key, _Value, _Query, Reason}) ->
+    {invalid_ssl_parameter, Key, redacted, redacted, Reason};
+sanitize_parse_error({invalid_amqp_params_parameter, Field, _Value, _Query, Reason}) ->
+    {invalid_amqp_params_parameter, Field, redacted, redacted, Reason};
+sanitize_parse_error({unable_to_parse_uri, _Detail}) ->
+    %% The detail embeds the raw URI (with credentials) and an exit stack
+    %% trace. Neither is safe to log; the sanitized URI is reported separately.
+    unable_to_parse_uri;
+sanitize_parse_error(Info) ->
+    Info.
+
+%% Random permutation, used to spread load across an upstream's URIs.
+shuffle(List) ->
+    [X || {_, X} <- lists:sort([{rand:uniform(), X} || X <- List])].
 
 print(Fmt, Args) -> iolist_to_binary(io_lib:format(Fmt, Args)).
 
@@ -102,7 +133,7 @@ find_contents(RegExp, VHost) ->
     Upstreams0 = rabbit_runtime_parameters:list(
                     VHost, <<"federation-upstream">>),
     Upstreams  = [rabbit_data_coercion:to_list(U) || U <- Upstreams0,
-                    re:run(pget(name, U), RegExp) =/= nomatch],
+                    rabbit_re:matches(pget(name, U), RegExp)],
     [[{<<"upstream">>, pget(name, U)}] || U <- Upstreams].
 
 from_set_contents(Set, XorQ) ->
@@ -131,7 +162,7 @@ from_upstream_or_set(US, Name, U, XorQ) ->
               consumer_tag    = bget('consumer-tag',    US, U, <<"federation-link-", Name/binary>>),
               prefetch_count  = bget('prefetch-count',  US, U, ?DEF_PREFETCH),
               reconnect_delay = bget('reconnect-delay', US, U, 5),
-              max_hops        = bget('max-hops',        US, U, 1),
+              max_hops        = max_hops(bget('max-hops', US, U, ?DEF_MAX_HOPS)),
               expires         = bget(expires,           US, U, none),
               message_ttl     = bget('message-ttl',     US, U, none),
               trust_user_id   = bget('trust-user-id',   US, U, false),
@@ -142,6 +173,22 @@ from_upstream_or_set(US, Name, U, XorQ) ->
               resource_cleanup_mode = to_atom(bget('resource-cleanup-mode', US, U, <<"default">>)),
               channel_use_mode      = to_atom(bget('channel-use-mode', US, U, multiple))
     }.
+
+%% Parameters persisted by earlier versions were only checked for being a
+%% number. A fractional value used to crash the exchange federation link when
+%% the hop counter was encoded as a `short`, and a value above the `short`
+%% range wrapped around to a negative one.
+-spec max_hops(term()) -> non_neg_integer().
+max_hops(N) when is_integer(N) andalso
+                 N >= ?MIN_MAX_HOPS andalso
+                 N =< ?MAX_MAX_HOPS ->
+    N;
+max_hops(N) when is_number(N) andalso N > ?MAX_MAX_HOPS ->
+    ?MAX_MAX_HOPS;
+max_hops(N) when is_number(N) andalso N > ?MIN_MAX_HOPS ->
+    trunc(N);
+max_hops(_N) ->
+    ?MIN_MAX_HOPS.
 
 %%----------------------------------------------------------------------------
 

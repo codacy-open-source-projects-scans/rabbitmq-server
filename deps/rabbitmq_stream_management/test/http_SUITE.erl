@@ -19,6 +19,8 @@
 
 -compile(export_all).
 
+-define(TEST_MAX_SUPER_STREAM_PARTITIONS, 10).
+
 all() ->
     [{group, non_parallel_tests}].
 
@@ -28,7 +30,12 @@ groups() ->
                                create_super_stream,
                                create_super_stream_requires_configure_permission,
                                create_super_stream_partition_limits,
-                               stream_tracking_requires_vhost_access
+                               create_super_stream_binding_keys_limit,
+                               stream_tracking_requires_vhost_access,
+                               stream_tracking_requires_read_permission,
+                               stream_publishers_require_vhost_access,
+                               stream_consumers_require_vhost_access,
+                               stream_consumers_visible_to_monitoring
                               ]}].
 
 %% -------------------------------------------------------------------
@@ -56,8 +63,15 @@ init_per_suite(Config) ->
                                                     [{collect_statistics_interval,
                                                       500}]})
                 end,
+            RmqStreamSetupStep =
+                fun(StepConfig) ->
+                   rabbit_ct_helpers:merge_app_env(StepConfig,
+                                                   {rabbitmq_stream,
+                                                    [{max_super_stream_partitions,
+                                                      ?TEST_MAX_SUPER_STREAM_PARTITIONS}]})
+                end,
             rabbit_ct_helpers:run_setup_steps(Config2,
-                                              [SetupStep]
+                                              [SetupStep, RmqStreamSetupStep]
                                               ++ rabbit_ct_broker_helpers:setup_steps()
                                               ++ rabbit_ct_client_helpers:setup_steps())
     end.
@@ -175,11 +189,24 @@ create_super_stream_partition_limits(Config) ->
     http_put(Config, "/stream/super-streams/%2F/neg-parts",
              #{partitions => -5}, ?BAD_REQUEST),
     http_put(Config, "/stream/super-streams/%2F/over-parts",
-             #{partitions => 1001}, ?BAD_REQUEST),
+             #{partitions => ?TEST_MAX_SUPER_STREAM_PARTITIONS + 1},
+             ?BAD_REQUEST),
     http_put(Config, "/stream/super-streams/%2F/huge-parts",
-             #{partitions => 500000000}, ?BAD_REQUEST),
-    http_put(Config, "/stream/super-streams/%2F/max-parts",
-             #{partitions => 1000}, {group, '2xx'}),
+             #{partitions => ?TEST_MAX_SUPER_STREAM_PARTITIONS * 2},
+             ?BAD_REQUEST),
+    http_put(Config, "/stream/super-streams/%2F/many-parts",
+             #{partitions => ?TEST_MAX_SUPER_STREAM_PARTITIONS}, {group, '2xx'}),
+    ok.
+
+create_super_stream_binding_keys_limit(Config) ->
+    %% A binding-keys list exceeding the partition limit (default 1000) is rejected.
+    OverLimit = iolist_to_binary(
+                  lists:join(
+                    <<",">>,
+                    [<<"k", (integer_to_binary(N))/binary>>
+                     || N <- lists:seq(0, 1000)])),
+    http_put(Config, "/stream/super-streams/%2F/too-many-binding-keys",
+             #{'binding-keys' => OverLimit}, ?BAD_REQUEST),
     ok.
 
 stream_tracking_requires_vhost_access(Config) ->
@@ -192,7 +219,7 @@ stream_tracking_requires_vhost_access(Config) ->
     rabbit_ct_broker_helpers:add_user(Config, User, User),
     rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
     http_get(Config, "/stream/tracking-vh/test-stream/tracking",
-             User, User, ?NOT_AUTHORISED),
+             User, User, 404),
     %% Permissions granted, must succeed.
     rabbit_ct_broker_helpers:set_full_permissions(Config, User, Vhost),
     http_get(Config, "/stream/tracking-vh/test-stream/tracking",
@@ -201,6 +228,94 @@ stream_tracking_requires_vhost_access(Config) ->
     rabbit_ct_broker_helpers:delete_user(Config, User),
     rabbit_ct_broker_helpers:delete_vhost(Config, Vhost),
     ok.
+
+stream_tracking_requires_read_permission(Config) ->
+    Vhost = <<"tracking-read-perm-vh">>,
+    User = <<"tracking-read-perm-user">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, Vhost),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, <<"guest">>, Vhost),
+    StreamArgs = [{durable, true}, {arguments, [{'x-queue-type', 'stream'}]}],
+    http_put(Config, "/queues/tracking-read-perm-vh/test-stream", StreamArgs, {group, '2xx'}),
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
+    %% Grant vhost access but no read permission: must fail with 401.
+    rabbit_ct_broker_helpers:set_permissions(Config, User, Vhost,
+                                             <<"^$">>, <<"^$">>, <<"^$">>),
+    http_get(Config, "/stream/tracking-read-perm-vh/test-stream/tracking",
+             User, User, ?NOT_AUTHORISED),
+    %% Grant read permission: must succeed.
+    rabbit_ct_broker_helpers:set_permissions(Config, User, Vhost,
+                                             <<"^$">>, <<"^$">>, <<".*">>),
+    http_get(Config, "/stream/tracking-read-perm-vh/test-stream/tracking",
+             User, User, ?OK),
+    http_delete(Config, "/queues/tracking-read-perm-vh/test-stream", {group, '2xx'}),
+    rabbit_ct_broker_helpers:delete_user(Config, User),
+    rabbit_ct_broker_helpers:delete_vhost(Config, Vhost),
+    ok.
+
+stream_publishers_require_vhost_access(Config) ->
+    Vhost = <<"publishers-vh">>,
+    User = <<"publishers-user">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, Vhost),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, <<"guest">>, Vhost),
+    StreamArgs = [{durable, true}, {arguments, [{'x-queue-type', 'stream'}]}],
+    http_put(Config, "/queues/publishers-vh/test-stream", StreamArgs, {group, '2xx'}),
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
+    http_get(Config, "/stream/publishers/publishers-vh", User, User, 404),
+    http_get(Config, "/stream/publishers/no-such-vhost", User, User, 404),
+    http_get(Config, "/stream/publishers/publishers-vh/test-stream",
+             User, User, 404),
+    http_get(Config, "/stream/publishers/publishers-vh/no-such-stream",
+             User, User, 404),
+    404 = get_with_vhost_header(Config, "/stream/publishers", "publishers-vh", User),
+    404 = get_with_vhost_header(Config, "/stream/publishers", "no-such-vhost", User),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User, Vhost),
+    http_get(Config, "/stream/publishers/publishers-vh", User, User, ?OK),
+    http_get(Config, "/stream/publishers/publishers-vh/test-stream",
+             User, User, ?OK),
+    ?OK = get_with_vhost_header(Config, "/stream/publishers", "publishers-vh", User),
+    http_delete(Config, "/queues/publishers-vh/test-stream", {group, '2xx'}),
+    rabbit_ct_broker_helpers:delete_user(Config, User),
+    rabbit_ct_broker_helpers:delete_vhost(Config, Vhost),
+    ok.
+
+stream_consumers_require_vhost_access(Config) ->
+    Vhost = <<"consumers-vh">>,
+    User = <<"consumers-user">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, Vhost),
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
+    http_get(Config, "/stream/consumers/consumers-vh", User, User, 404),
+    http_get(Config, "/stream/consumers/no-such-vhost", User, User, 404),
+    404 = get_with_vhost_header(Config, "/stream/consumers", "consumers-vh", User),
+    404 = get_with_vhost_header(Config, "/stream/consumers", "no-such-vhost", User),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User, Vhost),
+    http_get(Config, "/stream/consumers/consumers-vh", User, User, ?OK),
+    ?OK = get_with_vhost_header(Config, "/stream/consumers", "consumers-vh", User),
+    rabbit_ct_broker_helpers:delete_user(Config, User),
+    rabbit_ct_broker_helpers:delete_vhost(Config, Vhost),
+    ok.
+
+stream_consumers_visible_to_monitoring(Config) ->
+    Vhost = <<"consumers-monitoring-vh">>,
+    User = <<"consumers-monitoring-user">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, Vhost),
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [monitoring]),
+    http_get(Config, "/stream/consumers/consumers-monitoring-vh",
+             User, User, ?OK),
+    http_get(Config, "/stream/consumers/no-such-vhost", User, User, 404),
+    rabbit_ct_broker_helpers:delete_user(Config, User),
+    rabbit_ct_broker_helpers:delete_vhost(Config, Vhost),
+    ok.
+
+get_with_vhost_header(Config, Path, Vhost, User) ->
+    {ok, {{_, Code, _}, _, _}} =
+        rabbit_mgmt_test_util:req(Config, 0, get, Path,
+                                  [rabbit_mgmt_test_util:auth_header(User, User),
+                                   {"x-vhost", Vhost}]),
+    Code.
 
 get_stream_port(Config) ->
     rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_stream).

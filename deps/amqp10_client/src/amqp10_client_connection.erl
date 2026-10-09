@@ -23,7 +23,8 @@
          socket_ready/2,
          protocol_header_received/5,
          begin_session/1,
-         heartbeat/1]).
+         heartbeat/1,
+         obfuscate_config/1]).
 
 %% gen_statem callbacks
 -export([init/1,
@@ -59,6 +60,8 @@
       address => address(),
       port => inet:port_number(),
       tls_opts => {secure_port, [ssl:tls_option()]},
+      %% socket connect timeout, for TLS applied to the TCP connect and the TLS handshake separately
+      connect_timeout => timeout(),
       ws_path => string(),
       ws_opts => gun:opts(),
       notify => pid() | none, % the pid to send connection events to
@@ -74,7 +77,8 @@
       % control by this margin
       transfer_limit_margin => 0 | neg_integer(),
       sasl => sasl(),
-      properties => amqp10_client_types:properties()
+      properties => amqp10_client_types:properties(),
+      desired_capabilities => [binary()]
   }.
 
 -record(state,
@@ -112,9 +116,20 @@ open(Config0) ->
             {_, Reader, _, _} = lists:keyfind(reader, 1, Children),
             {_, Connection, _, _} = lists:keyfind(connection, 1, Children),
             {_, SessionsSup, _, _} = lists:keyfind(sessions, 1, Children),
-            set_other_procs(Connection, #{sessions_sup => SessionsSup,
-                                          reader => Reader}),
-            {ok, Connection};
+            %% The reader's socket connect (including DNS resolution) is
+            %% deliberately deferred until here, rather than done as part
+            %% of its own init/1: a hostname/connectivity failure is then
+            %% just a normal call reply instead of a supervisor start_error,
+            %% which OTP would otherwise always report.
+            case amqp10_client_frame_reader:connect(Reader) of
+                ok ->
+                    set_other_procs(Connection, #{sessions_sup => SessionsSup,
+                                                  reader => Reader}),
+                    {ok, Connection};
+                {error, _} = Error ->
+                    _ = supervisor:terminate_child(amqp10_client_sup, ConnSup),
+                    Error
+            end;
         Error ->
             Error
     end.
@@ -210,7 +225,9 @@ sasl_hdr_sent({call, From}, begin_session,
     {keep_state, State1};
 sasl_hdr_sent(info, {'DOWN', MRef, process, _Pid, _},
               #state{reader_m_ref = MRef}) ->
-    {stop, {shutdown, reader_down}}.
+    {stop, {shutdown, reader_down}};
+sasl_hdr_sent(_EvtType, Frame, State) ->
+    unexpected_during_handshake(sasl_hdr_sent, Frame, State).
 
 sasl_hdr_rcvds(_EvtType, #'v1_0.sasl_mechanisms'{
                             sasl_server_mechanisms = {array, symbol, AvailableMechs}},
@@ -222,12 +239,17 @@ sasl_hdr_rcvds(_EvtType, #'v1_0.sasl_mechanisms'{
             ok = send_sasl_init(State, DecryptedSasl),
             {next_state, sasl_init_sent, State};
         false ->
-            {stop, {sasl_not_supported, DecryptedSasl}, State}
+            {stop, {shutdown, {sasl_not_supported, DecryptedSasl}}, State}
     end;
 sasl_hdr_rcvds({call, From}, begin_session,
                #state{pending_session_reqs = PendingSessionReqs} = State) ->
     State1 = State#state{pending_session_reqs = [From | PendingSessionReqs]},
-    {keep_state, State1}.
+    {keep_state, State1};
+sasl_hdr_rcvds(info, {'DOWN', MRef, process, _Pid, _},
+               #state{reader_m_ref = MRef}) ->
+    {stop, {shutdown, reader_down}};
+sasl_hdr_rcvds(_EvtType, Frame, State) ->
+    unexpected_during_handshake(sasl_hdr_rcvds, Frame, State).
 
 sasl_init_sent(_EvtType, #'v1_0.sasl_outcome'{code = {ubyte, 0}},
                #state{socket = Socket} = State) ->
@@ -235,16 +257,21 @@ sasl_init_sent(_EvtType, #'v1_0.sasl_outcome'{code = {ubyte, 0}},
     {next_state, hdr_sent, State};
 sasl_init_sent(_EvtType, #'v1_0.sasl_outcome'{code = {ubyte, C}},
                #state{} = State) when C==1;C==2;C==3;C==4 ->
-    {stop, sasl_auth_failure, State};
+    {stop, {shutdown, sasl_auth_failure}, State};
 sasl_init_sent({call, From}, begin_session,
                #state{pending_session_reqs = PendingSessionReqs} = State) ->
     State1 = State#state{pending_session_reqs = [From | PendingSessionReqs]},
-    {keep_state, State1}.
+    {keep_state, State1};
+sasl_init_sent(info, {'DOWN', MRef, process, _Pid, _},
+               #state{reader_m_ref = MRef}) ->
+    {stop, {shutdown, reader_down}};
+sasl_init_sent(_EvtType, Frame, State) ->
+    unexpected_during_handshake(sasl_init_sent, Frame, State).
 
 hdr_sent(_EvtType, {protocol_header_received, 0, 1, 0, 0}, State) ->
     case send_open(State) of
         ok    -> {next_state, open_sent, State};
-        Error -> {stop, Error, State}
+        Error -> {stop, {shutdown, Error}, State}
     end;
 hdr_sent(_EvtType, {protocol_header_received, Protocol, Maj, Min,
                                 Rev}, State) ->
@@ -254,7 +281,12 @@ hdr_sent(_EvtType, {protocol_header_received, Protocol, Maj, Min,
 hdr_sent({call, From}, begin_session,
          #state{pending_session_reqs = PendingSessionReqs} = State) ->
     State1 = State#state{pending_session_reqs = [From | PendingSessionReqs]},
-    {keep_state, State1}.
+    {keep_state, State1};
+hdr_sent(info, {'DOWN', MRef, process, _Pid, _},
+         #state{reader_m_ref = MRef}) ->
+    {stop, {shutdown, reader_down}};
+hdr_sent(_EvtType, Frame, State) ->
+    unexpected_during_handshake(hdr_sent, Frame, State).
 
 open_sent(_EvtType, #'v1_0.open'{max_frame_size = MaybeMaxFrameSize,
                                  idle_time_out = Timeout} = Open,
@@ -297,11 +329,21 @@ open_sent(_EvtType, {close, Reason}, State) ->
             %% timeout to give its partner a reasonable time to receive and process the close
             %% before giving up and simply closing the underlying transport mechanism)." [§2.4.3]
             {next_state, close_sent, State, {state_timeout, ?TIMEOUT, received_no_close_frame}};
-        {error, closed} ->
-            {stop, normal, State};
-        Error ->
-            {stop, Error, State}
+        {error, _} ->
+            %% Best-effort: the socket is already gone, for whatever
+            %% reason. There is nobody left to notify and nothing more
+            %% useful to do.
+            {stop, normal, State}
     end;
+open_sent(_EvtType, #'v1_0.close'{} = Close,
+          #state{config = Config,
+                 pending_session_reqs = PendingSessionReqs} = State) ->
+    %% The peer refused the connection, e.g. due to an unknown virtual
+    %% host or a connection limit.
+    ok = notify_closed(Config, Close),
+    [gen_statem:reply(From, {error, closed}) || From <- PendingSessionReqs],
+    _ = send_close(State, none),
+    {stop, normal, State};
 open_sent(info, {'DOWN', MRef, process, _, _},
           #state{reader_m_ref = MRef}) ->
     {stop, {shutdown, reader_down}}.
@@ -321,18 +363,33 @@ opened(_EvtType, {close, Reason}, State) ->
             %% timeout to give its partner a reasonable time to receive and process the close
             %% before giving up and simply closing the underlying transport mechanism)." [§2.4.3]
             {next_state, close_sent, State, {state_timeout, ?TIMEOUT, received_no_close_frame}};
-        {error, closed} ->
-            {stop, normal, State};
-        Error ->
-            {stop, Error, State}
+        {error, _} ->
+            %% Best-effort: the socket is already gone, for whatever
+            %% reason. There is nobody left to notify and nothing more
+            %% useful to do.
+            {stop, normal, State}
     end;
 opened(_EvtType, #'v1_0.close'{} = Close, State = #state{config = Config}) ->
     %% We receive the first close frame, reply and terminate.
     ok = notify_closed(Config, Close),
     case send_close(State, none) of
-        ok              -> {stop, normal, State};
-        {error, closed} -> {stop, normal, State};
-        Error           -> {stop, Error, State}
+        ok        -> {stop, normal, State};
+        {error, _} -> {stop, normal, State}
+    end;
+opened(_EvtType, {'EXIT', Pid, Reason}, State) ->
+    %% A linked process (e.g. the application that opened this connection)
+    %% died. Close the connection gracefully instead of lingering silently
+    %% or falling through to the generic "unexpected frame" clause below.
+    ?LOG_WARNING("Connection ~tp closing because dependent process ~tp died: ~tp",
+                 [self(), Pid, Reason]),
+    case send_close(State, Reason) of
+        ok ->
+            {next_state, close_sent, State, {state_timeout, ?TIMEOUT, received_no_close_frame}};
+        {error, _} ->
+            %% Best-effort: the socket is already gone, for whatever
+            %% reason. There is nobody left to notify and nothing more
+            %% useful to do.
+            {stop, normal, State}
     end;
 opened({call, From}, begin_session, State) ->
     {Ret, State1} = handle_begin_session(From, State),
@@ -350,11 +407,15 @@ opened(_EvtType, Frame, State) ->
 close_sent(_EvtType, heartbeat, _Data) ->
     keep_state_and_data;
 close_sent(_EvtType, {'EXIT', _Pid, shutdown}, _Data) ->
-    %% monitored processes may exit during closure
+    %% our supervisor is shutting us down; let it enforce its own timeout
     keep_state_and_data;
 close_sent(_EvtType, {'EXIT', _Pid, {shutdown, _}}, _Data) ->
-    %% monitored processes may exit during closure
+    %% our supervisor is shutting us down; let it enforce its own timeout
     keep_state_and_data;
+close_sent(_EvtType, {'EXIT', _Pid, _Reason}, _Data) ->
+    %% a linked process exited unexpectedly; we probably won't
+    %% receive a close frame
+    {stop, normal};
 close_sent(_EvtType, {'DOWN', _Ref, process, ReaderPid, _Reason},
            #state{reader = ReaderPid}) ->
     %% if the reader exits we probably won't receive a close frame
@@ -368,6 +429,15 @@ close_sent(_EvtType, #'v1_0.open'{}, _Data) ->
     %% Transition from CLOSE_PIPE to CLOSE_SENT in figure 2.23.
     keep_state_and_data.
 
+%% A peer that refuses the connection or misbehaves can send frames out
+%% of the expected handshake sequence. Terminating with a stack trace
+%% would help nobody; log the frame and stop quietly instead.
+unexpected_during_handshake(StateName, Frame, State) ->
+    ?LOG_WARNING("Connection ~tp received an unexpected frame or message "
+                 "~tp during handshake (~ts)",
+                 [self(), Frame, StateName]),
+    {stop, {shutdown, {unexpected_frame, Frame}}, State}.
+
 set_other_procs0(OtherProcs, State) ->
     #{sessions_sup := SessionsSup,
       reader := Reader} = OtherProcs,
@@ -379,10 +449,29 @@ set_other_procs0(OtherProcs, State) ->
 
 terminate(Reason, _StateName, #state{connection_sup = Sup,
                                      config = Config}) ->
-    ok = notify_closed(Config, Reason),
+    %% Expected failures stop this process with a reason wrapped in
+    %% 'shutdown' to avoid massive supervisor reports logged. Notify
+    %% the owner with the specific reason, without the wrapper.
+    ok = notify_closed(Config, case Reason of
+                                   {shutdown, R} -> R;
+                                   _             -> Reason
+                               end),
     case Reason of
-        normal -> sys:terminate(Sup, normal);
-        _      -> ok
+        normal ->
+            %% Tear down the rest of the connection's supervision tree
+            %% (reader, sessions) now that we're done: a quiet (`normal')
+            %% child termination is not cascaded to `one_for_all' siblings.
+            %%
+            %% This must not be a blocking call: `Sup' shutting down this
+            %% very process is part of its own termination, which can
+            %% never complete while we are still executing this callback,
+            %% so calling sys:terminate/2 (or supervisor:terminate_child/2)
+            %% directly here would deadlock both processes until they each
+            %% hit their 5-second timeout.
+            _ = spawn(fun() -> sys:terminate(Sup, normal) end),
+            ok;
+        _ ->
+            ok
     end.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -399,19 +488,28 @@ format_status(Context = #{data := ProcState}) ->
 %% Internal functions.
 %% -------------------------------------------------------------------
 
-obfuscate_state(State = #state{config = Cfg0}) ->
-    Cfg1 = obfuscate_state_config_sasl(Cfg0),
-    Cfg2 = obfuscate_state_config_tls_opts(Cfg1),
-    State#state{config = Cfg2}.
+obfuscate_state(State = #state{config = Cfg}) ->
+    State#state{config = obfuscate_config(Cfg)}.
+
+-spec obfuscate_config(connection_config()) -> connection_config().
+obfuscate_config(Cfg) ->
+    obfuscate_state_config_tls_opts(obfuscate_state_config_sasl(Cfg)).
 
 -spec obfuscate_state_config_sasl(connection_config()) -> connection_config().
 obfuscate_state_config_sasl(Cfg) ->
     Sasl0 = maps:get(sasl, Cfg, none),
     Sasl = case Sasl0 of
+               none -> none;
+               anon -> anon;
+               external -> external;
                {plain, Username, _Password} ->
                    {plain, Username, <<"[redacted]">>};
-               Other ->
-                   Other
+               {plaintext, _} ->
+                   {plaintext, <<"[redacted]">>};
+               {encrypted, _} ->
+                   {encrypted, <<"[redacted]">>};
+               _ ->
+                   {plaintext, <<"[redacted]">>}
            end,
     Cfg#{sasl => Sasl}.
 
@@ -459,11 +557,18 @@ send_open(#state{socket = Socket, config = Config0}) ->
                          properties = Props,
                          max_frame_size = {uint, IncomingMaxFrameSize}
                         },
+    Open1 = case Config of
+                #{hostname := Hostname} ->
+                    Open0#'v1_0.open'{hostname = {utf8, Hostname}};
+                _ ->
+                    Open0
+            end,
     Open = case Config of
-               #{hostname := Hostname} ->
-                   Open0#'v1_0.open'{hostname = {utf8, Hostname}};
+               #{desired_capabilities := DesCapsList} when is_list(DesCapsList) ->
+                   DesCaps = amqp10_util:capabilities_from_list(DesCapsList),
+                   Open1#'v1_0.open'{desired_capabilities = DesCaps};
                _ ->
-                   Open0
+                   Open1
            end,
     Encoded = amqp10_framing:encode_bin(Open),
     Frame = amqp10_binary_generator:build_frame(0, Encoded),

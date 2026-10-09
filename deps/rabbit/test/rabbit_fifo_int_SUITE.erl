@@ -27,6 +27,7 @@ all_tests() ->
      lost_return_is_resent_on_applied_after_leader_change,
      rabbit_fifo_returns_correlation,
      returns,
+     returns_batched_while_slow_are_redelivered_in_order,
      returns_after_down,
      resends_after_lost_applied,
      handles_reject_notification,
@@ -44,7 +45,10 @@ all_tests() ->
      untracked_enqueue,
      flow,
      test_queries,
-     duplicate_delivery
+     duplicate_delivery,
+     local_query_resolves_pinned_v7_machine_version,
+     local_query_resolves_pinned_v8_machine_version,
+     local_query_does_not_retry_on_unrelated_error
     ].
 
 groups() ->
@@ -256,8 +260,9 @@ lost_return_is_resent_on_applied_after_leader_change(Config) ->
     %% by the new leader, not the old
     {ok, F6, _} = rabbit_fifo_client:handle_ra_event(ClusterName, NextLeader,
                                                      RaEvt, F5),
-    %% this should resend the never applied enqueue
-    {_, _, F7} = process_ra_events(receive_ra_events(1, 0), ClusterName, F6),
+    %% this should resend the never applied enqueue; extra leader changes can
+    %% arrive on mixed-version clusters, so retry if the applied event is missed
+    {_, _, F7} = receive_applied_retrying(ClusterName, F6),
 
     ?assertEqual(0, rabbit_fifo_client:pending_size(F7)),
 
@@ -447,6 +452,36 @@ returns(Config) ->
     rabbit_quorum_queue:stop_server(ServerId),
     ok.
 
+returns_batched_while_slow_are_redelivered_in_order(Config) ->
+    ClusterName = ?config(cluster_name, Config),
+    ServerId = ?config(node_id, Config),
+    ok = start_cluster(ClusterName, [ServerId]),
+
+    F0 = rabbit_fifo_client:init([ServerId], 1),
+    {ok, _, F1} = rabbit_fifo_client:checkout(<<"tag">>, {simple_prefetch, 3},
+                                              #{}, F0),
+    F2 = lists:foldl(fun (Msg, S0) ->
+                             {ok, S, _} = rabbit_fifo_client:enqueue(
+                                            ClusterName, Msg, S0),
+                             S
+                     end, F1, [m1, m2, m3]),
+    {Delivered, F3} = receive_deliveries(ClusterName, 3, F2),
+    ?assertEqual([m1, m2, m3], [Msg || {_, Msg} <- Delivered]),
+
+    F4 = lists:foldl(fun ({MsgId, _}, S0) ->
+                             {S, []} = rabbit_fifo_client:return(<<"tag">>,
+                                                                 [MsgId], S0),
+                             S
+                     end, F3, Delivered),
+    ?assertEqual(3, rabbit_fifo_client:pending_size(F4)),
+
+    {_, _, F5} = process_ra_events(receive_ra_events(3, 0), ClusterName, F4),
+    {Redelivered, _} = receive_deliveries(ClusterName, 3, F5),
+    ?assertEqual([m1, m2, m3], [Msg || {_, Msg} <- Redelivered]),
+
+    rabbit_quorum_queue:stop_server(ServerId),
+    ok.
+
 returns_after_down(Config) ->
     ClusterName = ?config(cluster_name, Config),
     ServerId = ?config(node_id, Config),
@@ -533,9 +568,6 @@ handles_reject_notification(Config) ->
     % reverse order - should try the first node in the list first
     F0 = rabbit_fifo_client:init([ServerId2, ServerId1]),
     {ok, F1, []} = rabbit_fifo_client:enqueue(ClusterName, one, F0),
-
-    timer:sleep(500),
-
     % the applied notification
     _F2 = process_ra_events(receive_ra_events(1, 0), ClusterName, F1),
     rabbit_quorum_queue:stop_server(ServerId1),
@@ -554,7 +586,7 @@ discard(Config) ->
              initial_member => [],
              initial_machine_version => rabbit_fifo:version(),
              machine => {module, rabbit_fifo,
-                         #{queue_resource => discard,
+                         #{queue_resource => ClusterName,
                            dead_letter_handler =>
                            {at_most_once, {?MODULE, dead_letter_handler, [self()]}}}}},
     _ = rabbit_quorum_queue:start_server(Conf),
@@ -645,10 +677,10 @@ cancel_checkout_with_pending(Config, Reason) ->
            end, F3, Msgs),
 
     {ok, _F4} = rabbit_fifo_client:cancel_checkout(<<"tag">>, Reason, F4),
-    timer:sleep(100),
-    {ok, Overview, _} = ra:member_overview(ServerId),
-    ?assertMatch(#{machine := #{num_messages := 0,
-                                num_consumers := 0}}, Overview),
+    rabbit_ct_helpers:eventually(
+        ?_assertMatch(#{machine := #{num_messages := 0, num_consumers := 0}},
+                      element(2, ra:member_overview(ServerId))),
+        200, 20),
     flush(),
     ok.
 
@@ -816,6 +848,52 @@ test_queries(Config) ->
     rabbit_quorum_queue:stop_server(ServerId),
     ok.
 
+local_query_resolves_pinned_v7_machine_version(Config) ->
+    local_query_resolves_pinned_machine_version(7, Config).
+
+local_query_resolves_pinned_v8_machine_version(Config) ->
+    local_query_resolves_pinned_machine_version(8, Config).
+
+local_query_resolves_pinned_machine_version(MacVer, Config) ->
+    ClusterName = ?config(cluster_name, Config),
+    ServerId = ?config(node_id, Config),
+    %% pin this cluster's machine at MacVer: it never upgrades to the state
+    %% shape of the latest module
+    ok = start_cluster(ClusterName, [ServerId],
+                       #{name => some_name, queue_resource => ClusterName},
+                       MacVer),
+
+    F0 = rabbit_fifo_client:init([ServerId]),
+    {ok, F1, []} = rabbit_fifo_client:enqueue(ClusterName, msg1, F0),
+    _ = process_ra_events(receive_ra_events(1, 0), ClusterName, F1),
+
+    %% querying with the latest module hardcoded still crashes against this
+    %% older state shape, confirming the fallback below is load-bearing
+    ?assertEqual({error, function_clause},
+                 ra:local_query(ServerId,
+                                fun rabbit_fifo:query_notify_decorators_info/1)),
+    %% local_query resolves the module the pinned version is served by
+    %% rather than assuming any particular one
+    ?assertMatch({ok, {_, {empty, false}}, _},
+                 rabbit_fifo_client:local_query(
+                   ServerId, query_notify_decorators_info, 5000)),
+
+    rabbit_quorum_queue:stop_server(ServerId),
+    ok.
+
+local_query_does_not_retry_on_unrelated_error(_Config) ->
+    ok = meck:new(ra, [passthrough]),
+    try
+        meck:expect(ra, local_query, fun (_Server, _Fun, _Timeout) -> {error, noproc} end),
+        ?assertEqual({error, noproc},
+                     rabbit_fifo_client:local_query(
+                       some_server, query_notify_decorators_info, 1000)),
+        ?assertEqual(1, meck:num_calls(ra, local_query, '_'))
+    after
+        meck:unload(ra)
+    end,
+    ok.
+
 dead_letter_handler(Pid, Reason, Msgs) ->
     Pid ! {dead_letter, Reason, Msgs}.
 
@@ -885,6 +963,45 @@ receive_ra_events(Applied, Deliveries, Acc) ->
             exit({missing_events, Applied, Deliveries, Acc})
     end.
 
+%% Waits for exactly one applied event. On mixed-version clusters an extra
+%% `leader_change` event may arrive before the applied event, causing
+%% `receive_ra_events/2` to time out. When that happens the accumulated
+%% `leader_change` events are fed through the client so it updates its leader
+%% pointer and resends pending commands, then the wait is retried.
+receive_applied_retrying(ClusterName, State) ->
+    receive_applied_retrying(ClusterName, State, 3).
+
+receive_applied_retrying(_ClusterName, _State, 0) ->
+    exit(missing_applied_event);
+receive_applied_retrying(ClusterName, State, Retries) ->
+    try
+        process_ra_events(receive_ra_events(1, 0), ClusterName, State)
+    catch
+        exit:{missing_events, _, _, Acc} ->
+            {_, _, State1} = process_ra_events(lists:reverse(Acc), ClusterName, State),
+            receive_applied_retrying(ClusterName, State1, Retries - 1)
+    end.
+
+receive_deliveries(ClusterName, Num, State) ->
+    receive_deliveries(ClusterName, Num, State, []).
+
+receive_deliveries(_ClusterName, Num, State, Acc) when Num =< 0 ->
+    {Acc, State};
+receive_deliveries(ClusterName, Num, State0, Acc) ->
+    receive
+        {ra_event, From, {machine, Del} = Evt}
+          when element(1, Del) =:= delivery ->
+            {ok, State, Actions} = rabbit_fifo_client:handle_ra_event(
+                                     ClusterName, From, Evt, State0),
+            Msgs = [{MsgId, Msg} || {deliver, _, _, Ms} <- Actions,
+                                    {_, _, MsgId, _, Msg} <- Ms],
+            receive_deliveries(ClusterName, Num - length(Msgs), State,
+                               Acc ++ Msgs)
+    after ?TIMEOUT ->
+              flush(),
+              exit(await_delivery_timeout)
+    end.
+
 %% Flusing the mailbox to later check that deliveries hasn't been received
 receive_ra_events() ->
     receive_ra_events([]).
@@ -937,6 +1054,12 @@ discard_next_delivery(ClusterName, State0, Wait) ->
     end.
 
 start_cluster(ClusterName, ServerIds, RaFifoConfig) ->
+    start_cluster(ClusterName, ServerIds, RaFifoConfig, rabbit_fifo:version()).
+
+%% pins the cluster's machine at MachineVersion instead of the latest,
+%% e.g. to test how the latest code behaves against an older state shape
+start_cluster(ClusterName, ServerIds, RaFifoConfig, MachineVersion) ->
+    Module = rabbit_fifo:which_module(MachineVersion),
     NameBin = ra_lib:to_binary(ClusterName#resource.name),
     Confs = [begin
                  UId = ra:new_uid(NameBin),
@@ -945,8 +1068,8 @@ start_cluster(ClusterName, ServerIds, RaFifoConfig) ->
                    cluster_name => ClusterName#resource.name,
                    log_init_args => #{uid => UId},
                    initial_members => ServerIds,
-                   initial_machine_version => rabbit_fifo:version(),
-                   machine => {module, rabbit_fifo, RaFifoConfig}}
+                   initial_machine_version => MachineVersion,
+                   machine => {module, Module, RaFifoConfig}}
              end
              || Id <- ServerIds],
     {ok, Started, _} = ra:start_cluster(?RA_SYSTEM, Confs),

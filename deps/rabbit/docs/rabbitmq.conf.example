@@ -50,6 +50,14 @@
 # listeners.tcp.other_ip   = 10.10.10.10:5672
 
 
+## To listen on a Unix domain socket, provide the socket path prefixed with
+## unix: (or the equivalent local:) followed by :0 as the port. The two
+## prefixes are interchangeable.
+##
+# listeners.tcp.unix = unix:/var/run/rabbitmq/rabbitmq.sock:0
+# listeners.tcp.unix = local:/var/run/rabbitmq/rabbitmq.sock:0
+
+
 ## TLS listeners are configured in the same fashion as TCP listeners,
 ## including the option to control the choice of interface.
 ##
@@ -308,6 +316,7 @@
 ## it's necessary to update her password.
 ##
 ## To use SHA-512, set to rabbit_password_hashing_sha512.
+## To use PBKDF2-HMAC-SHA256, set to rabbit_password_hashing_pbkdf2_sha256.
 ##
 # password_hashing_module = rabbit_password_hashing_sha256
 
@@ -423,8 +432,9 @@
 
 ## Set the max permissible number of channels per AMQP 0-9-1 connection.
 ## 0 means "no limit".
+## The previous name, `channel_max`, is still accepted as an alias.
 ##
-# channel_max = 128
+# max_channels_per_connection = 128
 
 ## Set the max permissible number of channels across all AMQP 0-9-1 connections on the node.
 ##
@@ -434,9 +444,15 @@
 ##
 # consumer_max_per_channel = 100
 
-## Set the max permissible number of client connections on the node.
+## Set the max number of publishes a channel will buffer for an open
+## AMQP 0-9-1 transaction before rejecting further ones.
 ##
-# connection_max = 5000
+# channel_tx_message_max = 10000
+
+## Set the max permissible number of client connections on the node.
+## The previous name, `connection_max`, is still accepted as an alias.
+##
+# max_connections = 5000
 
 ## Sets the maximum number of AMQP 1.0 sessions that can be simultaneously
 ## active on an AMQP 1.0 connection.
@@ -610,6 +626,11 @@
 ## a dedicated volume with particularly fast storage.
 ##
 # stream.data_dir = /data/rabbitmq/streams
+
+## Limits the RabbitMQ Stream Protocol frame size.
+# stream.initial_frame_max = 8192
+## Limits the maximum allowed RabbitMQ Stream Protocol sub-entry batch size.
+# stream.max_uncompressed_sub_entry_batch_size = 67108864
 
 ##
 ## Resource Limits & Flow Control
@@ -870,12 +891,29 @@
 ## on Windows.
 # motd_file = /etc/rabbitmq/motd
 
+## When multiple plugins provide interceptors, use these
+## settings to configure their run (execution) order.
+# channel_interceptor.priorities.interceptor_one = 1
+# channel_interceptor.priorities.interceptor_two = 2
+# channel_interceptor.priorities.interceptor_three = 3
+
 ## Consumer timeout
 ## If a message delivered to a consumer has not been acknowledged before this timer
 ## triggers the channel will be force closed by the broker. This ensures that
 ## faulty consumers that never ack will not hold on to messages indefinitely.
 ##
 # consumer_timeout = 900000
+
+## How consumer delivery acknowledgement timeouts should be handled.
+##
+## `notify_consumer` (the default) sends a `basic.cancel` to clients
+## that support the `consumer_cancel_notify` capability
+## and only closes the channel for clients that do not.
+##
+## `close_channel`, as the name suggests, always closes the channel,
+## which is the pre-`4.3.0` behavior.
+##
+# consumer_timeout_response = notify_consumer
 
 #
 # Advanced Erlang Networking/Clustering Options
@@ -943,6 +981,16 @@
 # management.tcp.request_timeout    = 120
 # management.tcp.compress           = true
 
+## Additional HTTP listeners. Each one uses the same `management.tcp.*`
+## settings as the primary HTTP listener, except for the port and the
+## interface, which is what these configure.
+##
+## If only a port is provided, the listener will
+## listen on all interfaces.
+##
+# management.listeners.tcp.1 = 127.0.0.1:15680
+# management.listeners.tcp.2 = 15681
+
 ## HTTPS listener settings
 ##
 ## Relevant doc guides:
@@ -954,6 +1002,18 @@
 # management.ssl.cacertfile = /path/to/ca_certificate.pem
 # management.ssl.certfile   = /path/to/server_certificate.pem
 # management.ssl.keyfile    = /path/to/server_key.pem
+
+## Additional HTTPS listeners. Each one uses the same `management.ssl.*`
+## settings as the primary HTTPS listener, except for the port and the
+## interface, which is what these configure.
+##
+## If no `management.ssl.*` settings are provided, these listeners fall
+## back to the node's `ssl_options`, that is, the certificate and key
+## configured for AMQP. A node without either logs a warning and
+## TLS handshakes on these listeners will fail.
+##
+# management.listeners.ssl.1 = 127.0.0.1:15682
+# management.listeners.ssl.2 = 15683
 
 ## More TLS options
 # management.ssl.honor_cipher_order   = true
@@ -1000,6 +1060,59 @@
 
 # management.sample_retention_policies.detailed.10 = 5
 
+## An encryption secret to use for the management UI.
+## This value is optional.
+## If set, it MUST be identical on all cluster nodes.
+# management.credential_encryption_secret = a-very-long-securely-generated-value
+
+## Should definition import over the HTTP API require files to have a .json
+## extension in addition to payload validation?
+# management.definitions.require_json_extension = false
+
+## Controls the `Referrer-Policy` HTTP header value.
+# management.headers.referrer_policy = no-referrer
+
+## Displays or hides an HTTP header in HTTP API responses.
+# management.http.hide_allow_header = false
+
+#
+# Prometheus
+#
+
+## Relevant doc guide: https://www.rabbitmq.com/docs/prometheus
+##
+## Primary HTTP and HTTPS listeners. With neither configured, a plain
+## HTTP listener is started on port 15692. With only `prometheus.ssl.*`
+## configured, only the HTTPS listener is started.
+##
+# prometheus.tcp.port       = 15692
+# prometheus.ssl.port       = 15691
+# prometheus.ssl.cacertfile = /path/to/ca_certificate.pem
+# prometheus.ssl.certfile   = /path/to/server_certificate.pem
+# prometheus.ssl.keyfile    = /path/to/server_key.pem
+
+## Additional HTTP listeners. Each one uses the same `prometheus.tcp.*`
+## settings as the primary HTTP listener, except for the port and the
+## interface, which is what these configure.
+##
+## If only a port is provided, the listener will
+## listen on all interfaces.
+##
+# prometheus.listeners.tcp.1 = 127.0.0.1:15693
+# prometheus.listeners.tcp.2 = 15694
+
+## Additional HTTPS listeners. Each one uses the same `prometheus.ssl.*`
+## settings as the primary HTTPS listener, except for the port and the
+## interface, which is what these configure.
+##
+## If no `prometheus.ssl.*` settings are provided, these listeners fall
+## back to the node's `ssl_options`, that is, the certificate and key
+## configured for AMQP. A node without either logs a warning and
+## TLS handshakes on these listeners will fail.
+##
+# prometheus.listeners.ssl.1 = 127.0.0.1:15695
+# prometheus.listeners.ssl.2 = 15696
+
 #
 # Shovel
 #
@@ -1011,6 +1124,15 @@
 ## * https://www.rabbitmq.com/docs/shovel-static
 
 ## Static shovel configuration examples can be found in advanced.config.example.
+
+## When shovels are declared with a TTL, what is
+## the absolute minimum TTL interval should be used to avoid
+## shovel churn and termination storms?
+##
+## The shovel plugin will enforce a 15 seconds minimum value,
+## that is, if the value configured is lower, 15 seconds will be
+## used by the plugin.
+# shovel.delete_after_duration_floor = 60
 
 
 #
@@ -1095,6 +1217,13 @@
 ## Relevant doc guide: https://www.rabbitmq.com/docs/stomp#proxy-protocol
 ##
 # stomp.proxy_protocol = false
+
+#
+# Web STOMP
+#
+
+## The WebSocket connection HSTS policy.
+# web_stomp.hsts.policy = max-age=31536000; includeSubDomains
 
 #
 # MQTT Adapter
@@ -1202,8 +1331,21 @@
 ## the MQTT plugin to be DELETED or clients will fail to subscribe.
 ## So this setting should be used for new clusters.
 ##
+## What queue type should the MQTT plugin use for durable
+## (QoS 1) storage?
 # mqtt.durable_queue_type = classic
 
+## Limit how much data the retained message store can
+## accumulate, per virtual host.
+# mqtt.retained_message_store.max_messages = 100000
+# mqtt.retained_message_store.max_size_bytes = 1073741824
+
+#
+# Web MQTT
+#
+
+## The WebSocket connection HSTS policy.
+# web_mqtt.hsts.policy = max-age=31536000; includeSubDomains
 
 
 ## Logging settings.
@@ -1245,7 +1387,12 @@
 
 ## Log level to use when logging to the amq.rabbitmq.log exchange
 ##
+## The log level to use for the `exchange` category
 # log.exchange.level = info
+
+## The log settings to use for the `user` (authentication and such) category
+# log.user.file = user.log
+# log.user.level = info
 
 
 ## File size-based log rotation
@@ -1325,6 +1472,9 @@
 ## Disable audience validation (not recommended)
 ##
 # auth_oauth2.verify_aud = false
+
+## Should the `exp` field be required on the JWT tokens?
+# auth_oauth2.require_exp = true
 
 ## Enable OAuth 2 in the management UI
 ##

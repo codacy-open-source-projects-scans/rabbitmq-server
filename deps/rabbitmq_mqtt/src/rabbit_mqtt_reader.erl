@@ -213,7 +213,9 @@ handle_info({keepalive, Req}, State = #state{proc_state = PState,
             rabbit_mqtt_processor:send_disconnect(?RC_KEEP_ALIVE_TIMEOUT, PState),
             {stop, {shutdown, keepalive_timeout}, State};
         {error, Reason} ->
-            {stop, Reason, State}
+            %% Socket already closed (e.g. `einval` from
+            %% `inet:getstat/2`). Let `tcp_closed` handle teardown.
+            network_error(Reason, State)
     end;
 
 handle_info(credential_expired,
@@ -318,6 +320,16 @@ log_tls_alert(Alert, ConnName) ->
 
 process_received_bytes(<<>>, State) ->
     {noreply, ensure_stats_timer(State), ?HIBERNATE_AFTER};
+%% Detect a TLS ClientHello (TLS record content type 22) sent to a non-TLS
+%% listener and emit a user-friendly error instead of a confusing parse failure
+%% with a large stacktrace.
+process_received_bytes(<<16#16, _/binary>>,
+                       State = #state{proc_state = connect_packet_unprocessed,
+                                      conn_name = ConnName}) ->
+    ?LOG_ERROR("MQTT detected TLS ClientHello from ~ts: TLS-enabled client is "
+               "connecting to a non-TLS MQTT listener",
+               [ConnName]),
+    {stop, {shutdown, tls_connection_on_non_tls_listener}, State};
 process_received_bytes(Bytes, State = #state{socket = Socket,
                                              parse_state = ParseState,
                                              proc_state = ProcState,
@@ -340,7 +352,12 @@ process_received_bytes(Bytes, State = #state{socket = Socket,
                                               throw({send_failed, Reason})
                                       end
                               end,
-                    try rabbit_mqtt_processor:init(Packet, Socket, ConnName, SendFun) of
+                    %% Pass the proxy-aware socket so the processor resolves the ends from it
+                    InitSocket = case State#state.proxy_socket of
+                                     undefined -> Socket;
+                                     ProxySocket -> ProxySocket
+                                 end,
+                    try rabbit_mqtt_processor:init(Packet, InitSocket, ConnName, SendFun) of
                         {ok, ProcState1} ->
                             ?LOG_INFO("Accepted MQTT connection ~ts for client ID ~ts",
                                       [ConnName, rabbit_mqtt_processor:info(client_id, ProcState1)]),
@@ -484,12 +501,7 @@ i(SockStat, #state{socket = Sock})
        SockStat =:= send_oct;
        SockStat =:= send_cnt;
        SockStat =:= send_pend ->
-    case rabbit_net:getstat(Sock, [SockStat]) of
-        {ok, [{_, N}]} when is_number(N) ->
-            N;
-        _ ->
-            0
-    end;
+    rabbit_net:getstat_or_zero(Sock, SockStat);
 i(state, S) ->
     i(connection_state, S);
 i(garbage_collection, _) ->
@@ -517,6 +529,7 @@ i(SSL, #state{socket = Sock, proxy_socket = ProxySock})
 i(Cert, #state{socket = Sock})
   when Cert =:= peer_cert_issuer;
        Cert =:= peer_cert_subject;
+       Cert =:= peer_cert_serial_number;
        Cert =:= peer_cert_validity ->
     rabbit_ssl:cert_info(Cert, Sock);
 i(timeout, #state{keepalive = KState}) ->

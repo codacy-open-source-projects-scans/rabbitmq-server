@@ -43,7 +43,9 @@
     peername,
     auth_hd,
     stats_timer,
-    connection
+    connection,
+    current_frame_size = 0,
+    max_frame_size
 }).
 
 -define(APP, rabbitmq_web_stomp).
@@ -117,11 +119,8 @@ init(Req0, Opts) ->
                     end
             end,
             WsOpts0 = proplists:get_value(ws_opts, Opts, #{}),
-            MaxFrameSize = application:get_env(
-                rabbitmq_stomp, max_frame_size_unauthenticated,
-                ?DEFAULT_MAX_FRAME_SIZE_UNAUTHENTICATED) + 4096,
             WsOpts = maps:merge(#{compress => true,
-                                   max_frame_size => MaxFrameSize}, WsOpts0),
+                                   max_frame_size => unauthenticated_frame_size()}, WsOpts0),
             {?MODULE, Req, #state{
                 frame_type         = proplists:get_value(type, Opts, text),
                 heartbeat_sup      = KeepaliveSup,
@@ -151,6 +150,7 @@ websocket_init(State) ->
     {ok, rabbit_event:init_stats_timer(
            State#state{proc_state     = ProcessorState,
                        parser_config  = ParserConfig,
+                       max_frame_size = unauthenticated_frame_size(),
                        parse_state    = rabbit_stomp_frame:initial_state(ParserConfig)},
            #state.stats_timer)}.
 
@@ -182,9 +182,7 @@ init_processor_state(#state{socket=Sock, auth_hd=AuthHd}) ->
                       max_header_length = application:get_env(
                                             rabbitmq_stomp, max_header_length,
                                             Defaults#stomp_parser_config.max_header_length),
-                      max_body_length   = application:get_env(
-                                            rabbitmq_stomp, max_body_length,
-                                            Defaults#stomp_parser_config.max_body_length)},
+                      max_body_length   = rabbit_stomp:max_body_length()},
     UseHTTPAuth = application:get_env(rabbitmq_web_stomp, use_http_auth, false),
     UserConfig = application:get_env(rabbitmq_stomp, default_user, undefined),
     StompConfig1 = rabbit_stomp:parse_default_user(UserConfig, StompConfig0),
@@ -308,6 +306,15 @@ websocket_info({start_heartbeats, {SendTimeout, ReceiveTimeout}},
 websocket_info(client_timeout, State) ->
     stop(State);
 
+websocket_info(credential_expired, State = #state{proc_state = ProcState}) ->
+    ?LOG_WARNING("Web STOMP: closing connection ~ts of user '~ts': "
+                 "credential has expired",
+                 [rabbit_stomp_processor:adapter_name(ProcState),
+                  rabbit_stomp_processor:info(user, ProcState)]),
+    ProcState1 = rabbit_stomp_processor:send_credential_expired_error(ProcState),
+    self() ! close_websocket,
+    {[], State#state{proc_state = ProcState1}};
+
 %%----------------------------------------------------------------------------
 websocket_info({'EXIT', _From, _Reason}, State) ->
     stop(State);
@@ -320,16 +327,16 @@ websocket_info(emit_stats, State) ->
     {ok, emit_stats(State)};
 
 websocket_info(increase_max_frame_size, State) ->
-    MaxFrameSize = application:get_env(
-        rabbitmq_stomp, max_frame_size, ?DEFAULT_MAX_FRAME_SIZE) + 4096,
-    {[{set_options, #{max_frame_size => MaxFrameSize}}], State};
+    {[{set_options, #{max_frame_size => authenticated_frame_size() + 4096}}], State};
 
-websocket_info(login_timeout, State = #state{connection = C})
-  when C =:= none; C =:= undefined ->
-    ?LOG_ERROR("Web STOMP: closing connection (login timeout)"),
-    stop(State);
-websocket_info(login_timeout, State) ->
-    {ok, State};
+websocket_info(login_timeout, State = #state{proc_state = ProcState}) ->
+    case rabbit_stomp_processor:info(user, ProcState) of
+        undefined ->
+            ?LOG_ERROR("Web STOMP: closing connection (login timeout)"),
+            stop(State);
+        _ ->
+            {ok, State}
+    end;
 
 websocket_info(Msg, State) ->
     ?LOG_INFO("Web STOMP: unexpected message ~tp",
@@ -405,40 +412,82 @@ handle_data(Data, State0) ->
 
 handle_data1(<<>>, State) ->
     {ok, ensure_stats_timer(State)};
-handle_data1(Bytes, State = #state{proc_state    = ProcState,
-                                   parse_state   = ParseState,
-                                   parser_config = ParserConfig,
-                                   connection    = OldConn}) ->
+handle_data1(Bytes, State = #state{proc_state         = ProcState,
+                                   parse_state        = ParseState,
+                                   parser_config      = ParserConfig,
+                                   current_frame_size = FrameSize,
+                                   max_frame_size     = MaxFrameSize,
+                                   connection         = OldConn}) ->
     case rabbit_stomp_frame:parse(Bytes, ParseState) of
         {more, ParseState1} ->
-            {ok, ensure_stats_timer(State#state{ parse_state = ParseState1 })};
+            FrameSize1 = FrameSize + byte_size(Bytes),
+            case frame_size_exceeded(FrameSize1, MaxFrameSize) of
+                true ->
+                    {error, {frame_too_big, {FrameSize1, MaxFrameSize}}};
+                false ->
+                    {ok, ensure_stats_timer(
+                           State#state{parse_state        = ParseState1,
+                                       current_frame_size = FrameSize1})}
+            end;
         {ok, Frame, Rest} ->
-            case rabbit_stomp_processor:process_frame(Frame, ProcState) of
-                {ok, ProcState1} ->
-                    maybe_increase_max_frame_size(OldConn, ProcState1),
-                    ParseState1 = rabbit_stomp_frame:initial_state(ParserConfig),
-                    State1 = maybe_block(State, Frame),
-                    handle_data1(
-                      Rest,
-                      State1 #state{ parse_state = ParseState1,
-                                     proc_state  = ProcState1 });
-                {stop, _Reason, ProcState1} ->
-                    %% do not exit here immediately, because we need to wait for messages eventually enqueued by process_request
-                    self() ! close_websocket,
-                    {ok, State#state{ proc_state = ProcState1 }}
+            FrameSize1 = FrameSize + byte_size(Bytes) - byte_size(Rest),
+            case frame_size_exceeded(FrameSize1, MaxFrameSize) of
+                true ->
+                    {error, {frame_too_big, {FrameSize1, MaxFrameSize}}};
+                false ->
+                    case rabbit_stomp_processor:process_frame(Frame, ProcState) of
+                        {ok, ProcState1} ->
+                            MaxFrameSize1 = maybe_raise_frame_size_limit(
+                                              OldConn, ProcState1, MaxFrameSize),
+                            ParseState1 = rabbit_stomp_frame:initial_state(ParserConfig),
+                            State1 = maybe_block(State, Frame),
+                            handle_data1(
+                              Rest,
+                              State1 #state{ parse_state        = ParseState1,
+                                             proc_state         = ProcState1,
+                                             current_frame_size = 0,
+                                             max_frame_size     = MaxFrameSize1 });
+                        {stop, _Reason, ProcState1} ->
+                            %% do not exit here immediately, because we need to wait for messages eventually enqueued by process_request
+                            self() ! close_websocket,
+                            {ok, State#state{ proc_state = ProcState1 }}
+                    end
             end;
         Other ->
             Other
     end.
 
-maybe_increase_max_frame_size(OldConn, ProcState)
+-spec frame_size_exceeded(non_neg_integer(), non_neg_integer()) -> boolean().
+frame_size_exceeded(Size, Max) -> Size > Max.
+
+-spec unauthenticated_frame_size() -> pos_integer().
+unauthenticated_frame_size() ->
+    application:get_env(rabbitmq_stomp, max_frame_size_unauthenticated,
+                        ?DEFAULT_MAX_FRAME_SIZE_UNAUTHENTICATED) + 4096.
+
+-spec authenticated_frame_size() -> non_neg_integer().
+authenticated_frame_size() ->
+    application:get_env(rabbitmq_stomp, max_frame_size, ?DEFAULT_MAX_FRAME_SIZE).
+
+%% A STOMP frame may span many WebSocket messages that each stay within the
+%% per-message limit while the parser continuation retains their sum, and
+%% permessage-deflate lets small unauthenticated input expand into a large
+%% continuation. Cap that sum until the client authenticates.
+-spec maybe_raise_frame_size_limit(pid() | none | undefined,
+                                   term(),
+                                   non_neg_integer()) ->
+    non_neg_integer().
+maybe_raise_frame_size_limit(OldConn, ProcState, Max)
   when OldConn =:= none; OldConn =:= undefined ->
     case rabbit_stomp_processor:info(user, ProcState) of
-        undefined -> ok;
-        _ -> self() ! increase_max_frame_size
+        undefined ->
+            Max;
+        _ ->
+            self() ! increase_max_frame_size,
+            authenticated_frame_size()
     end;
-maybe_increase_max_frame_size(_, _) ->
-    ok.
+maybe_raise_frame_size_limit(_, _, Max) ->
+    Max.
 
 maybe_block(State = #state{state = blocking, heartbeat = Heartbeat},
             #stomp_frame{command = 'SEND'}) ->
@@ -450,9 +499,8 @@ maybe_block(State, _) ->
 stop(State) ->
     stop(State, 1000, "STOMP died").
 
-stop(State = #state{proc_state = ProcState}, CloseCode, Error0) ->
+stop(State, CloseCode, Error0) ->
     maybe_emit_stats(State),
-    _ = rabbit_stomp_processor:flush_and_die(ProcState),
     Error1 = rabbit_data_coercion:to_binary(Error0),
     {[{close, CloseCode, Error1}], State}.
 

@@ -19,8 +19,16 @@
          validate_queue_args/2,
          validate_consumer_args/2,
          validate_delete_after/2,
+         validate_delete_after_duration/2,
+         parse_delete_after/1,
+         sched_expire_after_duration/2,
+         cancel_expire_after_duration/1,
          deobfuscate_value/1,
-         deobfuscated_uris/2
+         deobfuscated_uris/2,
+         obfuscated_uris/2,
+         obfuscate_uris/1,
+         deobfuscate_uris/1,
+         log_connection_failure/3
         ]).
 
 -export([
@@ -29,6 +37,7 @@
 
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("kernel/include/logger.hrl").
+-include("rabbit_shovel.hrl").
 
 -define(APP, rabbitmq_shovel).
 -define(ROUTING_HEADER, <<"x-shovelled">>).
@@ -57,15 +66,10 @@ add_timestamp_header(Props = #'P_basic'{headers = Headers}) ->
     Props#'P_basic'{headers = Headers2}.
 
 delete_shovel(VHost, Name, ActingUser) ->
-    case rabbit_shovel_status:lookup({VHost, Name}) of
+    case rabbit_runtime_parameters:value(VHost, <<"shovel">>, Name) of
         not_found ->
-            %% Follow the user's obvious intent and delete the runtime parameter just in case the Shovel is in
-            %% a starting-failing-restarting loop. MK.
-            ?LOG_INFO("Will delete runtime parameters of shovel '~ts' in virtual host '~ts'", [Name, VHost]),
-            ok = rabbit_runtime_parameters:clear(VHost, <<"shovel">>, Name, ActingUser),
             {error, not_found};
-        _Obj ->
-            ShovelParameters = rabbit_runtime_parameters:value(VHost, <<"shovel">>, Name),
+        ShovelParameters ->
             case needs_force_delete(ShovelParameters, ActingUser) of
                 false ->
                     ?LOG_INFO("Will delete runtime parameters of shovel '~ts' in virtual host '~ts'", [Name, VHost]),
@@ -130,6 +134,9 @@ bin_to_hex(Bin) ->
            true  -> N + $0 end>>
       || <<N:4>> <= Bin>>.
 
+%% The backend completes these args with its connection context before applying.
+-spec decl_fun(module(), {source | destination, proplists:proplist()}) ->
+          {module(), atom(), [term()]}.
 decl_fun(Mod, {source, Endpoint}) ->
     case parse_declaration({proplists:get_value(declarations, Endpoint, []), []}) of
         [] ->
@@ -138,7 +145,9 @@ decl_fun(Mod, {source, Endpoint}) ->
                             <<>> -> fail({invalid_parameter_value, declarations, {require_non_empty}});
                             Queue -> {Mod, check_fun, [Queue]}
                         end;
-                false -> {Mod, decl_fun, []}
+                %% [[]], not []: callers append the connection context, so
+                %% decl_fun still needs its leading declaration argument.
+                false -> {Mod, decl_fun, [[]]}
             end;
         Decl -> {Mod, decl_fun, [Decl]}
     end;
@@ -219,12 +228,15 @@ validate_params_user(#amqp_params_direct{}, none) ->
     ok;
 validate_params_user(#amqp_params_direct{virtual_host = VHost},
                      User = #user{username = Username}) ->
-    VHostAccess = case catch rabbit_access_control:check_vhost_access(User, VHost, undefined, #{}) of
-                      ok -> ok;
-                      NotOK ->
-                          ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: ~tp", [NotOK]),
-                          NotOK
+    VHostAccess = try rabbit_access_control:check_vhost_access(
+                          User, VHost, undefined, #{})
+                  catch _:E -> {error, E}
                   end,
+    case VHostAccess of
+        ok -> ok;
+        NotOK ->
+            ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: ~tp", [NotOK])
+    end,
     case rabbit_vhost:exists(VHost) andalso VHostAccess of
         ok -> ok;
         _ ->
@@ -259,10 +271,108 @@ validate_delete_after(Name,  Term) ->
     {error, "~ts should be a number greater than or equal to 0, \"never\" or \"queue-length\", actually was "
      "~tp", [Name, Term]}.
 
+
+parse_delete_after(<<"never">>) -> never;
+parse_delete_after(<<"queue-length">>) -> 'queue-length';
+parse_delete_after(N) when is_integer(N) -> N.
+
+validate_delete_after_duration(Name, N) when is_integer(N), N > 0 ->
+    %% the configured floor will still be applied if the value is too low
+    case rabbit_misc:check_expiry(N * 1000) of
+        ok ->
+            ok;
+        {error, {value_too_large, _}} ->
+            {error, "~ts is ~tp seconds, which exceeds the maximum supported "
+             "duration", [Name, N]}
+    end;
+validate_delete_after_duration(Name,  Term) ->
+    {error, "~ts should be a positive integer (seconds), actually was ~tp",
+     [Name, Term]}.
+
+sched_expire_after_duration(Name, Src) ->
+    %% Be extra defensive against timer leaks.
+    _ = cancel_expire_after_duration(Src),
+    case maps:get(delete_after_duration, Src, undefined) of
+        Seconds when is_integer(Seconds), Seconds > 0 ->
+            EffectSeconds = clamp_expire_after_duration(Seconds),
+            case EffectSeconds =:= Seconds of
+                true ->
+                    ok;
+                false ->
+                    ?LOG_WARNING("Shovel '~ts' has src-delete-after-duration of ~tp seconds, "
+                                 "adjusting to the minimum allowed ~tp seconds",
+                                 [Name, Seconds, EffectSeconds])
+            end,
+
+            Timer = rabbit_misc:send_after(EffectSeconds * 1000, self(),
+                                           {internal, delete_after_duration_expired}),
+
+            Src#{delete_after_timer => Timer};
+        _ ->
+            Src
+    end.
+
+cancel_expire_after_duration(#{delete_after_timer := Timer}) ->
+    rabbit_misc:cancel_timer(Timer);
+cancel_expire_after_duration(_) ->
+    ok.
+
+clamp_expire_after_duration(Seconds) ->
+    ConfigFloor = application:get_env(?APP, delete_after_duration_floor,
+                                      ?SOFT_DELETE_AFTER_DURATION_FLOOR),
+    EffectFloor = max(?HARD_DELETE_AFTER_DURATION_FLOOR, ConfigFloor),
+    max(Seconds, EffectFloor).
+
 deobfuscate_value(Value) ->
     credentials_obfuscation:decrypt(Value).
 
 deobfuscated_uris(Key, Def) ->
     ObfuscatedURIs = rabbit_misc:pget(Key, Def),
+    deobfuscate_uris(ObfuscatedURIs).
+
+obfuscated_uris(Key, Def) ->
+    rabbit_misc:pget(Key, Def).
+
+obfuscate_uris(URIs) ->
+    [credentials_obfuscation:encrypt(rabbit_data_coercion:to_binary(URI)) || URI <- URIs].
+
+deobfuscate_uris(ObfuscatedURIs) ->
     URIs = [credentials_obfuscation:decrypt(ObfuscatedURI) || ObfuscatedURI <- ObfuscatedURIs],
-    [binary_to_list(URI) || URI <- URIs].
+    [rabbit_data_coercion:to_list(URI) || URI <- URIs].
+
+%% Logs a single-line, human-readable connection failure instead of a raw
+%% (and potentially deeply nested) error term. Used by both the AMQP 0-9-1
+%% and AMQP 1.0 shovel implementations.
+log_connection_failure(Reason, URI, {VHost, Name} = _ShovelName) ->
+    ?LOG_WARNING(
+       "Shovel '~ts' in vhost '~ts' failed to connect (URI: ~ts): ~ts",
+       [Name, VHost, amqp_uri:remove_credentials(URI), human_readable_connection_error(Reason)]);
+log_connection_failure(Reason, URI, ShovelName) ->
+    ?LOG_WARNING(
+       "Shovel '~ts' failed to connect (URI: ~ts): ~ts",
+       [ShovelName, amqp_uri:remove_credentials(URI), human_readable_connection_error(Reason)]).
+
+human_readable_connection_error({auth_failure, Msg}) ->
+    Msg;
+human_readable_connection_error(sasl_auth_failure) ->
+    "authentication failure (SASL)";
+human_readable_connection_error(not_allowed) ->
+    "access to target virtual host was refused";
+human_readable_connection_error(unknown_host) ->
+    "unknown host (failed to resolve hostname)";
+human_readable_connection_error(econnrefused) ->
+    "connection to target host was refused (ECONNREFUSED)";
+human_readable_connection_error(econnreset) ->
+    "connection to target host was reset by peer (ECONNRESET)";
+human_readable_connection_error(etimedout) ->
+    "connection to target host timed out (ETIMEDOUT)";
+human_readable_connection_error(ehostunreach) ->
+    "target host is unreachable (EHOSTUNREACH)";
+human_readable_connection_error(nxdomain) ->
+    "target hostname cannot be resolved (NXDOMAIN)";
+human_readable_connection_error(eacces) ->
+    "connection to target host failed with EACCES. "
+    "This may be due to insufficient RabbitMQ process permissions or "
+    "a reserved IP address used as destination";
+human_readable_connection_error(Other) ->
+    rabbit_misc:format("~tp", [Other]).

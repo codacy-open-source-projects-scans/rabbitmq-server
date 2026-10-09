@@ -16,11 +16,10 @@
 
 -module(rabbit_stream_manager).
 
--feature(maybe_expr, enable).
-
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit/include/amqqueue.hrl").
+-include_lib("rabbit/include/rabbit_stream_queue.hrl").
 -include_lib("rabbitmq_stream/src/rabbit_stream_utils.hrl").
 -include_lib("kernel/include/logger.hrl").
 
@@ -29,6 +28,7 @@
          delete/3,
          create_super_stream/6,
          delete_super_stream/3,
+         delete_super_stream/4,
          lookup_leader/2,
          lookup_local_member/2,
          lookup_member/2,
@@ -59,7 +59,7 @@ create(VirtualHost, Reference, Arguments, Username) ->
     end.
 
 -spec delete(binary(), binary(), binary()) ->
-    {ok, deleted} | {error, reference_not_found}.
+    {ok, deleted} | {error, term()}.
 delete(VirtualHost, Reference, Username) ->
     Name =
     #resource{virtual_host = VirtualHost,
@@ -74,10 +74,15 @@ delete(VirtualHost, Reference, Username) ->
                 true ->
                     ?LOG_DEBUG("Queue record ~tp is a stream, trying to delete it",
                                      [Reference]),
-                    {ok, _} =
-                    rabbit_stream_queue:delete(Q, false, false, Username),
-                    ?LOG_DEBUG("Stream ~tp deleted", [Reference]),
-                    {ok, deleted};
+                    case rabbit_stream_queue:delete(Q, false, false, Username) of
+                        {ok, _} ->
+                            ?LOG_DEBUG("Stream ~tp deleted", [Reference]),
+                            {ok, deleted};
+                        {error, Reason} ->
+                            {error, Reason};
+                        {protocol_error, Type, Reason, Args} ->
+                            {error, {protocol_error, Type, Reason, Args}}
+                    end;
                 _ ->
                     ?LOG_DEBUG("Queue record ~tp is NOT a stream, returning error",
                                      [Reference]),
@@ -169,32 +174,53 @@ create_super_stream(VirtualHost,
 delete_super_stream(VirtualHost, SuperStream, Username) ->
     case super_stream_partitions(VirtualHost, SuperStream) of
         {ok, Partitions} ->
-            case delete_super_stream_exchange(VirtualHost, SuperStream,
-                                              Username)
-            of
+            delete_super_stream(VirtualHost, SuperStream, Partitions, Username);
+        {error, Error} ->
+            {error, Error}
+    end.
+
+%% Deletes a super stream using a caller-supplied, already authorization-checked
+%% partition list. Using the caller's snapshot closes the TOCTOU window that
+%% exists when the manager re-reads bindings after the authorization check.
+-spec delete_super_stream(binary(), binary(), [binary()], binary()) ->
+    ok | {error, term()}.
+delete_super_stream(VirtualHost, SuperStream, Partitions, Username) ->
+    UniquePartitions = lists:uniq(Partitions),
+    case delete_super_stream_partitions(VirtualHost, SuperStream, UniquePartitions,
+                                        Username) of
+        ok ->
+            case delete_super_stream_exchange(VirtualHost, SuperStream, Username) of
                 ok ->
                     ok;
                 {error, Error} ->
                     ?LOG_WARNING("Error while deleting super stream exchange ~tp, "
-                                       "~tp",
-                                       [SuperStream, Error]),
-                    ok
-            end,
-            [begin
-                 case delete(VirtualHost, Stream, Username) of
-                     {ok, deleted} ->
-                         ok;
-                     {error, Err} ->
-                         ?LOG_WARNING("Error while delete partition ~tp of super stream "
-                                            "~tp, ~tp",
-                                            [Stream, SuperStream, Err]),
-                         ok
-                 end
-             end
-             || Stream <- Partitions],
+                                 "~tp",
+                                 [SuperStream, Error]),
+                    {error, {exchange_not_deleted, UniquePartitions, Error}}
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+delete_super_stream_partitions(VirtualHost, SuperStream, Partitions, Username) ->
+    {Deleted, Errors} =
+    lists:foldl(fun(Stream, {DeletedAcc, ErrorsAcc}) ->
+                        case delete(VirtualHost, Stream, Username) of
+                            {ok, deleted} ->
+                                {[Stream | DeletedAcc], ErrorsAcc};
+                            {error, Error} ->
+                                ?LOG_WARNING(
+                                  "Error while deleting partition ~tp of super stream ~tp, ~tp",
+                                  [Stream, SuperStream, Error]),
+                                {DeletedAcc, [{Stream, Error} | ErrorsAcc]}
+                        end
+                end, {[], []}, Partitions),
+    case Errors of
+        [] ->
             ok;
-        {error, Error} ->
-            {error, Error}
+        _ ->
+            {error, {partitions_not_deleted, lists:reverse(Deleted),
+                     lists:reverse(Errors)}}
     end.
 
 -spec lookup_leader(binary(), binary()) ->
@@ -467,6 +493,12 @@ stream_queue_arguments(ArgumentsAcc,
                              rabbit_data_coercion:to_integer(Value)}]
                            ++ ArgumentsAcc,
                            maps:remove(<<"stream-filter-size-bytes">>, Arguments));
+stream_queue_arguments(ArgumentsAcc,
+                       #{<<"stream-initial-offset">> := Value} = Arguments) ->
+    stream_queue_arguments([{<<"x-stream-initial-offset">>, long,
+                             rabbit_data_coercion:to_integer(Value)}]
+                           ++ ArgumentsAcc,
+                           maps:remove(<<"stream-initial-offset">>, Arguments));
 stream_queue_arguments(ArgumentsAcc, _Arguments) ->
     ArgumentsAcc.
 
@@ -492,6 +524,12 @@ validate_stream_queue_arguments([{<<"x-stream-filter-size-bytes">>, long,
                                   FilterSize}
                                  | _])
   when FilterSize < 16 orelse FilterSize > 255 ->
+    error;
+validate_stream_queue_arguments([{<<"x-stream-initial-offset">>, long,
+                                  InitialOffset}
+                                 | _])
+  when InitialOffset < 0
+       orelse InitialOffset > ?MAX_STREAM_INITIAL_OFFSET ->
     error;
 validate_stream_queue_arguments([_ | T]) ->
     validate_stream_queue_arguments(T).
@@ -626,6 +664,7 @@ validate_super_stream_creation(_VirtualHost, _Name, Partitions, BindingKeys)
 validate_super_stream_creation(VirtualHost, Name, Partitions, _BindingKeys) ->
     maybe
         ok ?= validate_super_stream_partitions(Partitions),
+        ok ?= validate_super_stream_max_partitions(Partitions),
         ok ?= case rabbit_vhost_limit:would_exceed_queue_limit(length(Partitions), VirtualHost) of
                   false ->
                       ok;
@@ -670,6 +709,17 @@ validate_super_stream_partitions(Partitions) ->
         _ -> {error, {validation_failed,
                       {rabbit_misc:format("Duplicate partition names found ~ts",
                                           [Partitions])}}}
+    end.
+
+validate_super_stream_max_partitions(Partitions) ->
+    case rabbit_stream_utils:validate_super_stream_max_partitions(Partitions) of
+        true ->
+            ok;
+        false ->
+            MaxPartitions = rabbit_stream_utils:max_super_stream_partitions(),
+            {error, {validation_failed,
+                     {rabbit_misc:format("The partition number must not exceed ~w",
+                                         [MaxPartitions])}}}
     end.
 
 exchange_exists(VirtualHost, Name) ->

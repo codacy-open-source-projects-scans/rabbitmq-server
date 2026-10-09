@@ -30,7 +30,10 @@
          base_product_version/0,
          motd_file/0,
          motd/0,
-         pg_local_scope/1]).
+         pg_local_scope/1,
+         pg_scope_amqp091_channel/0,
+         pg_scope_amqp091_connection/0,
+         pg_scope_non_amqp_connection/0]).
 %% For CLI, testing and mgmt-agent.
 -export([set_log_level/1, log_locations/0, config_files/0]).
 -export([is_booted/1, is_booted/0, is_booting/1, is_booting/0]).
@@ -39,7 +42,11 @@
 %% Boot steps.
 -export([update_cluster_tags/0, maybe_insert_default_data/0, boot_delegate/0, recover/0,
          pg_local_amqp_session/0,
-         pg_local_amqp_connection/0, prevent_startup_if_node_was_reset/0]).
+         pg_local_amqp_connection/0,
+         pg_local_amqp091_channel/0,
+         pg_local_amqp091_connection/0,
+         pg_local_non_amqp_connection/0,
+         prevent_startup_if_node_was_reset/0]).
 
 -rabbit_boot_step({pre_boot, [{description, "rabbit boot start"}]}).
 
@@ -219,6 +226,13 @@
                     {mfa,         {rabbit_logger_exchange_h, declare_exchange, []}},
                     {requires,    [core_initialized, recovery]}]}).
 
+-rabbit_boot_step({channel_interceptor_priorities_check,
+                   [{description, "warn about channel interceptor priorities that match no registered interceptor"},
+                    {mfa,         {rabbit_channel_interceptor,
+                                   warn_unknown_priorities, []}},
+                    {requires,    recovery},
+                    {enables,     routing_ready}]}).
+
 -rabbit_boot_step({routing_ready,
                    [{description, "message delivery logic ready"},
                     {requires,    [core_initialized, recovery]}]}).
@@ -286,8 +300,26 @@
                     {enables,     core_initialized}]}).
 
 -rabbit_boot_step({pg_local_amqp_connection,
-                   [{description, "local-only pg scope for AMQP connections"},
+                   [{description, "local-only pg scope for AMQP 1.0 connections"},
                     {mfa,         {rabbit, pg_local_amqp_connection, []}},
+                    {requires,    kernel_ready},
+                    {enables,     core_initialized}]}).
+
+-rabbit_boot_step({pg_local_amqp091_channel,
+                   [{description, "local-only pg scope for AMQP 0-9-1 channels"},
+                    {mfa,         {rabbit, pg_local_amqp091_channel, []}},
+                    {requires,    kernel_ready},
+                    {enables,     core_initialized}]}).
+
+-rabbit_boot_step({pg_local_amqp091_connection,
+                   [{description, "local-only pg scope for AMQP 0-9-1 connections"},
+                    {mfa,         {rabbit, pg_local_amqp091_connection, []}},
+                    {requires,    kernel_ready},
+                    {enables,     core_initialized}]}).
+
+-rabbit_boot_step({pg_local_non_amqp_connection,
+                   [{description, "local-only pg scope for non-AMQP connections"},
+                    {mfa,         {rabbit, pg_local_non_amqp_connection, []}},
                     {requires,    kernel_ready},
                     {enables,     core_initialized}]}).
 
@@ -455,9 +487,10 @@ spawn_boot_marker() ->
     %% We register a process doing nothing to indicate that RabbitMQ is
     %% booting. This is checked by `is_booting(Node)` on a remote node.
     Marker = spawn_link(fun() -> receive stop -> ok end end),
-    case catch register(rabbit_boot, Marker) of
-        true -> {ok, Marker};
-        _    -> {already_booting, Marker}
+    try register(rabbit_boot, Marker) of
+        true -> {ok, Marker}
+    catch
+        _:_ -> {already_booting, Marker}
     end.
 
 stop_boot_marker(Marker) ->
@@ -1026,6 +1059,8 @@ do_run_postlaunch_phase(Plugins) ->
         ok = application:set_env(prometheus, instrumenters, [],
                                  [{persistent, true}]),
 
+        ok = application:set_env(kernel, log_missed_net_ticks, true),
+
         %% However, we want to run their boot steps and actually start
         %% them one by one, to ensure a dependency is fully started
         %% before a plugin which depends on it gets a chance to start.
@@ -1047,6 +1082,15 @@ do_run_postlaunch_phase(Plugins) ->
 
         %% Start listeners after all plugins have been enabled,
         %% see rabbitmq/rabbitmq-server#2405.
+        case application:get_env(rabbit, listeners_startup_delay, 0) of
+            Delay when is_integer(Delay), Delay > 0 ->
+                ?LOG_INFO("Delaying startup of client connection listeners by ~b seconds", [Delay]),
+                timer:sleep(Delay * 1000);
+            0 ->
+                ok;
+            Delay ->
+                ?LOG_WARNING("Ignoring invalid listeners.startup_delay value ~tp", [Delay])
+        end,
         ?LOG_INFO("Ready to start client connection listeners"),
         ok = rabbit_networking:boot(),
 
@@ -1120,8 +1164,32 @@ pg_local_amqp_connection() ->
     PgScope = pg_local_scope(amqp_connection),
     rabbit_sup:start_child(pg_amqp_connection, pg, [PgScope]).
 
+pg_local_amqp091_channel() ->
+    PgScope = pg_local_scope(amqp091_channel),
+    persistent_term:put(pg_scope_amqp091_channel, PgScope),
+    rabbit_sup:start_child(pg_amqp091_channel, pg, [PgScope]).
+
+pg_local_amqp091_connection() ->
+    PgScope = pg_local_scope(amqp091_connection),
+    persistent_term:put(pg_scope_amqp091_connection, PgScope),
+    rabbit_sup:start_child(pg_amqp091_connection, pg, [PgScope]).
+
+pg_local_non_amqp_connection() ->
+    PgScope = pg_local_scope(non_amqp_connection),
+    persistent_term:put(pg_scope_non_amqp_connection, PgScope),
+    rabbit_sup:start_child(pg_non_amqp_connection, pg, [PgScope]).
+
 pg_local_scope(Prefix) ->
     list_to_atom(io_lib:format("~s_~s", [Prefix, node()])).
+
+pg_scope_amqp091_channel() ->
+    persistent_term:get(pg_scope_amqp091_channel).
+
+pg_scope_amqp091_connection() ->
+    persistent_term:get(pg_scope_amqp091_connection).
+
+pg_scope_non_amqp_connection() ->
+    persistent_term:get(pg_scope_non_amqp_connection).
 
 -spec update_cluster_tags() -> 'ok'.
 
@@ -1129,7 +1197,7 @@ update_cluster_tags() ->
     Tags = application:get_env(rabbit, cluster_tags, []),
     ?LOG_DEBUG("Seeding cluster tags from application environment key...",
                #{domain => ?RMQLOG_DOMAIN_GLOBAL}),
-    rabbit_runtime_parameters:set_global(cluster_tags, Tags, <<"internal_user">>).
+    rabbit_runtime_parameters:set_global(<<"cluster_tags">>, Tags, <<"internal_user">>).
 
 
 -spec prevent_startup_if_node_was_reset() -> 'ok' | no_return().
@@ -1285,9 +1353,9 @@ force_event_refresh(Ref) ->
 log_broker_started(Plugins) ->
     PluginList = iolist_to_binary([rabbit_misc:format(" * ~ts~n", [P])
                                    || P <- Plugins]),
-    Message = string:strip(rabbit_misc:format(
+    Message = string:trim(rabbit_misc:format(
         "Server startup complete; ~b plugins started.~n~ts",
-        [length(Plugins), PluginList]), right, $\n),
+        [length(Plugins), PluginList]), trailing, "\n"),
     ?LOG_INFO(Message,
               #{domain => ?RMQLOG_DOMAIN_GLOBAL}),
     io:format(" completed with ~tp plugins.~n", [length(Plugins)]).
@@ -1317,6 +1385,32 @@ log_broker_started(Plugins) ->
         "~n  " ?BG32_START "          " ?C_END "  ~ts").
 
 print_banner() ->
+    %% Avoid printing the banner if the node is configured
+    %% to use JSON logging.
+    %%
+    %% There isn't really a meaningful JSON equivalent of the
+    %% startup banner but skipping it only has one possible downside:
+    %% it can be harder to spot the node version in some log snippets
+    %% (immediately after node startup).
+    case console_output_uses_json_formatter() of
+        true  -> ok;
+        false -> print_banner1()
+    end.
+
+console_output_uses_json_formatter() ->
+    lists:any(
+      fun(Id) ->
+              case logger:get_handler_config(Id) of
+                  {ok, #{config := #{type := Type},
+                         formatter := {rabbit_logger_json_fmt, _}}}
+                    when Type =:= standard_io orelse Type =:= standard_error ->
+                      true;
+                  _ ->
+                      false
+              end
+      end, logger:get_handler_ids()).
+
+print_banner1() ->
     Product = product_name(),
     Version = product_version(),
     LineListFormatter = fun (Placeholder, [_ | Tail] = LL) ->
@@ -1376,11 +1470,7 @@ print_banner() ->
               CfgLocations).
 
 emu_flavor() ->
-    %% emu_flavor was introduced in Erlang 24 so we need to catch the error on Erlang 23
-    case catch(erlang:system_info(emu_flavor)) of
-        {'EXIT', _} -> "emu";
-        EmuFlavor -> EmuFlavor
-    end.
+    erlang:system_info(emu_flavor).
 
 crypto_version() ->
     [{CryptoLibName, _, CryptoLibVersion}] = crypto:info_lib(),
@@ -1419,7 +1509,7 @@ log_banner() ->
                      rabbit_misc:format(
                        " ~-" ++ integer_to_list(DescrLen) ++ "s: ~ts~n", [K, V])
              end,
-    Banner = string:strip(lists:flatten(
+    Banner = string:trim(lists:flatten(
                [case S of
                     {"config file(s)" = K, []} ->
                         Format(K, "(none)");
@@ -1427,7 +1517,7 @@ log_banner() ->
                         [Format(K, V0) | [Format("", V) || V <- Vs]];
                     {K, V} ->
                         Format(K, V)
-                end || S <- Settings]), right, $\n),
+                end || S <- Settings]), trailing, "\n"),
     ?LOG_INFO("~n~ts", [Banner],
               #{domain => ?RMQLOG_DOMAIN_GLOBAL}).
 
@@ -1465,7 +1555,8 @@ product_name() ->
 
 -spec product_license_line() -> string().
 product_license_line() ->
-    application:get_env(rabbit, license_line, ?INFORMATION_MESSAGE).
+    {ok, Val} = application:get_env(rabbit, license_line),
+    Val.
 
 -spec product_version() -> string().
 

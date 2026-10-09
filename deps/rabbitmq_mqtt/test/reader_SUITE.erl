@@ -102,8 +102,10 @@ block_connack_timeout(Config) ->
 
     DefaultWatermark = rpc(Config, vm_memory_monitor, get_vm_memory_high_watermark, []),
     ok = rpc(Config, vm_memory_monitor, set_vm_memory_high_watermark, [0]),
-    %% Let connection block.
-    timer:sleep(100),
+    rabbit_ct_helpers:await_condition(fun() ->
+        Alarms = rpc(Config, rabbit_alarm, get_alarms, []),
+        lists:any(fun({{resource_limit, memory, _}, _}) -> true; (_) -> false end, Alarms)
+    end, 10_000),
 
     %% We can still connect via TCP, but CONNECT packet will not be processed on the server.
     {ok, Client} = emqtt:start_link([{host, "localhost"},
@@ -162,11 +164,15 @@ login_timeout(Config) ->
 
 stats(Config) ->
     C = connect(?FUNCTION_NAME, Config),
-    %% Wait for stats being emitted (every 100ms)
-    timer:sleep(300),
-    %% Retrieve the connection Pid
+    %% A connection from a prior (shuffled) test case may still be deregistering.
+    rabbit_ct_helpers:await_condition(fun() ->
+        length(all_connection_pids(Config)) =:= 1
+    end, 10_000),
     [Pid] = all_connection_pids(Config),
     [{pid, Pid}] = rpc(Config, rabbit_mqtt_reader, info, [Pid, [pid]]),
+    rabbit_ct_helpers:await_condition(fun() ->
+        rpc(Config, ets, lookup, [connection_metrics, Pid]) =/= []
+    end, 10_000),
     %% Verify the content of the metrics, garbage_collection must be present
     [{Pid, Props}] = rpc(Config, ets, lookup, [connection_metrics, Pid]),
     true = proplists:is_defined(garbage_collection, Props),
@@ -239,7 +245,7 @@ event_authentication_failure(Config) ->
 
     ?assertMatch({error, _}, emqtt:connect(C)),
 
-    [E | _] = util:get_events(Server, user_authentication_failure),
+    [E | _] = util:await_events(Server, user_authentication_failure, 1),
     util:assert_event_type(user_authentication_failure, E),
     util:assert_event_prop([{name, <<"Trudy">>},
                             {connection_type, network}],
@@ -274,6 +280,10 @@ rabbit_mqtt_qos0_queue_overflow(Config) ->
                         {buffer, 256}]}],
     Sub = connect(<<"subscriber">>, Config, Opts),
     {ok, _, [0]} = emqtt:subscribe(Sub, Topic, qos0),
+    %% A connection from a prior (shuffled) test case may still be deregistering.
+    rabbit_ct_helpers:await_condition(fun() ->
+        length(all_connection_pids(Config)) =:= 1
+    end, 10_000),
     [ServerConnectionPid] = all_connection_pids(Config),
 
     %% Suspend the receiving client such that it stops reading from its socket

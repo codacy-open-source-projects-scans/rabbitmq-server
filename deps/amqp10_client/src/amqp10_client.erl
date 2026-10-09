@@ -482,7 +482,7 @@ parse_result(Map) ->
     end.
 
 parse_usertoken(U) ->
-    [User, Pass] = string:tokens(U, ":"),
+    [User, Pass] = string:lexemes(U, ":"),
     {plain,
      to_binary(uri_string:percent_decode(User)),
      to_binary(uri_string:percent_decode(Pass))}.
@@ -502,7 +502,7 @@ parse_tls_opt("verify", V, Acc)
 parse_tls_opt("verify", _V, _Acc) ->
     throw({invalid_option, verify});
 parse_tls_opt("versions", V, Acc) ->
-    Parts = string:tokens(V, ","),
+    Parts = string:lexemes(V, ","),
     Versions = [try_to_existing_atom(P) || P <- Parts],
     [{versions, Versions} | Acc];
 parse_tls_opt("fail_if_no_peer_cert", V, Acc)
@@ -515,6 +515,13 @@ parse_tls_opt("server_name_indication", "disable", Acc) ->
     [{server_name_indication, disable} | Acc];
 parse_tls_opt("server_name_indication", V, Acc) ->
     [{server_name_indication, V} | Acc];
+%% The value cannot be expressed in a URI, so only the
+%% Erlang/tOTP-provided HTTPS match fun is supported.
+parse_tls_opt("customize_hostname_check", "https", Acc) ->
+    [{customize_hostname_check,
+      [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]} | Acc];
+parse_tls_opt("customize_hostname_check", _V, _Acc) ->
+    throw({invalid_option, customize_hostname_check});
 parse_tls_opt(_K, _V, Acc) ->
     Acc.
 
@@ -638,7 +645,20 @@ parse_uri_test_() ->
                sasl => external}},
         parse_uri("amqp://my_proxy:9876?sasl=external")),
      ?_assertEqual({error, path_segment_not_supported},
-                   parse_uri("amqp://my_host/my_path_segment:9876"))
+                   parse_uri("amqp://my_host/my_path_segment:9876")),
+     ?_test(begin
+                {ok, #{tls_opts := {secure_port, TlsOpts}}} =
+                    parse_uri("amqps://my_host?cacertfile=/etc/cacert.pem&"
+                              "verify=verify_peer&"
+                              "customize_hostname_check=https"),
+                {customize_hostname_check, HostnameCheckOpts} =
+                    lists:keyfind(customize_hostname_check, 1, TlsOpts),
+                {match_fun, MatchFun} =
+                    lists:keyfind(match_fun, 1, HostnameCheckOpts),
+                ?assert(is_function(MatchFun, 2))
+            end),
+     ?_assertEqual({error, {invalid_option, customize_hostname_check}},
+                   parse_uri("amqps://my_host?customize_hostname_check=bogus"))
     ].
 
 -endif.

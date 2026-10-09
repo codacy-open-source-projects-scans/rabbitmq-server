@@ -113,7 +113,7 @@ end}.
 %% compute service address automatically?
 
 {mapping, "cluster_formation.consul.svc_addr_auto", "rabbit.cluster_formation.peer_discovery_consul.consul_svc_addr_auto", [
-    {datatype, {enum, [true, false]}}
+    {datatype, boolean}
 ]}.
 
 {translation, "rabbit.cluster_formation.peer_discovery_consul.consul_svc_addr_auto",
@@ -143,7 +143,7 @@ end}.
 %% use (Erlang) node name when computing service address?
 
 {mapping, "cluster_formation.consul.svc_addr_use_nodename", "rabbit.cluster_formation.peer_discovery_consul.consul_svc_addr_nodename", [
-    {datatype, {enum, [true, false]}}
+    {datatype, boolean}
 ]}.
 
 {translation, "rabbit.cluster_formation.peer_discovery_consul.consul_svc_addr_nodename",
@@ -188,7 +188,7 @@ end}.
 %% include nodes with warnings?
 
 {mapping, "cluster_formation.consul.include_nodes_with_warnings", "rabbit.cluster_formation.peer_discovery_consul.include_nodes_with_warnings", [
-    {datatype, {enum, [true, false]}}
+    {datatype, boolean}
 ]}.
 
 {translation, "rabbit.cluster_formation.peer_discovery_consul.consul_include_nodes_with_warnings",
@@ -219,7 +219,7 @@ end}.
 %% service check TTL
 
 {mapping, "cluster_formation.consul.svc_ttl", "rabbit.cluster_formation.peer_discovery_consul.consul_svc_ttl", [
-    {datatype, integer}, {validators, ["non_negative_integer"]}
+    {datatype, {integer, non_negative}}
 ]}.
 
 {translation, "rabbit.cluster_formation.peer_discovery_consul.consul_svc_ttl",
@@ -234,7 +234,7 @@ end}.
 %% should a node in warning state be deregister by Consul after a period of time?
 
 {mapping, "cluster_formation.consul.deregister_after", "rabbit.cluster_formation.peer_discovery_consul.consul_deregister_after", [
-    {datatype, integer}, {validators, ["non_negative_integer"]}
+    {datatype, {integer, non_negative}}
 ]}.
 
 {translation, "rabbit.cluster_formation.peer_discovery_consul.consul_deregister_after",
@@ -249,7 +249,7 @@ end}.
 %% use long node names?
 
 {mapping, "cluster_formation.consul.use_longname", "rabbit.cluster_formation.peer_discovery_consul.consul_use_longname", [
-    {datatype, {enum, [true, false]}}
+    {datatype, boolean}
 ]}.
 
 {translation, "rabbit.cluster_formation.peer_discovery_consul.consul_use_longname",
@@ -317,11 +317,11 @@ end}.
 %% lock acquisition timeout
 
 {mapping, "cluster_formation.consul.lock_wait_time", "rabbit.cluster_formation.peer_discovery_consul.lock_wait_time", [
-    {datatype, integer}, {validators, ["non_negative_integer"]}
+    {datatype, {integer, non_negative}}
 ]}.
 
 {mapping, "cluster_formation.consul.lock_timeout", "rabbit.cluster_formation.peer_discovery_consul.lock_wait_time", [
-    {datatype, integer}, {validators, ["non_negative_integer"]}
+    {datatype, {integer, non_negative}}
 ]}.
 
 %% an alias for lock acquisition timeout to be consistent with the etcd backend
@@ -343,104 +343,33 @@ end}.
 %% TLS client options
 %%
 
-{mapping, "cluster_formation.consul.ssl_options", "rabbit.cluster_formation.peer_discovery_consul.ssl_options", [
-    {datatype, {enum, [none]}}
-]}.
+{include_partial, {rabbit, "ssl_options"},
+    [{prefix, "cluster_formation.consul.ssl_options"},
+     {app_prefix, "rabbit.cluster_formation.peer_discovery_consul.ssl_options"},
+     {disable_with, none}]}.
 
-{translation, "rabbit.cluster_formation.peer_discovery_consul.ssl_options",
-fun(Conf) ->
-case cuttlefish:conf_get("cluster_formation.consul.ssl_options", Conf, undefined) of
-    none -> [];
-    _    -> cuttlefish:invalid("Invalid cluster_formation.consul.ssl_options")
-end
-end}.
+%% `key.*` is kept inline so the no-match branch stays the atom
+%% `undefined` — the historical (and buggy) translation shape on
+%% consul's deeper conf-key prefix. Preserving it keeps the generated
+%% app.config byte-identical for users who never set these keys.
 
-{mapping, "cluster_formation.consul.ssl_options.verify", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.verify", [
-{datatype, {enum, [verify_peer, verify_none]}}]}.
+{mapping, "cluster_formation.consul.ssl_options.key.RSAPrivateKey",
+    "rabbit.cluster_formation.peer_discovery_consul.ssl_options.key",
+    [{datatype, string}]}.
 
-{mapping, "cluster_formation.consul.ssl_options.fail_if_no_peer_cert", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.fail_if_no_peer_cert", [
-{datatype, {enum, [true, false]}}]}.
+{mapping, "cluster_formation.consul.ssl_options.key.DSAPrivateKey",
+    "rabbit.cluster_formation.peer_discovery_consul.ssl_options.key",
+    [{datatype, string}]}.
 
-{mapping, "cluster_formation.consul.ssl_options.cacertfile", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.cacertfile",
-[{datatype, string}, {validators, ["pem_file"]}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.certfile", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.certfile",
-[{datatype, string}, {validators, ["pem_file"]}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.cert", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.cert",
-[{datatype, string}]}.
-
-{translation, "rabbit.cluster_formation.peer_discovery_consul.ssl_options.cert",
-fun(Conf) ->
-list_to_binary(cuttlefish:conf_get("cluster_formation.consul.ssl_options.cert", Conf))
-end}.
-
-{mapping, "cluster_formation.consul.ssl_options.crl_check", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.crl_check",
-[{datatype, [{enum, [true, false, peer, best_effort]}]}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.depth", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.depth",
-[{datatype, integer}, {validators, ["byte"]}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.dh", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.dh",
-[{datatype, string}]}.
-
-{translation, "rabbit.cluster_formation.peer_discovery_consul.ssl_options.dh",
-fun(Conf) ->
-list_to_binary(cuttlefish:conf_get("cluster_formation.consul.ssl_options.dh", Conf))
-end}.
-
-{mapping, "cluster_formation.consul.ssl_options.dhfile", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.dhfile",
-[{datatype, string}, {validators, ["file_accessible"]}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.key.RSAPrivateKey", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.key",
-[{datatype, string}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.key.DSAPrivateKey", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.key",
-[{datatype, string}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.key.PrivateKeyInfo", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.key",
-[{datatype, string}]}.
+{mapping, "cluster_formation.consul.ssl_options.key.PrivateKeyInfo",
+    "rabbit.cluster_formation.peer_discovery_consul.ssl_options.key",
+    [{datatype, string}]}.
 
 {translation, "rabbit.cluster_formation.peer_discovery_consul.ssl_options.key",
 fun(Conf) ->
-case cuttlefish_variable:filter_by_prefix("cluster_formation.consul.ssl_options.key", Conf) of
-    [{[_,_,Key], Val}|_] -> {list_to_atom(Key), list_to_binary(Val)};
-    _ -> undefined
-end
-end}.
-
-{mapping, "cluster_formation.consul.ssl_options.keyfile", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.keyfile",
-[{datatype, string}, {validators, ["pem_file"]}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.log_alert", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.log_alert",
-[{datatype, {enum, [true, false]}}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.password", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.password",
-[{datatype, [tagged_binary, binary]}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.psk_identity", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.psk_identity",
-[{datatype, string}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.reuse_sessions", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.reuse_sessions",
-[{datatype, {enum, [true, false]}}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.secure_renegotiate", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.secure_renegotiate",
-[{datatype, {enum, [true, false]}}]}.
-
-{mapping, "cluster_formation.consul.ssl_options.versions.$version", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.versions",
-[{datatype, atom}]}.
-
-{translation, "rabbit.cluster_formation.peer_discovery_consul.ssl_options.versions",
-fun(Conf) ->
-Settings = cuttlefish_variable:filter_by_prefix("cluster_formation.consul.ssl_options.versions", Conf),
-[V || {_, V} <- Settings]
-end}.
-
-{mapping, "cluster_formation.consul.ssl_options.ciphers.$cipher", "rabbit.cluster_formation.peer_discovery_consul.ssl_options.ciphers",
-[{datatype, string}]}.
-
-{translation, "rabbit.cluster_formation.peer_discovery_consul.ssl_options.ciphers",
-fun(Conf) ->
-Settings = cuttlefish_variable:filter_by_prefix("cluster_formation.consul.ssl_options.ciphers", Conf),
-lists:reverse([V || {_, V} <- Settings])
+    case cuttlefish_variable:filter_by_prefix(
+           "cluster_formation.consul.ssl_options.key", Conf) of
+        [{[_,_,Key], Val}|_] -> {list_to_atom(Key), list_to_binary(Val)};
+        _ -> undefined
+    end
 end}.

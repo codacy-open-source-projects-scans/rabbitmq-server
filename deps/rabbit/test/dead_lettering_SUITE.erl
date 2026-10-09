@@ -495,6 +495,7 @@ dead_letter_ttl(Config) ->
     QName = ?config(queue_name, Config),
     DLXQName = ?config(queue_name_dlx, Config),
     declare_dead_letter_queues(Ch, Config, QName, DLXQName, [{<<"x-message-ttl">>, long, 1}]),
+    ok = await_dead_letter_handler_applied(Config, QName),
 
     %% Publish message
     P1 = <<"msg1">>,
@@ -1051,6 +1052,9 @@ dead_letter_policy(Config) ->
                     amqqueue:get_policy(Q0)
                 end,
                 30000),
+    %% `handle_tick/3` can briefly revert `dead_letter_handler` when its
+    %% local Khepri lookup races with replication; wait until it settles.
+    ok = await_dead_letter_handler_applied(Config, QName),
     %% Nack the second message
     amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = DTag2,
                                         multiple     = false,
@@ -1317,6 +1321,7 @@ dead_letter_headers_should_not_be_appended_for_republish(Config) ->
                       {<<"x-dead-letter-routing-key">>, longstr, DlxName}],
     #'queue.declare_ok'{} = amqp_channel:call(Ch0, #'queue.declare'{queue = QName, arguments = DeadLetterArgs ++ Args, durable = true}),
     #'queue.declare_ok'{} = amqp_channel:call(Ch0, #'queue.declare'{queue = DlxName, arguments = Args, durable = true}),
+    ok = await_dead_letter_handler_applied(Config, QName),
 
     P = <<"msg1">>,
 
@@ -1342,6 +1347,7 @@ dead_letter_headers_should_not_be_appended_for_republish(Config) ->
     #'queue.delete_ok'{} = amqp_channel:call(Ch0, #'queue.delete'{queue = QName}),
     DeadLetterArgs1 = DeadLetterArgs ++ [{<<"x-message-ttl">>, long, 1}],
     #'queue.declare_ok'{} = amqp_channel:call(Ch0, #'queue.declare'{queue = QName, arguments = DeadLetterArgs1 ++ Args, durable = true}),
+    ok = await_dead_letter_handler_applied(Config, QName),
 
     publish(Ch1, QName, [P], Headers1),
 
@@ -1653,6 +1659,7 @@ dead_letter_extra_bcc(Config) ->
                                                                    durable = true}),
     rabbit_ct_broker_helpers:rpc(Config, ?MODULE, set_queue_options,
                                  [TargetQ, #{extra_bcc => ExtraBCCQ}]),
+    ok = await_dead_letter_handler_applied(Config, SourceQ),
     %% Publish message
     P = <<"msg">>,
     publish(Ch, SourceQ, [P]),
@@ -1720,7 +1727,7 @@ metric_expired_queue_msg_ttl(Config) ->
     %% Publish 1000 messages
     Payloads = lists:map(fun erlang:integer_to_binary/1, lists:seq(1, 1000)),
     publish(Ch, QName, Payloads),
-    ?awaitMatch(1000, counted(messages_dead_lettered_expired_total, Config), 3000, 300).
+    ?awaitMatch(1000, counted(messages_dead_lettered_expired_total, Config), 30_000, 300).
 
 metric_expired_per_msg_msg_ttl(Config) ->
     {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
@@ -1919,3 +1926,32 @@ header_lookup(undefined, _Key) ->
     undefined;
 header_lookup(Headers, Key) ->
     rabbit_misc:table_lookup(Headers, Key).
+
+await_dead_letter_handler_applied(Config, QName) ->
+    QRes = rabbit_misc:r(<<"/">>, queue, QName),
+    {ok, Q} = rabbit_ct_broker_helpers:rpc(
+                Config, 0, rabbit_amqqueue, lookup, [QRes], infinity),
+    case amqqueue:get_type(Q) of
+        rabbit_quorum_queue ->
+            {ok, RaName} = rabbit_queue_type_util:qname_to_internal_name(QRes),
+            Node = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+            Server = {RaName, Node},
+            ?awaitMatch(DLH when DLH =/= undefined,
+                        dead_letter_handler(Config, Server),
+                        30_000),
+            rabbit_ct_helpers:consistently(
+              ?_assertNotEqual(undefined,
+                               dead_letter_handler(Config, Server))),
+            ok;
+        _ ->
+            ok
+    end.
+
+dead_letter_handler(Config, Server) ->
+    case rabbit_ct_broker_helpers:rpc(
+           Config, 0, ra, member_overview, [Server], infinity) of
+        {ok, #{machine := #{config := #{dead_letter_handler := DLH}}}, _} ->
+            DLH;
+        _ ->
+            undefined
+    end.

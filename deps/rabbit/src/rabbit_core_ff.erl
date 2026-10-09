@@ -104,7 +104,6 @@
    {classic_queue_type_delivery_support,
     #{desc          => "Bug fix for classic queue deliveries using mixed versions",
       doc_url       => "https://github.com/rabbitmq/rabbitmq-server/issues/5931",
-      %%TODO remove compatibility code
       stability     => required,
       require_level => hard,
       depends_on    => [stream_queue]
@@ -254,4 +253,22 @@
                          {rabbit_khepri, topic_binding_projection_enable},
                          post_enable =>
                          {rabbit_khepri, topic_binding_projection_post_enable}}
+     }}).
+
+-rabbit_feature_flag(
+   {topic_binding_projection_v5,
+    #{desc          => "Enable the topic binding Khepri projection v5",
+      stability     => stable,
+      depends_on    => [topic_binding_projection_v4],
+      callbacks     => #{enable =>
+                         {rabbit_khepri, topic_binding_projection_v5_enable},
+                         post_enable =>
+                         {rabbit_khepri, topic_binding_projection_v5_post_enable}}
+     }}).
+
+-rabbit_feature_flag(
+   {'rabbitmq_4.4.0',
+    #{desc          => "Allows rolling upgrades to 4.4.x",
+      stability     => stable,
+      depends_on    => ['rabbitmq_4.3.0']
      }}).

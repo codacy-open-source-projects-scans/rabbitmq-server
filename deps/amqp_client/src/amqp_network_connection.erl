@@ -9,6 +9,7 @@
 -module(amqp_network_connection).
 
 -include("amqp_client_internal.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -behaviour(amqp_gen_connection).
 -export([init/0, terminate/2, connect/4, do/2, open_channel_args/1, i/2,
@@ -23,6 +24,7 @@
                 name,
                 heartbeat,
                 writer0,
+                main_reader,
                 frame_max,
                 type_sup,
                 closing_reason, %% undefined | Reason
@@ -46,26 +48,37 @@ do(Method, State) ->
 
 do2(Method, #state{writer0 = Writer}) ->
     %% Catching because it expects the {channel_exit, _, _} message on error
-    catch rabbit_writer:send_command_sync(Writer, Method).
+    try rabbit_writer:send_command_sync(Writer, Method) catch _:_ -> ok end.
 
+%% We replied to a peer-initiated close but its socket did not close in
+%% time. This is expected teardown, so wrap it like the failures below.
 handle_message(socket_closing_timeout,
                State = #state{closing_reason = Reason}) ->
-    {stop, {socket_closing_timeout, Reason}, State};
+    {stop, {shutdown, {socket_closing_timeout, Reason}}, State};
 handle_message(socket_closed, State = #state{waiting_socket_close = true,
                                              closing_reason = Reason}) ->
     {stop, {shutdown, Reason}, State};
+%% Expected connection-level failures are wrapped in 'shutdown' so that
+%% neither gen_server nor the supervisor logs them: linked processes and
+%% monitors still observe the specific reason.
 handle_message(socket_closed, State = #state{waiting_socket_close = false}) ->
-    {stop, socket_closed_unexpectedly, State};
+    {stop, {shutdown, socket_closed_unexpectedly}, State};
 handle_message({socket_error, _} = SocketError, State) ->
-    {stop, SocketError, State};
+    {stop, {shutdown, SocketError}, State};
 handle_message({channel_exit, 0, Reason}, State) ->
-    {stop, {channel0_died, Reason}, State};
+    ?LOG_WARNING("Connection (~tp): closing because channel 0 died: ~tp",
+                 [self(), Reason]),
+    {stop, {shutdown, {channel0_died, Reason}}, State};
 handle_message(heartbeat_timeout, State) ->
-    {stop, heartbeat_timeout, State};
+    {stop, {shutdown, heartbeat_timeout}, State};
+%% The peer never replied to our close, matching the reason the
+%% 'connection.close_ok' path would have stopped with.
 handle_message(closing_timeout, State = #state{closing_reason = Reason}) ->
-    {stop, Reason, State};
+    {stop, {shutdown, Reason}, State};
 handle_message({'EXIT', Pid, Reason}, State) ->
-    {stop, rabbit_misc:format("stopping because dependent process ~tp died: ~tp", [Pid, Reason]), State};
+    ?LOG_WARNING("Connection (~tp): closing because dependent process ~tp died: ~tp",
+                 [self(), Pid, Reason]),
+    {stop, {shutdown, {dependent_process_died, Pid, Reason}}, State};
 %% see http://erlang.org/pipermail/erlang-bugs/2012-June/002933.html
 handle_message({Ref, {error, Reason}},
                State = #state{waiting_socket_close = Waiting,
@@ -73,8 +86,8 @@ handle_message({Ref, {error, Reason}},
   when is_reference(Ref) ->
     {stop, case {Reason, Waiting} of
                {closed,  true} -> {shutdown, CloseReason};
-               {closed, false} -> socket_closed_unexpectedly;
-               {_,          _} -> {socket_error, Reason}
+               {closed, false} -> {shutdown, socket_closed_unexpectedly};
+               {_,          _} -> {shutdown, {socket_error, Reason}}
            end, State}.
 
 closing(_ChannelCloseType, {server_initiated_close, _, _} = Reason, State) ->
@@ -159,6 +172,8 @@ inet_address_preference() ->
         {ok, false} -> [inet, inet6]
     end.
 
+gethostaddr({local, Path}) ->
+    {{local, Path}, local};
 gethostaddr(Host) ->
     resolve_address(Host, inet_address_preference()).
 
@@ -196,8 +211,8 @@ handshake(AmqpParams, SIF, State0 = #state{sock = Sock}) ->
 
 start_infrastructure(SIF, State = #state{sock = Sock, name = Name}) ->
     case SIF(Sock, Name) of
-      {ok, ChMgr, Writer} ->
-        {ok, ChMgr, State#state{writer0 = Writer}};
+      {ok, ChMgr, Writer, Reader} ->
+        {ok, ChMgr, State#state{writer0 = Writer, main_reader = Reader}};
       {error, Reason} ->
         {error, Reason}
     end.
@@ -214,6 +229,8 @@ network_handshake(AmqpParams = #amqp_params_network{virtual_host = VHost},
             Err;
         Tune ->
             {TuneOk, ChannelMax, State1} = tune(Tune, AmqpParams, State0),
+            amqp_main_reader:set_frame_max(State1#state.main_reader,
+                                           State1#state.frame_max),
             do2(TuneOk, State1),
             do2(#'connection.open'{virtual_host = VHost}, State1),
             Params = {ServerProperties, ChannelMax, ChMgr, State1},
@@ -267,7 +284,7 @@ start_heartbeat(#state{sock      = Sock,
                        heartbeat = Heartbeat,
                        type_sup  = Sup}) ->
     Frame = rabbit_binary_generator:build_heartbeat_frame(),
-    SendFun = fun () -> catch rabbit_net:send(Sock, Frame) end,
+    SendFun = fun () -> try rabbit_net:send(Sock, Frame) catch _:_ -> ok end end,
     Connection = self(),
     ReceiveFun = fun () -> Connection ! heartbeat_timeout end,
     rabbit_heartbeat:start(

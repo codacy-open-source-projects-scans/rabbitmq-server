@@ -7,6 +7,9 @@ PROJECT_DESCRIPTION = RabbitMQ Server
 # value from rabbitmq-components.mk.
 export RABBITMQ_VERSION := $(PROJECT_VERSION)
 
+# Avoid creating macOS AppleDouble/resource fork files in tarballs.
+export COPYFILE_DISABLE = 1
+
 # Release artifacts are put in $(PACKAGES_DIR).
 PACKAGES_DIR ?= $(abspath PACKAGES)
 
@@ -67,7 +70,7 @@ endif
 # Plugins to enable for `gmake run-broker`, `gmake start-cluster`, etc.
 # To override:
 #     gmake ENABLED_PLUGINS="rabbitmq_management rabbitmq_stream" run-broker
-#     gmake NODES=3 ENABLED_PLUGINS="rabbitmq_management rabbitmq_stream rabbitmq_stream_management" start-cluster
+#     gmake NODES=3 AZ=3 ENABLED_PLUGINS="rabbitmq_management rabbitmq_stream rabbitmq_stream_management" start-cluster
 #
 # Note: ENABLED_PLUGINS only takes effect on first start. On subsequent starts,
 # the enabled_plugins file is preserved. To change plugins on restart, either:
@@ -96,6 +99,7 @@ RSYNC_V = $(RSYNC_V_$(V))
 BASE_RSYNC_FLAGS += -a $(RSYNC_V) \
 	       --delete					\
 	       --delete-excluded			\
+	       --exclude '._*'				\
 	       --exclude '.sw?' --exclude '.*.sw?'	\
 	       --exclude '*.beam'			\
 	       --exclude '*.d'				\
@@ -526,7 +530,6 @@ INTERNAL_DEPS := \
 
 TIER1_PLUGINS := \
 	   rabbitmq_amqp_client \
-	   rabbitmq_amqp1_0 \
 	   rabbitmq_auth_backend_cache \
 	   rabbitmq_auth_backend_http \
 	   rabbitmq_auth_backend_internal_loopback \

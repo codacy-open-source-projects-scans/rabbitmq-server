@@ -46,6 +46,10 @@ all_tests() ->
      unbind_from_volatile_queue,
      binding_args_direct_exchange,
      binding_args_fanout_exchange,
+     topic_exchange_zero_words,
+     topic_binding_hash_limit,
+     topic_exchange_binding_hash_limit,
+     topic_binding_hash_limit_allows_unbind,
 
      %% Exchange bindings
      bind_and_unbind_direct_exchange,
@@ -81,7 +85,18 @@ end_per_group(_, Config) ->
     rabbit_ct_helpers:run_steps(Config,
                                 rabbit_ct_broker_helpers:teardown_steps()).
 
+init_per_testcase(topic_exchange_zero_words = Testcase, Config) ->
+    case rabbit_ct_broker_helpers:enable_feature_flag(
+           Config, topic_binding_projection_v5) of
+        ok ->
+            init_per_testcase0(Testcase, Config);
+        {skip, _} = Skip ->
+            Skip
+    end;
 init_per_testcase(Testcase, Config) ->
+    init_per_testcase0(Testcase, Config).
+
+init_per_testcase0(Testcase, Config) ->
     Config1 = rabbit_ct_helpers:testcase_started(Config, Testcase),
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_queues, []),
     Name = rabbit_data_coercion:to_binary(Testcase),
@@ -706,6 +721,159 @@ binding_args(Exchange, Config) ->
     ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"m2">>}},
                  amqp_channel:call(Ch, #'basic.get'{queue = Q, no_ack = true})).
 
+%% Test case for https://github.com/rabbitmq/rabbitmq-server/discussions/16221
+%%
+%% "The routing key used for a topic exchange MUST consist of zero or more words delimited by dots.
+%% Each word may contain the letters A-Z and a-z and digits 0-9.
+%% The routing pattern follows the same rules as the routing key with the addition
+%% that * matches a single word, and # matches zero or more words."
+%% [AMQP 0.9.1]
+%%
+%% Here, we test a zero words routing key and routing pattern.
+topic_exchange_zero_words(Config) ->
+    ZeroWords = <<>>,
+
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+
+    X1 = <<"x1">>,
+    X2 = <<"x2">>,
+    Q1 = <<"q1">>,
+    Q2 = <<"q2">>,
+
+    #'exchange.declare_ok'{} = amqp_channel:call(Ch, #'exchange.declare'{exchange = X1,
+                                                                         type = <<"topic">>}),
+    #'exchange.declare_ok'{} = amqp_channel:call(Ch, #'exchange.declare'{exchange = X2,
+                                                                         type = <<"topic">>}),
+    #'queue.declare_ok'{} = declare(Ch, Q1, []),
+    #'queue.declare_ok'{} = declare(Ch, Q2, []),
+
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = X1,
+                                                             queue = Q1,
+                                                             routing_key = ZeroWords}),
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = X2,
+                                                             queue = Q2,
+                                                             routing_key = ZeroWords}),
+
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+    amqp_channel:register_confirm_handler(Ch, self()),
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{exchange = X1,
+                                            routing_key = ZeroWords},
+                           #amqp_msg{payload = <<"m1">>}),
+    receive #'basic.ack'{} -> ok
+    after 9000 -> ct:fail(confirm_timeout)
+    end,
+    %% m1 must arrive at Q1 and must not leak into Q2
+    ?assertMatch(#'queue.declare_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.declare'{queue = Q1, passive = true})),
+    ?assertMatch(#'queue.declare_ok'{message_count = 0},
+                 amqp_channel:call(Ch, #'queue.declare'{queue = Q2, passive = true})),
+
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{exchange = X2,
+                                            routing_key = ZeroWords},
+                           #amqp_msg{payload = <<"m2">>}),
+    receive #'basic.ack'{} -> ok
+    after 9000 -> ct:fail(confirm_timeout)
+    end,
+    %% m2 must arrive at Q2 and must not leak into Q1.
+    ?assertMatch(#'queue.declare_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.declare'{queue = Q1, passive = true})),
+    ?assertMatch(#'queue.declare_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.declare'{queue = Q2, passive = true})),
+
+    %% Unbinding the empty key stops message routing.
+    %% Zero words means the root is also the leaf, so `trie_follow_down_get_path/4`
+    %% returns an empty trie path and `trie_gc_path/3` will not have any edges to prune.
+    #'queue.unbind_ok'{} = amqp_channel:call(Ch, #'queue.unbind'{exchange = X1,
+                                                                  queue = Q1,
+                                                                  routing_key = ZeroWords}),
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{exchange = X1,
+                                            routing_key = ZeroWords},
+                           #amqp_msg{payload = <<"m3">>}),
+    receive #'basic.ack'{} -> ok
+    after 9000 -> ct:fail(confirm_timeout)
+    end,
+    %% For completeness' sake:
+    %% m3 must not reach Q1 (unbound) or Q2 (bound to a different exchange)
+    ?assertMatch(#'queue.declare_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.declare'{queue = Q1, passive = true})),
+    ?assertMatch(#'queue.declare_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.declare'{queue = Q2, passive = true})),
+
+    ?assertMatch(#'queue.delete_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = Q1})),
+    ?assertMatch(#'queue.delete_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = Q2})),
+    #'exchange.delete_ok'{} = amqp_channel:call(Ch, #'exchange.delete'{exchange = X1}),
+    #'exchange.delete_ok'{} = amqp_channel:call(Ch, #'exchange.delete'{exchange = X2}),
+    rabbit_ct_client_helpers:close_channel(Ch).
+
+%% A topic binding key may hold at most two '#' wildcards. Two are accepted and
+%% still route; three are refused.
+topic_binding_hash_limit(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    X = ?config(exchange_name, Config),
+    Q = ?config(queue_name, Config),
+    #'exchange.declare_ok'{} =
+        amqp_channel:call(Ch, #'exchange.declare'{exchange = X, type = <<"topic">>}),
+    #'queue.declare_ok'{} = declare(Ch, Q, []),
+
+    #'queue.bind_ok'{} =
+        amqp_channel:call(Ch, #'queue.bind'{exchange = X, queue = Q,
+                                            routing_key = <<"#.b.#">>}),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+    ok = amqp_channel:cast(Ch, #'basic.publish'{exchange = X,
+                                                routing_key = <<"a.b.c">>},
+                           #amqp_msg{payload = <<"m">>}),
+    ?assert(amqp_channel:wait_for_confirms(Ch, 30)),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"m">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q, no_ack = true})),
+
+    ?assertExit({{shutdown, {server_initiated_close, 406, _}}, _},
+                amqp_channel:call(Ch, #'queue.bind'{exchange = X, queue = Q,
+                                                    routing_key = <<"#.#.#">>})),
+    ok.
+
+topic_exchange_binding_hash_limit(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Source = ?config(exchange_name, Config),
+    Destination = <<Source/binary, "_dst">>,
+    #'exchange.declare_ok'{} =
+        amqp_channel:call(Ch, #'exchange.declare'{exchange = Source, type = <<"topic">>}),
+    #'exchange.declare_ok'{} =
+        amqp_channel:call(Ch, #'exchange.declare'{exchange = Destination, type = <<"topic">>}),
+
+    ?assertExit({{shutdown, {server_initiated_close, 406, _}}, _},
+                amqp_channel:call(Ch, #'exchange.bind'{source = Source,
+                                                       destination = Destination,
+                                                       routing_key = <<"#.#.#">>})),
+    Ch2 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    #'exchange.delete_ok'{} = amqp_channel:call(Ch2, #'exchange.delete'{exchange = Destination}),
+    ok.
+
+%% Bindings stored before the limit existed must stay removable. The binding is
+%% written straight to the database because the validated path now refuses it.
+topic_binding_hash_limit_allows_unbind(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    X = ?config(exchange_name, Config),
+    Q = ?config(queue_name, Config),
+    Key = <<"#.#.#">>,
+    #'exchange.declare_ok'{} =
+        amqp_channel:call(Ch, #'exchange.declare'{exchange = X, type = <<"topic">>}),
+    #'queue.declare_ok'{} = declare(Ch, Q, []),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE,
+                                      create_binding_without_validation, [X, Key, Q]),
+    ?assertMatch(#'queue.unbind_ok'{},
+                 amqp_channel:call(Ch, #'queue.unbind'{exchange = X, queue = Q,
+                                                       routing_key = Key})),
+    ok.
+
 bind_and_unbind_direct_exchange(Config) ->
     bind_and_unbind_exchange(<<"direct">>, Config).
 
@@ -866,3 +1034,8 @@ binding_record(Src, Dst, Key, Args) ->
              destination = Dst,
              key = Key,
              args = Args}.
+
+create_binding_without_validation(XName, Key, QName) ->
+    Binding = binding_record(rabbit_misc:r(<<"/">>, exchange, XName),
+                             rabbit_misc:r(<<"/">>, queue, QName), Key, []),
+    rabbit_db_binding:create(Binding, fun (_Src, _Dst) -> ok end).

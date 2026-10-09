@@ -30,7 +30,8 @@ var KNOWN_ARGS = {'alternate-exchange':        {'short': 'AE',  'type': 'string'
                   'x-consumer-disconnected-timeout': {'short': 'CDT', 'type': 'int'},
                   'x-delayed-retry-type':    {'short': 'DRT', 'type': 'string'},
                   'x-delayed-retry-min':     {'short': 'DRm', 'type': 'int'},
-                  'x-delayed-retry-max':     {'short': 'DRM', 'type': 'int'}};
+                  'x-delayed-retry-max':     {'short': 'DRM', 'type': 'int'},
+                  'x-member-placement-tag':  {'short': 'MPT', 'type': 'string'}};
 
 // Things that are like arguments that we format the same way in listings.
 var IMPLICIT_ARGS = {'durable':         {'short': 'D',    'type': 'boolean'},
@@ -84,6 +85,7 @@ var ALL_COLUMNS =
                    ['state',                'State',                  true]],
       'Messages': [['msgs-ready',      'Ready',          true],
                    ['msgs-unacked',    'Unacknowledged', true],
+                   ['msgs-delayed',    'Delayed',        false],
                    ['msgs-ram',        'In memory',      false],
                    ['msgs-persistent', 'Persistent',     false],
                    ['msgs-total',      'Total',          true]],
@@ -184,6 +186,12 @@ var DISABLED_STATS_COLUMNS =
                   ['heartbeat',    'Heartbeat',    false],
                   ['connected_at', 'Connected at', false]]},
 
+     'channels':
+     {'Overview': [['user', 'User name', true]],
+      'Details': [],
+      'Transactions': [],
+      'Message rates': []},
+
      'vhosts':
      {'Overview': [['cluster-state',   'Cluster state',  false]]}};
 
@@ -241,6 +249,9 @@ var HELP = {
     'queue-stream-filter-size-bytes':
       'Size of the filter data attached to each stream chunk.<br/>(Sets the x-stream-filter-size-bytes argument.)',
 
+    'queue-stream-initial-offset':
+      'Offset of the first message published to a new stream. Defaults to 0 and cannot be changed after the stream has been created.<br/>(Sets the x-stream-initial-offset argument.)',
+
     'queue-auto-delete':
       'If yes, the queue will delete itself after at least one consumer has connected, and then all consumers have disconnected.',
 
@@ -273,6 +284,9 @@ var HELP = {
 
     'queue-leader-locator':
        'Set the rule by which the queue leader is located when declared on a cluster of nodes. Valid values are <code>client-local</code> (default) and <code>balanced</code>.',
+
+    'queue-member-placement-tag':
+       'Node tag key used for AZ-aware quorum queue member placement. When set, replicas are spread across distinct values of this tag (e.g. <code>az</code>). Requires nodes to be tagged with the matching key via the <code>node_tags</code> configuration.',
 
     'queue-initial-cluster-size':
        'Set the queue initial cluster size, i.e. number of queue members/replicas',
@@ -313,7 +327,7 @@ var HELP = {
       'Only users within the internal RabbitMQ database are shown here. Other users (e.g. those authenticated over LDAP) will not appear.',
 
     'export-definitions':
-    'The definitions consist of users, virtual hosts, permissions, parameters, exchanges, queues, policies and bindings. They do not include the contents of queues. Exclusive queues will not be exported.',
+    'The definitions consist of users, virtual hosts, permissions, parameters, exchanges, queues, policies and bindings. They do not include the contents of queues. Exclusive queues will not be exported. The download filename may only contain token characters (letters, digits and !#$%&\'*+-.^_`|~).',
 
     'export-definitions-vhost':
     'The definitions exported for a single virtual host consist of exchanges, queues, bindings and policies.',
@@ -514,11 +528,12 @@ var HELP = {
     When single active consumer is enabled for the queue, only one consumer at a time is active. \
     When single active consumer is disabled for the queue, consumers are active by default. \
     For a quorum queue, a consumer can be inactive because its owning node is suspected down. <br/><br/> \
-    (<a href="https://www.rabbitmq.com/consumers.html#active-consumer" target="_blank">Documentation</a>)',
+    (<a href="https://www.rabbitmq.com/docs/consumers#active-consumer" target="_blank">Documentation</a>)',
 
     'consumer-owner' :
-    '<a href="https://www.rabbitmq.com/consumers.html">AMQP 0-9-1 consumers</a> belong to a channel, \
-    and <a href="https://www.rabbitmq.com/stream.html">stream consumers</a> belong to a stream connection.',
+    '<a href="https://www.rabbitmq.com/docs/consumers" target="_blank">AMQP 0-9-1 consumers</a> belong to a channel, \
+    <a href="https://www.rabbitmq.com/docs/stream" target="_blank">stream consumers</a> belong to a stream connection, \
+    and consumers of other protocols (AMQP 1.0, MQTT, STOMP) belong to a connection.',
 
     'plugins' :
     'Note that only plugins which are both explicitly enabled and running are shown here.',
@@ -756,40 +771,48 @@ function DisplayControl() {
 }
 
 
+function update_cluster_name_ui(new_name) {
+    cluster_name = fmt_escape_html(new_name);
+    var nav_link = user_administrator ? '<a href="#/cluster-name">' + cluster_name + '</a>' : cluster_name;
+
+    var $li = $('#logout').prev('li');
+    if ($li.length > 0 && $li.text().startsWith('Cluster')) {
+        $li.html('Cluster ' + nav_link);
+    } else {
+        $('#logout').before('<li>Cluster ' + nav_link + '</li>');
+    }
+}
+
 // Set up the above vars
-function setup_global_vars(overview) {
-    rates_mode = overview.rates_mode;
-    is_op_policy_updating_enabled = overview.is_op_policy_updating_enabled;
+function setup_global_vars(settings) {
+    rates_mode = settings.rates_mode;
+    is_op_policy_updating_enabled = settings.is_op_policy_updating_enabled;
     user_tags = expand_user_tags(user.tags);
     user_administrator = jQuery.inArray("administrator", user_tags) != -1;
     is_user_policymaker = jQuery.inArray("policymaker", user_tags) != -1;
     user_monitor = jQuery.inArray("monitoring", user_tags) != -1;
-    exchange_types = overview.exchange_types.map(function(xt) { return xt.name; });
+    exchange_types = settings.exchange_types.map(function(xt) { return fmt_escape_html_one_line(xt.name); });
 
-    cluster_name = fmt_escape_html(overview.cluster_name);
-    $('#logout').before(
-      '<li>Cluster ' + (user_administrator ?  '<a href="#/cluster-name">' + cluster_name + '</a>' : cluster_name) + '</li>'
-    );
+    update_cluster_name_ui(settings.cluster_name);
 
     user_name = fmt_escape_html(user.name);
     $('#header #logout').prepend(
       'User ' + (user_administrator && user.is_internal_user ?  '<a href="#/users/' + user_name + '">' + user_name + '</a>' : user_name)
     );
 
-    var product = overview.rabbitmq_version;
-    if (overview.product_name && overview.product_version) {
-        product = overview.product_name + ' ' + overview.product_version;
+    var product = settings.product_info.rabbitmq_version;
+    if (settings.product_info.product_name && settings.product_info.product_version) {
+        product = settings.product_info.product_name + ' ' + settings.product_info.product_version;
     }
 
     $('#versions').html(
       '<abbr title="Available exchange types: ' + exchange_types.join(", ") + '">' + fmt_escape_html(product) + '</abbr>' +
-      '<abbr title="' + fmt_escape_html(overview.erlang_full_version) + '">Erlang ' + fmt_escape_html(overview.erlang_version) + '</abbr>'
+      '<abbr title="' + fmt_escape_html(settings.product_info.erlang_full_version) + '">Erlang ' + fmt_escape_html(settings.product_info.erlang_version) + '</abbr>'
     );
     nodes_interesting = false;
     rabbit_versions_interesting = false;
     if (user_monitor) {
-        var nodes = JSON.parse(sync_get('/nodes'));
-        if (nodes.length > 1) {
+        if (ui_data_model.nodes && ui_data_model.nodes.length > 1) {
             nodes_interesting = true;
             var v = '';
             for (var i = 0; i < ui_data_model.nodes.length; i++) {
@@ -805,13 +828,13 @@ function setup_global_vars(overview) {
 
     queue_type = "default";
     current_vhost = get_pref('vhost');
-    exchange_types = overview.exchange_types;
+    exchange_types = settings.exchange_types;
 
-    disable_stats = overview.disable_stats;
-    enable_queue_totals = overview.enable_queue_totals;
+    disable_stats = settings.disable_stats;
+    enable_queue_totals = settings.enable_queue_totals;
     COLUMNS = disable_stats?DISABLED_STATS_COLUMNS:ALL_COLUMNS;
 
-    setup_chart_ranges(overview.sample_retention_policies);
+    setup_chart_ranges(settings.sample_retention_policies);
 }
 
 function setup_chart_ranges(srp) {

@@ -5,13 +5,11 @@
 %% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
 -module(rabbit_mqtt_processor).
--feature(maybe_expr, enable).
 
 -export([info/2, init/4, process_packet/2,
          terminate/3, handle_pre_hibernate/0,
          handle_down/2, handle_queue_event/2,
          proto_version_tuple/1, throttle/2, format_status/1,
-         remove_duplicate_client_id_connections/2,
          remove_duplicate_client_id_connections/3,
          update_trace/2, send_disconnect/2]).
 
@@ -25,8 +23,7 @@
               send_fun/0]).
 
 -import(rabbit_mqtt_util, [mqtt_to_amqp/1,
-                           amqp_to_mqtt/1,
-                           ip_address_to_binary/1]).
+                           amqp_to_mqtt/1]).
 -import(rabbit_misc, [maps_put_truthy/3]).
 
 -include_lib("kernel/include/logger.hrl").
@@ -119,7 +116,7 @@
 
 %% NB: If init/4 returns an error, it must clean up itself because terminate/3 will not be called.
 -spec init(ConnectPacket :: mqtt_packet(),
-           RawSocket :: rabbit_net:socket(),
+           Socket :: rabbit_net:socket() | rabbit_net:proxy_socket(),
            ConnectionName :: binary(),
            SendFun :: send_fun()) ->
     {ok, state()} | {error, {socket_ends, any()} | reason_code()}.
@@ -129,9 +126,11 @@ init(#mqtt_packet{fixed = #mqtt_packet_fixed{type = ?CONNECT},
     %% Check whether peer closed the connection.
     %% For example, this can happen when connection was blocked because of resource
     %% alarm and client therefore disconnected due to client side CONNACK timeout.
+    %% Resolve the ends from the (possibly Proxy Protocol-aware) socket, then unwrap it
+    %% for the rest of the connection where the raw socket is expected.
     case rabbit_net:socket_ends(Socket, inbound) of
         {ok, SocketEnds} ->
-            process_connect(ConnectPacket, Socket, ConnName, SendFun, SocketEnds);
+            process_connect(ConnectPacket, rabbit_net:unwrap_socket(Socket), ConnName, SendFun, SocketEnds);
         {error, Reason} ->
             {error, {socket_ends, Reason}}
     end.
@@ -196,6 +195,7 @@ process_connect(
         ?LOG_DEBUG("MQTT connection ~s picked vhost using ~s", [ConnName0, VHostPickedUsing]),
         ok ?= check_vhost_exists(VHost, Username2, PeerIp),
         ok ?= check_vhost_alive(VHost),
+        ok ?= check_node_connection_limit(),
         ok ?= check_vhost_connection_limit(VHost),
         {ok, User = #user{username = Username}} ?= check_user_login(VHost, Username2, Password,
                                                                     ClientId, PeerIp, ConnName0),
@@ -339,6 +339,7 @@ connect_reason_code_to_return_code(_) ->
 
 process_connect(State0) ->
     maybe
+        ok ?= check_existing_subscriptions_topic_access(State0),
         {ok, QoS0SessPresent, State1} ?= handle_clean_start_qos0(State0),
         {ok, SessPresent, State2} ?= handle_clean_start_qos1(QoS0SessPresent, State1),
         {ok, State} ?= init_subscriptions(SessPresent, State2),
@@ -348,6 +349,29 @@ process_connect(State0) ->
     else
         {error, _} = Error ->
             Error
+    end.
+
+-spec check_existing_subscriptions_topic_access(state()) ->
+    ok | {error, reason_code()}.
+check_existing_subscriptions_topic_access(#state{cfg = #cfg{clean_start = true}}) ->
+    ok;
+%% The session queue is keyed on client ID, not the user, so a resume can't
+%% assume its subscriptions are still readable; reject the CONNECT and let
+%% the client retry with clean_start=true.
+check_existing_subscriptions_topic_access(#state{cfg = #cfg{exchange = Exchange}} = State) ->
+    QNames = existing_queue_names(State),
+    TopicFilters =
+    [amqp_to_mqtt(Key)
+     || QName <- QNames,
+        #binding{key = Key} <- rabbit_binding:list_for_source_and_destination(
+                                  Exchange, QName, _Reverse = true)],
+    case lists:all(fun(TopicFilter) ->
+                           check_topic_access(TopicFilter, read, State) =:= ok
+                   end, TopicFilters) of
+        true ->
+            ok;
+        false ->
+            {error, ?RC_NOT_AUTHORIZED}
     end.
 
 -spec process_packet(mqtt_packet(), state()) ->
@@ -558,11 +582,9 @@ process_request(?UNSUBSCRIBE,
     _ = send(Reply, State),
     {ok, State};
 
-process_request(?PINGREQ, #mqtt_packet{}, State = #state{cfg = #cfg{client_id = ClientId}}) ->
-    ?LOG_DEBUG("Received a PINGREQ from client ID ~s", [ClientId]),
+process_request(?PINGREQ, #mqtt_packet{}, State) ->
     Reply = #mqtt_packet{fixed = #mqtt_packet_fixed{type = ?PINGRESP}},
     _ = send(Reply, State),
-    ?LOG_DEBUG("Sent a PINGRESP to client ID ~s", [ClientId]),
     {ok, State};
 
 process_request(?DISCONNECT,
@@ -726,14 +748,6 @@ register_client_id(VHost, ClientId, CleanStart, WillProps)
                         ?MODULE,
                         remove_duplicate_client_id_connections,
                         [PgGroup, self(), SendWill]).
-
-%% remove_duplicate_client_id_connections/2 is only called from 3.13 nodes.
-%% Hence, this function can be deleted when mixed version clusters between
-%% this version and 3.13 are disallowed.
--spec remove_duplicate_client_id_connections(
-        {rabbit_types:vhost(), client_id()}, pid()) -> ok.
-remove_duplicate_client_id_connections(PgGroup, PidToKeep) ->
-    remove_duplicate_client_id_connections(PgGroup, PidToKeep, true).
 
 -spec remove_duplicate_client_id_connections(
         {rabbit_types:vhost(), client_id()}, pid(), boolean()) -> ok.
@@ -1081,6 +1095,37 @@ check_vhost_exists(VHost, Username, PeerIp) ->
             {error, ?RC_BAD_USER_NAME_OR_PASSWORD}
     end.
 
+check_node_connection_limit() ->
+    case application:get_env(?APP_NAME, max_connections, infinity) of
+        infinity ->
+            ok;
+        Limit when is_integer(Limit) andalso Limit >= 0 ->
+            PgScope = persistent_term:get(?PG_SCOPE),
+            %% pg:init/1 creates a named ETS table using the scope atom as the table
+            %% name. Each row holds one group: {Group, AllPids, LocalPids}. Since
+            %% MQTT enforces unique client IDs per vhost, every connected client
+            %% occupies exactly one group, so the table size equals the number of
+            %% active connections node-wide across all listeners and transports.
+            %% We use ets:info/2 (O(1)) rather than pg:which_groups/1, which
+            %% performs a full table scan via ets:match/2 and is O(N) — too
+            %% expensive when the node hosts a large number of MQTT connections.
+            %% Note: OTP-27.3.4.11 source code used as a reference.
+            case ets:info(PgScope, size) of
+                MqttConns when is_integer(MqttConns) andalso MqttConns >= Limit ->
+                    ?LOG_ERROR("MQTT connection failed: node connection limit ~b is reached",
+                               [Limit]),
+                    {error, ?RC_QUOTA_EXCEEDED};
+                MqttConns when is_integer(MqttConns) ->
+                    ok;
+                Other ->
+                    ?LOG_WARNING("MQTT pg scope ETS table '~ts' size is ~tp",
+                                 [PgScope, Other]),
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
 check_vhost_connection_limit(VHost) ->
     case rabbit_vhost_limit:is_over_connection_limit(VHost) of
         false ->
@@ -1231,7 +1276,7 @@ get_vhost_username(UserBin) ->
 
 get_vhost_from_user_mapping(User) ->
     UserVirtualHostMapping = rabbit_runtime_parameters:value_global(
-                               mqtt_default_vhosts
+                               <<"mqtt_default_vhosts">>
                               ),
     get_vhost_from_user_mapping(User, UserVirtualHostMapping).
 
@@ -1248,7 +1293,7 @@ get_vhost_from_user_mapping(User, Mapping) ->
 
 get_vhost_from_port_mapping(Port) ->
     PortVirtualHostMapping = rabbit_runtime_parameters:value_global(
-                               mqtt_port_to_vhost_mapping
+                               <<"mqtt_port_to_vhost_mapping">>
                               ),
     get_vhost_from_port_mapping(Port, PortVirtualHostMapping).
 
@@ -1909,7 +1954,12 @@ maybe_delete_mqtt_qos0_queue(
             case {amqqueue:get_type(Q), amqqueue:get_pid(Q)} of
                 {?QUEUE_TYPE_QOS_0, Pid}
                   when Pid =:= self() ->
-                    rabbit_queue_type:delete(Q, false, false, Username);
+                    case rabbit_queue_type:delete(Q, false, false, Username) of
+                        {ok, _} ->
+                            ok;
+                        {error, timeout} ->
+                            rabbit_mqtt_qos0_queue_cleanup:retry_delete(Q)
+                    end;
                 _ ->
                     ok
             end;

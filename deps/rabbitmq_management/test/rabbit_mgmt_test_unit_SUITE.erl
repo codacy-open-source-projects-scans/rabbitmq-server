@@ -13,7 +13,8 @@
 
 all() ->
     [
-     {group, parallel_tests}
+     {group, parallel_tests},
+     {group, sequential_tests}
     ].
 
 groups() ->
@@ -23,8 +24,17 @@ groups() ->
                                    pack_binding_test,
                                    default_restrictions,
                                    path_prefix_test,
-                                   regex_dos_test
-                                  ]}
+                                   regex_dos_test,
+                                   has_json_extension_test,
+                                   sort_list_test
+                                  ]},
+     {sequential_tests, [], [
+                              referrer_policy_header_set_when_configured,
+                              referrer_policy_header_absent_when_not_configured,
+                              allow_header_absent_on_non_405_when_hide_configured,
+                              allow_header_present_on_405_when_hide_configured,
+                              allow_header_present_on_200_when_not_configured
+                             ]}
     ].
 
 %% -------------------------------------------------------------------
@@ -112,6 +122,50 @@ regex_dos_test(_) ->
     ?assertEqual(false, rabbit_mgmt_util:maybe_filter_by_keyword(
         name, EvilRegex, [{name, TargetString}], "true")).
 
+has_json_extension_test(_Config) ->
+    %% Standard .json extension
+    ?assert(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.json">>)),
+    %% Case-insensitive
+    ?assert(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.JSON">>)),
+    ?assert(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.Json">>)),
+    %% Non-json extensions are rejected
+    ?assertNot(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.txt">>)),
+    ?assertNot(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions">>)),
+    %% The atom 'unknown' (no filename provided) is rejected
+    ?assertNot(rabbit_mgmt_wm_definitions:has_json_extension(unknown)).
+
+referrer_policy_header_set_when_configured(_Config) ->
+    application:set_env(rabbitmq_management, headers,
+                        [{referrer_policy, "no-referrer"}]),
+    Req = rabbit_mgmt_headers:set_common_permission_headers(fake_req(), ?MODULE),
+    RespHeaders = maps:get(resp_headers, Req),
+    ?assertEqual(<<"no-referrer">>, maps:get(<<"referrer-policy">>, RespHeaders)).
+
+referrer_policy_header_absent_when_not_configured(_Config) ->
+    Req = rabbit_mgmt_headers:set_common_permission_headers(fake_req(), ?MODULE),
+    RespHeaders = maps:get(resp_headers, Req),
+    ?assertNot(maps:is_key(<<"referrer-policy">>, RespHeaders)).
+
+allow_header_absent_on_non_405_when_hide_configured(_Config) ->
+    application:set_env(rabbitmq_management, hide_http_allow_header, true),
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>,
+                <<"content-type">> => <<"application/json">>},
+    Result = rabbit_cowboy_stream_h:maybe_strip_allow_header(200, Headers),
+    ?assertNot(maps:is_key(<<"allow">>, Result)),
+    ?assert(maps:is_key(<<"content-type">>, Result)).
+
+allow_header_present_on_405_when_hide_configured(_Config) ->
+    application:set_env(rabbitmq_management, hide_http_allow_header, true),
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>},
+    Result = rabbit_cowboy_stream_h:maybe_strip_allow_header(405, Headers),
+    ?assert(maps:is_key(<<"allow">>, Result)).
+
+allow_header_present_on_200_when_not_configured(_Config) ->
+    application:unset_env(rabbitmq_management, hide_http_allow_header),
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>},
+    Result = rabbit_cowboy_stream_h:maybe_strip_allow_header(200, Headers),
+    ?assert(maps:is_key(<<"allow">>, Result)).
+
 %%--------------------------------------------------------------------
 
 assert_binding(Packed, Routing, Args) ->
@@ -121,3 +175,28 @@ assert_binding(Packed, Routing, Args) ->
         Act ->
             throw({pack, Routing, Args, expected, Packed, got, Act})
     end.
+
+fake_req() ->
+    #{
+        resp_headers => #{},
+        headers      => #{},
+        method       => <<"GET">>,
+        scheme       => <<"http">>,
+        port         => 15672
+    }.
+
+sort_list_test(_Config) ->
+    %% Duplicate keys in proplists (issue #11886)
+    Item1 = [{name, <<"b">>}, {consumers, 1}, {consumers, 10}],
+    Item2 = [{name, <<"a">>}, {consumers, 2}, {consumers, 20}],
+    ?assertEqual([Item1, Item2], rabbit_mgmt_util:sort_list([Item1, Item2], ["consumers"])),
+    %% First occurrence precedence matches JSON serialization
+    Item3 = [{name, <<"c">>}, {consumers, 0}, {consumers, 99}],
+    ?assertEqual([Item3, Item1, Item2], rabbit_mgmt_util:sort_list([Item1, Item2, Item3], ["consumers"])),
+    %% Dotted traversal into scalar values
+    ItemScalar = [{name, <<"d">>}, {messages, 10}],
+    ?assertEqual([ItemScalar], rabbit_mgmt_util:sort_list([ItemScalar], ["messages.rate"])),
+    %% Dotted traversal into lists of non-2-tuples
+    ItemList = [{name, <<"e">>}, {tags, [<<"tag1">>, <<"tag2">>]}],
+    ?assertEqual([ItemList], rabbit_mgmt_util:sort_list([ItemList], ["tags.foo"])),
+    ok.

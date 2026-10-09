@@ -76,6 +76,7 @@ cluster_size_1_tests() ->
      client_rejects_publish,
      client_receive_maximum_min,
      client_receive_maximum_large,
+     client_receive_maximum_invalid,
      unsubscribe_success,
      unsubscribe_topic_not_found,
      subscription_option_no_local,
@@ -97,11 +98,14 @@ cluster_size_1_tests() ->
      compatibility_v3_v5,
      session_upgrade_v3_v5_unsubscribe,
      session_upgrade_v4_v5_no_queue_bind_permission,
+     stale_qos0_queue_delete_does_not_delete_reconnected_client_queue,
      amqp091_cc_header,
      publish_property_content_type,
      publish_property_payload_format_indicator,
      publish_property_response_topic_correlation_data,
      publish_property_user_property,
+     publish_property_not_applicable,
+     will_property_not_applicable,
      disconnect_with_will,
      will_qos2,
      will_delay_greater_than_session_expiry,
@@ -132,7 +136,9 @@ cluster_size_1_tests() ->
 cluster_size_3_tests() ->
     [session_migrate_v3_v5,
      session_takeover_v3_v5,
-     will_delay_node_restart
+     will_delay_node_restart,
+     stale_qos0_queue_deleted_after_metadata_store_timeout,
+     stale_qos0_queue_deleted_after_plugin_restart
     ].
 
 suite() ->
@@ -198,7 +204,10 @@ init_per_testcase(T, Config)
     init_per_testcase0(T, Config1);
 
 init_per_testcase(T, Config)
-    when T =:= zero_session_expiry_disconnect_autodeletes_qos0_queue ->
+    when T =:= zero_session_expiry_disconnect_autodeletes_qos0_queue;
+         T =:= stale_qos0_queue_delete_does_not_delete_reconnected_client_queue;
+         T =:= stale_qos0_queue_deleted_after_metadata_store_timeout;
+         T =:= stale_qos0_queue_deleted_after_plugin_restart ->
   rpc(Config, rabbit_registry, register, [queue, <<"qos0">>, rabbit_mqtt_qos0_queue]),
   init_per_testcase0(T, Config);
 
@@ -217,9 +226,12 @@ end_per_testcase(T, Config)
     ok = rpc(Config, application, set_env, [?APP, Par, Default]),
     end_per_testcase0(T, Config);
 end_per_testcase(T, Config)
-    when T =:= zero_session_expiry_disconnect_autodeletes_qos0_queue ->
+    when T =:= zero_session_expiry_disconnect_autodeletes_qos0_queue;
+         T =:= stale_qos0_queue_delete_does_not_delete_reconnected_client_queue;
+         T =:= stale_qos0_queue_deleted_after_metadata_store_timeout;
+         T =:= stale_qos0_queue_deleted_after_plugin_restart ->
   ok = rpc(Config, rabbit_registry, unregister, [queue, <<"qos0">>]),
-  init_per_testcase0(T, Config);
+  end_per_testcase0(T, Config);
 
 end_per_testcase(T, Config) ->
     end_per_testcase0(T, Config).
@@ -276,8 +288,8 @@ client_set_max_packet_size_connack(Config) ->
     %% We expect the server to drop the CONNACK packet because it's larger than 2 bytes.
     ?assertEqual({error, connack_timeout}, Connect(C)).
 
-%% "It is a Protocol Error to include the Receive Maximum
-%% value more than once or for it to have the value 0."
+%% "It is a Protocol Error to include the Maximum Packet Size
+%% more than once, or for the value to be set to zero." [MQTT 5.0 3.1.2.11.4]
 client_set_max_packet_size_invalid(Config) ->
     {C, Connect} = start_client(?FUNCTION_NAME, Config, 0,
                                 [{properties, #{'Maximum-Packet-Size' => 0}}]),
@@ -360,6 +372,10 @@ message_expiry_retained_message(Config) ->
                             <<"m3.1">>, [{retain, true}, {qos, 1}]),
     {ok, _} = emqtt:publish(Pub, <<"topic4">>, #{'Message-Expiry-Interval' => 100},
                             <<"m4">>, [{retain, true}, {qos, 1}]),
+    %% A value close to the timestamp the retainer records for the publish
+    %% above. The retainer handles the retain cast after the PUBACK, so a
+    %% reading taken before the publish can be a full round trip too early.
+    Start = os:system_time(second),
 
     {ok, _} = emqtt:publish(Pub, <<"topic1">>, #{'Message-Expiry-Interval' => 2},
                             <<"m1.2">>, [{retain, true}, {qos, 1}]),
@@ -367,9 +383,11 @@ message_expiry_retained_message(Config) ->
                             <<>>, [{retain, true}, {qos, 1}]),
     {ok, _} = emqtt:publish(Pub, <<"topic3">>, #{},
                             <<"m3.2">>, [{retain, true}, {qos, 1}]),
-    timer:sleep(2001),
+    %% The retainer starts the expiry timer when it processes the retain cast,
+    %% which lands after the PUBACK the publisher waits for.
+    timer:sleep(timer:seconds(4)),
     %% Expectations:
-    %% topic1 expired because 2 seconds elapsed
+    %% topic1 expired because more than 2 seconds elapsed
     %% topic2 is not retained because it got deleted
     %% topic3 is retained because its new message does not have an Expiry-Interval set
     %% topic4 is retained because 100 seconds have not elapsed
@@ -392,7 +410,8 @@ message_expiry_retained_message(Config) ->
                         topic := <<"topic4">>,
                         payload := <<"m4">>,
                         properties := #{'Message-Expiry-Interval' := MEI}}} ->
-                assert_message_expiry_interval(100 - 2, MEI)
+                ElapsedSeconds = os:system_time(second) - Start,
+                assert_message_expiry_interval(100 - ElapsedSeconds, MEI)
     after ?TIMEOUT -> ct:fail("did not receive topic4")
     end,
     assert_nothing_received(),
@@ -422,6 +441,110 @@ zero_session_expiry_disconnect_autodeletes_qos0_queue(Config) ->
     rabbit_ct_helpers:eventually(
         {?LINE, fun() -> ?assertEqual(0, length(rpc(Config, rabbit_amqqueue, list, []))) end},
         100, 50).
+
+stale_qos0_queue_delete_does_not_delete_reconnected_client_queue(Config) ->
+    ClientId = ?FUNCTION_NAME,
+    C1 = connect(ClientId, Config),
+    {ok, _, _} = emqtt:subscribe(C1, <<"topic0">>, qos0),
+    [OldQ] = rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue]),
+    ok = emqtt:disconnect(C1),
+    C2 = connect(ClientId, Config),
+    {ok, _, _} = emqtt:subscribe(C2, <<"topic0">>, qos0),
+    [NewQ] = rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue]),
+    ?assertNotEqual(amqqueue:get_pid(OldQ), amqqueue:get_pid(NewQ)),
+
+    %% A retry carries the old exclusive owner and must not match the new queue.
+    Server = rabbit_mqtt_qos0_queue_cleanup,
+    ok = rpc(Config, sys, log, [Server, true]),
+    try
+        ok = rpc(Config, Server, retry_delete, [OldQ]),
+        rabbit_ct_helpers:eventually(
+          {?LINE,
+           fun() ->
+                   {ok, Events} = rpc(Config, sys, log, [Server, get]),
+                   ?assert(lists:member({in, retry_delete}, Events)),
+                   ?assertMatch({state, [], _}, rpc(Config, sys, get_state, [Server]))
+           end},
+          100, 50)
+    after
+        ok = rpc(Config, sys, log, [Server, false])
+    end,
+    ?assertEqual([NewQ],
+                 rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue])),
+    ok = emqtt:disconnect(C2).
+
+stale_qos0_queue_deleted_after_plugin_restart(Config) ->
+    ClientId = ?FUNCTION_NAME,
+    C = connect(ClientId, Config),
+    {ok, _, _} = emqtt:subscribe(C, <<"topic0">>, qos0),
+    [Q] = rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue]),
+    unlink(C),
+    {ok, Timeout} = rpc(Config, application, get_env, [khepri, default_timeout]),
+    ok = rpc(Config, application, set_env, [khepri, default_timeout, 1000]),
+    try
+        ok = rabbit_ct_broker_helpers:stop_node(Config, 1),
+        ok = rabbit_ct_broker_helpers:stop_node(Config, 2),
+        [ok = rabbit_ct_broker_helpers:disable_plugin(Config, 0, Plugin)
+         || Plugin <- lists:reverse(?config(test_plugins, Config))],
+        [ok = rabbit_ct_broker_helpers:enable_plugin(Config, 0, Plugin)
+         || Plugin <- ?config(test_plugins, Config)],
+        rabbit_ct_helpers:eventually(
+          {?LINE,
+           fun() ->
+                   ?assertMatch({state, [Q], Pid} when is_pid(Pid),
+                                rpc(Config, sys, get_state, [rabbit_mqtt_qos0_queue_cleanup]))
+           end},
+          500, 20),
+        ?assertEqual([Q], rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue])),
+        ok = rabbit_ct_broker_helpers:async_start_node(Config, 1),
+        ok = rabbit_ct_broker_helpers:async_start_node(Config, 2),
+        ok = rabbit_ct_broker_helpers:wait_for_async_start_node(1),
+        ok = rabbit_ct_broker_helpers:wait_for_async_start_node(2),
+        [util:enable_plugin(Config, Plugin) || Plugin <- ?config(test_plugins, Config)],
+        rabbit_ct_helpers:eventually(
+          {?LINE,
+           fun() ->
+                   ?assertEqual([], rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue]))
+           end},
+          1000, 60)
+    after
+        ok = rpc(Config, application, set_env, [khepri, default_timeout, Timeout])
+    end.
+
+stale_qos0_queue_deleted_after_metadata_store_timeout(Config) ->
+    ClientId = ?FUNCTION_NAME,
+    C = connect(ClientId, Config),
+    {ok, _, _} = emqtt:subscribe(C, <<"topic0">>, qos0),
+    [Q] = rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue]),
+    {ok, Timeout} = rpc(Config, application, get_env, [khepri, default_timeout]),
+    ok = rpc(Config, application, set_env, [khepri, default_timeout, 1000]),
+    try
+        ok = rabbit_ct_broker_helpers:stop_node(Config, 1),
+        ok = rabbit_ct_broker_helpers:stop_node(Config, 2),
+        ok = emqtt:disconnect(C),
+        %% Node 0 is in a minority, so the delete on disconnect times out and is queued.
+        rabbit_ct_helpers:eventually(
+          {?LINE,
+           fun() ->
+                   ?assertMatch({state, [Q], Pid} when is_pid(Pid),
+                                rpc(Config, sys, get_state, [rabbit_mqtt_qos0_queue_cleanup]))
+           end},
+          500, 20),
+        ?assertEqual([Q], rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue])),
+        ok = rabbit_ct_broker_helpers:async_start_node(Config, 1),
+        ok = rabbit_ct_broker_helpers:async_start_node(Config, 2),
+        ok = rabbit_ct_broker_helpers:wait_for_async_start_node(1),
+        ok = rabbit_ct_broker_helpers:wait_for_async_start_node(2),
+        [util:enable_plugin(Config, Plugin) || Plugin <- ?config(test_plugins, Config)],
+        rabbit_ct_helpers:eventually(
+          {?LINE,
+           fun() ->
+                   ?assertEqual([], rpc(Config, rabbit_amqqueue, list_by_type, [rabbit_mqtt_qos0_queue]))
+           end},
+          1000, 60)
+    after
+        ok = rpc(Config, application, set_env, [khepri, default_timeout, Timeout])
+    end.
 
 session_expiry_disconnect_decrease(QueueType, Config) ->
     ClientId = ?FUNCTION_NAME,
@@ -622,6 +745,14 @@ client_receive_maximum_large(Config) ->
     %% Receive Maximum value.
     assert_nothing_received(),
     ok = emqtt:disconnect(C).
+
+%% "It is a Protocol Error to include the Receive Maximum
+%% value more than once or for it to have the value 0." [MQTT 5.0 3.1.2.11.3]
+client_receive_maximum_invalid(Config) ->
+    {C, Connect} = start_client(?FUNCTION_NAME, Config, 0,
+                                [{properties, #{'Receive-Maximum' => 0}}]),
+    unlink(C),
+    ?assertMatch({error, _}, Connect(C)).
 
 unsubscribe_success(Config) ->
     C = connect(?FUNCTION_NAME, Config),
@@ -1367,6 +1498,57 @@ publish_property_user_property(Config) ->
     after ?TIMEOUT -> ct:fail("did not receive message")
     end,
     ok = emqtt:disconnect(C).
+
+%% "A Control Packet which contains an Identifier which is not valid for its packet
+%% type [...] is a Malformed Packet." [v5 2.2.2.2]
+%% A client sending such an invalid property should get disconnected.
+publish_property_not_applicable(Config) ->
+    Topic = atom_to_binary(?FUNCTION_NAME),
+    Sub = connect(<<"subscriber">>, Config),
+    {ok, _, [0]} = emqtt:subscribe(Sub, Topic),
+    Pub = connect(<<"publisher">>, Config),
+    ok = emqtt:publish(Pub, Topic, #{'Content-Type' => <<"text/plain">>},
+                       <<"applicable">>, [{qos, 0}]),
+    ok = expect_publishes(Sub, Topic, [<<"applicable">>]),
+    ok = emqtt:disconnect(Pub),
+
+    process_flag(trap_exit, true),
+    NotApplicable = [{'Request-Problem-Information', 1},
+                     {'Request-Response-Information', 1},
+                     {'Response-Information', <<"response information">>},
+                     {'Server-Reference', <<"other-host">>},
+                     %% "A PUBLISH packet sent from a Client to a Server MUST NOT
+                     %% contain a Subscription Identifier." [MQTT-3.3.4-6]
+                     {'Subscription-Identifier', 1},
+                     {'Session-Expiry-Interval', 60},
+                     {'Will-Delay-Interval', 60}],
+    lists:foreach(
+      fun({Name, Val}) ->
+              C = connect(atom_to_binary(Name), Config),
+              ok = emqtt:publish(C, Topic, #{Name => Val},
+                                 atom_to_binary(Name), [{qos, 0}]),
+              %% The publisher should get disconnected.
+              util:await_exit(C)
+      end, NotApplicable),
+
+    %% The subscriber received none of the messages above and is still usable.
+    Pub1 = connect(<<"publisher 1">>, Config),
+    ok = emqtt:publish(Pub1, Topic, <<"last">>, qos0),
+    ok = expect_publishes(Sub, Topic, [<<"last">>]),
+    ok = emqtt:disconnect(Sub),
+    ok = emqtt:disconnect(Pub1).
+
+will_property_not_applicable(Config) ->
+    Topic = atom_to_binary(?FUNCTION_NAME),
+    %% 'Request-Problem-Information' is applicable to CONNECT,
+    %% but not to the Will Properties. [v5 2.2.2.2]
+    {C, Connect} = start_client(?FUNCTION_NAME, Config, 0,
+                                [{will_props, #{'Request-Problem-Information' => 1}},
+                                 {will_topic, Topic},
+                                 {will_qos, 0},
+                                 {will_payload, <<"will payload">>}]),
+    unlink(C),
+    ?assertMatch({error, _}, Connect(C)).
 
 disconnect_with_will(Config) ->
     Topic = Payload = ClientId = atom_to_binary(?FUNCTION_NAME),

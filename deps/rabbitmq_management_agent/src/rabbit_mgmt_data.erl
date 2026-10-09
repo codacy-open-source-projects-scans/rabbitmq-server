@@ -12,6 +12,10 @@
 -include_lib("rabbit_common/include/rabbit.hrl").
 -export([empty/2, pick_range/2]).
 
+-ifdef(TEST).
+-export([filter_user/2]).
+-endif.
+
 % delegate api
 -export([overview_data/4,
          consumer_data/2,
@@ -331,24 +335,40 @@ augment_channel_pid(Pid) ->
          {peer_host,       pget(peer_host,    Conn)}]
     end.
 
-lookup_channel_with_fallback_to_connection(ChannelOrConnectionPid) ->
-    % stream consumers report a stream connection PID for their channel PID,
-    % so we adapt to this here
-    case lookup_element(channel_created_stats, ChannelOrConnectionPid, 3) of
+%% Consumers of channel-less protocols (stream, MQTT, STOMP) report their
+%% connection pid as the channel pid, and AMQP 1.0 consumers report
+%% their session pid. Both are mapped to the owning connection here.
+lookup_channel_with_fallback_to_connection(Pid) ->
+    case lookup_element(channel_created_stats, Pid, 3) of
         [] ->
-            case lookup_element(connection_created_stats, ChannelOrConnectionPid, 3) of
-                [] ->
-                    % not a channel and not a connection, not much we can do here
-                    [{pid, ChannelOrConnectionPid}];
-                Conn ->
-                    [{name, <<"">>},
-                     {pid, ChannelOrConnectionPid},
-                     {number, 0},
-                     {user, pget(user, Conn)},
-                     {connection, ChannelOrConnectionPid}]
+            case connection_pid(Pid) of
+                undefined ->
+                    [{pid, Pid}];
+                ConnPid ->
+                    case lookup_element(connection_created_stats, ConnPid, 3) of
+                        [] ->
+                            [{pid, Pid}];
+                        Conn ->
+                            [{name, <<"">>},
+                             {pid, Pid},
+                             {number, 0},
+                             {user, pget(user, Conn)},
+                             {connection, ConnPid}]
+                    end
             end;
         Ch ->
             Ch
+    end.
+
+connection_pid(Pid) ->
+    case rabbit_amqp_session:is_local(Pid) of
+        true ->
+            case rabbit_amqp_session:connection_pid(Pid) of
+                {ok, ConnPid} -> ConnPid;
+                {error, _} -> undefined
+            end;
+        false ->
+            Pid
     end.
 
 augment_connection_pid(Pid) ->
@@ -589,5 +609,8 @@ filter_user(List, #user{username = Username, tags = Tags}) ->
         false -> [I || I <- List, pget(user, I) == Username]
     end.
 
-is_monitor(T)     -> intersects(T, [administrator, monitoring]).
-intersects(A, B) -> lists:any(fun(I) -> lists:member(I, B) end, A).
+is_monitor(T)     -> intersects(T, [<<"administrator">>, <<"monitoring">>]).
+
+intersects(A, B) ->
+    ABin = [rabbit_data_coercion:to_binary(I) || I <- A],
+    lists:any(fun(I) -> lists:member(I, B) end, ABin).

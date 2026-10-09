@@ -67,7 +67,8 @@
 -export([next_publish_seqno/1, wait_for_confirms/1, wait_for_confirms/2,
          wait_for_confirms_or_die/1, wait_for_confirms_or_die/2]).
 -export([start_link/5, set_writer/2, connection_closing/3, open/1,
-         enable_delivery_flow_control/1, notify_received/1]).
+         enable_delivery_flow_control/1, notify_received/1,
+         set_server_properties/2]).
 
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
@@ -99,7 +100,10 @@
                 %% to prevent the queue from overwhelming slow
                 %% consumers that use automatic acknowledgement
                 %% mode.
-                delivery_flow_control = false
+                delivery_flow_control = false,
+
+                accepts_consumer_cancel_ok = false,
+                consumer_tags              = sets:new([{version, 2}])
                }).
 
 %%---------------------------------------------------------------------------
@@ -358,6 +362,9 @@ set_writer(Pid, Writer) ->
 enable_delivery_flow_control(Pid) ->
     gen_server:cast(Pid, enable_delivery_flow_control).
 
+set_server_properties(Pid, ServerProperties) ->
+    gen_server:cast(Pid, {set_server_properties, ServerProperties}).
+
 notify_received({Pid, QPid, ServerChPid}) ->
     gen_server:cast(Pid, {send_notify, {QPid, ServerChPid}}).
 
@@ -428,6 +435,9 @@ handle_cast({set_writer, Writer}, State = #state{driver = direct}) ->
 handle_cast({set_writer, Writer}, State) ->
     {noreply, State#state{writer = Writer}};
 %% @private
+handle_cast({set_server_properties, ServerProperties}, State) ->
+    {noreply, State#state{accepts_consumer_cancel_ok =
+                              accepts_consumer_cancel_ok(ServerProperties)}};
 handle_cast(enable_delivery_flow_control, State) ->
     {noreply, State#state{delivery_flow_control = true}};
 %% @private
@@ -670,12 +680,20 @@ pending_rpc_method(#state{rpc_requests = Q}) ->
 pre_do(#'channel.close'{reply_code = Code, reply_text = Text}, none,
        _Sender, State) ->
     State#state{closing = {just_channel, {app_initiated_close, Code, Text}}};
-pre_do(#'basic.consume'{} = Method, none, Sender, State) ->
+pre_do(#'basic.consume'{consumer_tag = Tag, nowait = NoWait} = Method, none,
+       Sender, State) ->
     ok = call_to_consumer(Method, Sender, State),
-    State;
-pre_do(#'basic.cancel'{} = Method, none, Sender, State) ->
+    case NoWait andalso Tag =/= <<>> of
+        true  -> add_consumer_tag(Tag, State);
+        false -> State
+    end;
+pre_do(#'basic.cancel'{consumer_tag = Tag, nowait = NoWait} = Method, none,
+       Sender, State) ->
     ok = call_to_consumer(Method, Sender, State),
-    State;
+    case NoWait of
+        true  -> remove_consumer_tag(Tag, State);
+        false -> State
+    end;
 pre_do(_, _, _, State) ->
     State.
 
@@ -755,14 +773,25 @@ handle_method_from_server1(#'channel.close_ok'{}, none,
 handle_method_from_server1(#'basic.consume_ok'{} = ConsumeOk, none, State) ->
     Consume = #'basic.consume'{} = pending_rpc_method(State),
     ok = call_to_consumer(ConsumeOk, Consume, State),
-    {noreply, rpc_bottom_half(ConsumeOk, State)};
+    State1 = add_consumer_tag(ConsumeOk#'basic.consume_ok'.consumer_tag, State),
+    {noreply, rpc_bottom_half(ConsumeOk, State1)};
 handle_method_from_server1(#'basic.cancel_ok'{} = CancelOk, none, State) ->
     Cancel = #'basic.cancel'{} = pending_rpc_method(State),
     ok = call_to_consumer(CancelOk, Cancel, State),
-    {noreply, rpc_bottom_half(CancelOk, State)};
-handle_method_from_server1(#'basic.cancel'{} = Cancel, none, State) ->
+    State1 = remove_consumer_tag(CancelOk#'basic.cancel_ok'.consumer_tag, State),
+    {noreply, rpc_bottom_half(CancelOk, State1)};
+handle_method_from_server1(#'basic.cancel'{consumer_tag = ConsumerTag} = Cancel, none,
+                           State) ->
     ok = call_to_consumer(Cancel, none, State),
-    {noreply, State};
+    State1 = remove_consumer_tag(ConsumerTag, State),
+    case State#state.accepts_consumer_cancel_ok andalso
+         sets:is_element(ConsumerTag, State#state.consumer_tags) of
+        true ->
+            ok = cast(self(), #'basic.cancel_ok'{consumer_tag = ConsumerTag});
+        false ->
+            ok
+    end,
+    {noreply, State1};
 handle_method_from_server1(#'basic.deliver'{} = Deliver, AmqpMsg, State) ->
     ok = call_to_consumer(Deliver, AmqpMsg, State),
     {noreply, State};
@@ -865,23 +894,35 @@ handle_shutdown(Reason, State) ->
 
 do(Method, Content, Flow, #state{driver = network, writer = W}) ->
     %% Catching because it expects the {channel_exit, _, _} message on error
-    catch case {Content, Flow} of
-              {none, _}      -> rabbit_writer:send_command(W, Method);
-              {_,    flow}   -> rabbit_writer:send_command_flow(W, Method,
+    try
+        case {Content, Flow} of
+            {none, _}      -> rabbit_writer:send_command(W, Method);
+            {_,    flow}   -> rabbit_writer:send_command_flow(W, Method,
                                                                 Content);
-              {_,    noflow} -> rabbit_writer:send_command(W, Method, Content)
-          end;
+            {_,    noflow} -> rabbit_writer:send_command(W, Method, Content)
+        end
+    catch
+        throw:Thrown -> Thrown;
+        exit:Reason -> {'EXIT', Reason};
+        error:Reason:Stacktrace -> {'EXIT', {Reason, Stacktrace}}
+    end;
 do(Method, Content, Flow, #state{driver = direct, writer = W}) ->
     %% ditto catching because...
-    catch case {Content, Flow} of
-              {none, _}      -> rabbit_channel_common:do(W, Method);
-              {_,    flow}   -> rabbit_channel_common:do_flow(W, Method, Content);
-              {_,    noflow} -> rabbit_channel_common:do(W, Method, Content)
-          end.
+    try
+        case {Content, Flow} of
+            {none, _}      -> rabbit_channel_common:do(W, Method);
+            {_,    flow}   -> rabbit_channel_common:do_flow(W, Method, Content);
+            {_,    noflow} -> rabbit_channel_common:do(W, Method, Content)
+        end
+    catch
+        throw:Thrown -> Thrown;
+        exit:Reason -> {'EXIT', Reason};
+        error:Reason:Stacktrace -> {'EXIT', {Reason, Stacktrace}}
+    end.
 
 
 flush_writer(#state{driver = network, writer = Writer}) ->
-    _ = catch rabbit_writer:flush(Writer),
+    _ = try rabbit_writer:flush(Writer) catch _:_ -> ok end,
     ok;
 flush_writer(#state{driver = direct}) ->
     ok.
@@ -1000,6 +1041,21 @@ handle_wait_for_confirms(From, Timeout,
                  {noreply,
                   State#state{waiting_set = gb_trees:insert(From, TRef, WSet)}}
     end.
+
+accepts_consumer_cancel_ok(ServerProperties) ->
+    case lists:keyfind(<<"capabilities">>, 1, ServerProperties) of
+        {_, table, Capabilities} ->
+            lists:member({<<"accept_consumer_cancel_ok">>, bool, true},
+                         Capabilities);
+        _ ->
+            false
+    end.
+
+add_consumer_tag(Tag, State = #state{consumer_tags = Tags}) ->
+    State#state{consumer_tags = sets:add_element(Tag, Tags)}.
+
+remove_consumer_tag(Tag, State = #state{consumer_tags = Tags}) ->
+    State#state{consumer_tags = sets:del_element(Tag, Tags)}.
 
 call_to_consumer(Method, Args, #state{consumer = Consumer}) ->
     amqp_gen_consumer:call_consumer(Consumer, Method, Args).

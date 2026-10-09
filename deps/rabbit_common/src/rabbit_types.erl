@@ -185,16 +185,16 @@
 
 -type(auth_user() ::
         #auth_user{username :: username(),
-                   tags     :: [atom()],
+                   tags     :: [atom() | binary()],
                    impl     :: any()}).
 
 -type(authz_data() ::
-        #{peeraddr := inet:ip_address() | binary(),
+        #{peeraddr := inet:ip_address() | {local, string()} | binary(),
           _ => _      } | undefined).
 
 -type(user() ::
         #user{username       :: username(),
-              tags           :: [atom()],
+              tags           :: [atom() | binary()],
               authz_backends :: [{atom(), any()}]}).
 
 -type(username() :: binary()).

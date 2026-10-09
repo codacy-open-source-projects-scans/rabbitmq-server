@@ -10,7 +10,7 @@
 -export([status/2]).
 
 -ifdef(TEST).
--export([status/1]).
+-export([status/1, filter_vhost_user/3]).
 -endif.
 
 -import(rabbit_misc, [pget/2]).
@@ -25,8 +25,9 @@
 %% monitors) to see them.
 filter_vhost_user(List, _ReqData, #context{user = User = #user{tags = Tags}}) ->
     VHosts = rabbit_mgmt_util:list_login_vhosts_names(User, undefined),
+    TagsBin = [rabbit_data_coercion:to_binary(T) || T <- Tags],
     [I || I <- List, case pget(vhost, I) of
-                         undefined -> lists:member(administrator, Tags);
+                         undefined -> lists:member(<<"administrator">>, TagsBin);
                          VHost     -> lists:member(VHost, VHosts)
                      end].
 
@@ -38,10 +39,10 @@ status(ReqData, Context) ->
 
 status(Node) ->
     case rpc:call(Node, rabbit_shovel_status, status, [], ?SHOVEL_CALLS_TIMEOUT_MS) of
-        {badrpc, {'EXIT', _}} ->
-            [];
-        Status ->
-            [format(Node, I) || I <- Status]
+        Status when is_list(Status) ->
+            [format(Node, I) || I <- Status];
+        _Error ->
+            []
     end.
 
 format(Node, {Name, Type, Info, Metrics, TS}) ->

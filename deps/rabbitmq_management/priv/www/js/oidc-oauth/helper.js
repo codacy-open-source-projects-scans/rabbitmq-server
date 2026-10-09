@@ -53,10 +53,6 @@ function auth_settings_apply_defaults(authSettings) {
         if (!resource_server.oauth_client_id) {
           resource_server.oauth_client_id = authSettings.oauth_client_id
         }
-        if (!resource_server.oauth_client_secret && resource_server.oauth_client_id
-            && authSettings.oauth_client_secret) {
-          resource_server.oauth_client_secret = authSettings.oauth_client_secret
-        }
         if (!resource_server.oauth_initiated_logon_type) {
           if (authSettings.oauth_initiated_logon_type) {
             resource_server.oauth_initiated_logon_type = authSettings.oauth_initiated_logon_type
@@ -164,8 +160,11 @@ export function oidc_settings_from(resource_server) {
       end_session_endpoint: resource_server.end_session_endpoint
     }
   }
-  if (resource_server.oauth_client_secret != "") {
-    oidcSettings.client_secret = resource_server.oauth_client_secret
+  if (resource_server.use_token_endpoint_proxy) {
+    // The client secret stays server-side. Discover through the proxy so that
+    // token requests carrying the secret are sent to RabbitMQ, not the provider.
+    oidcSettings.metadataUrl = rabbit_base_uri() + "/js/oidc-oauth/token-endpoint/"
+      + encodeURIComponent(resource_server.id) + "/openid-configuration"
   }
   if (resource_server.oauth_authorization_endpoint_params) {
     oidcSettings.extraQueryParams = resource_server.oauth_authorization_endpoint_params
@@ -257,6 +256,8 @@ export function oauth_initiateLogin(resource_server_id) {
   if (!resource_server) return;
   set_auth_resource(resource_server_id)
 
+  store_pref("oauth-return-to", window.location.hash);
+
   oauth.sp_initiated = resource_server.sp_initiated
   oauth.authority = resource_server.oauth_provider_url
 
@@ -269,6 +270,7 @@ export function oauth_initiateLogin(resource_server_id) {
         _management_logger.error(err)
     })
   } else {
+    store_pref("oauth-idp-pending", "true")
     location.href = resource_server.oauth_provider_url
   }
 }
@@ -293,6 +295,7 @@ function oauth_redirectToLogin(error) {
 }
 export function oauth_completeLogin() {
     mgr.signinRedirectCallback().then(function(user) {
+      clear_local_pref(SESSION_EXPIRY);
       set_token_auth(user.access_token);
       oauth_redirectToHome();
     }).catch(function(err) {
@@ -348,13 +351,33 @@ function validate_openid_configuration(payload) {
 
 }
 
+/**
+ * Return a warning message for a single OAuth resource already escaped, i.e
+ * safe to append to the DOM.
+ * @param {*} oauthResource 
+ * @param {*} reason 
+ * @returns 
+ */
 function warningMessageOAuthResource(oauthResource, reason) {
-  return "OAuth resource [<b>" + (oauthResource["label"] != null ? oauthResource.label : oauthResource.id) +
-    "</b>] not available. OpenId Discovery endpoint " + readiness_url(oauthResource) + reason
+  return "OAuth resource [<b>" 
+    + fmt_escape_html(oauthResource["label"] != null ? oauthResource.label : oauthResource.id) 
+    + "</b>] not available. OpenId Discovery endpoint " 
+    + fmt_escape_html(readiness_url(oauthResource)) 
+    + fmt_escape_html(reason)
 }
+/**
+ * Return a warning message for multiple OAuth resources already escaped, i.e
+ * safe to append to the DOM.
+ * @param {*} commonProviderURL 
+ * @param {*} oauthResources 
+ * @param {*} reason 
+ * @returns 
+ */
 function warningMessageOAuthResources(commonProviderURL, oauthResources, reason) {
-  return "OAuth resources [ <b>" + oauthResources.map(resource => resource["label"] != null ? resource.label : resource.id).join("</b>,<b>")
-    + "</b>] not available. OpenId Discovery endpoint " + commonProviderURL + reason
+  return "OAuth resources [ <b>"
+    + oauthResources.map(resource => fmt_escape_html(resource["label"] != null ? resource.label : resource.id)).join("</b>,<b>")
+    + "</b>] not available. OpenId Discovery endpoint "
+    + fmt_escape_html(commonProviderURL) + fmt_escape_html(reason)
 }
 
 export function hasAnyResourceServerReady(oauth, onReadyCallback) {

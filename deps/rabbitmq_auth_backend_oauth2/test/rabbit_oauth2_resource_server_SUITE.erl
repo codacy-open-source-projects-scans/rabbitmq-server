@@ -77,6 +77,10 @@ verify_get_rabbitmq_server_configuration() -> [
     {with_verify_aud_false, [], [
         rabbitmq_verify_aud_is_false
     ]},
+    rabbitmq_require_exp_is_true,
+    {with_require_exp_false, [], [
+        rabbitmq_require_exp_is_false
+    ]},
     rabbitmq_has_default_scope_prefix,
     {with_scope_prefix, [], [
         rabbitmq_has_scope_prefix
@@ -99,6 +103,10 @@ verify_get_rabbitmq_server_configuration() -> [
     rabbitmq_has_no_scope_aliases,
     {with_scope_aliases, [], [
         rabbitmq_has_scope_aliases
+    ]},
+    rabbitmq_scope_pattern_syntax_default_wildcard,
+    {with_scope_pattern_syntax_regex, [], [
+        rabbitmq_scope_pattern_syntax_is_regex
     ]}
 ].
 
@@ -106,6 +114,10 @@ verify_configuration_inheritance_with_rabbitmq2() -> [
     rabbitmq2_verify_aud_is_true,
     {with_verify_aud_false, [], [
         rabbitmq2_verify_aud_is_false
+    ]},
+    rabbitmq2_require_exp_is_true,
+    {with_require_exp_false, [], [
+        rabbitmq2_require_exp_is_false
     ]},
     rabbitmq2_has_default_scope_prefix,
     {with_scope_prefix, [], [
@@ -126,6 +138,10 @@ verify_configuration_inheritance_with_rabbitmq2() -> [
     rabbitmq2_has_no_scope_aliases,
     {with_scope_aliases, [], [
         rabbitmq2_has_scope_aliases
+    ]},
+    rabbitmq2_scope_pattern_syntax_defaults_wildcard,
+    {with_scope_pattern_syntax_regex, [], [
+        rabbitmq2_scope_pattern_syntax_inherits_regex
     ]}
 ].
 
@@ -175,8 +191,16 @@ init_per_group(with_scope_aliases, Config) ->
     set_env(scope_aliases, Aliases),
     [{scope_aliases, Aliases} | Config];
 
+init_per_group(with_scope_pattern_syntax_regex, Config) ->
+    set_env(scope_pattern_syntax, regex),
+    Config;
+
 init_per_group(with_verify_aud_false, Config) ->
     set_env(verify_aud, false),
+    Config;
+
+init_per_group(with_require_exp_false, Config) ->
+    set_env(require_exp, false),
     Config;
 
 init_per_group(with_rabbitmq1_verify_aud_false, Config) ->
@@ -193,7 +217,7 @@ init_per_group(with_two_resource_servers, Config) ->
         {resource_server_type, <<"some-type">>},
         {verify_aud, true},
         {scope_prefix, <<"some-prefix">>},
-        {additional_scopes_key, <<"roles">>},
+        {extra_scopes_source, <<"roles">>},
         {preferred_username_claims, [<<"x-username">>, <<"x-email">>]},
         {scope_aliases, #{ <<"admin">> => [<<"rabbitmq.tag:administrator">>]}},
         {oauth_provider_id, ?OAUTH_PROVIDER_A}
@@ -227,8 +251,16 @@ end_per_group(with_empty_scope_prefix, Config) ->
     unset_env(scope_prefix),
     Config;
 
+end_per_group(with_scope_pattern_syntax_regex, Config) ->
+    unset_env(scope_pattern_syntax),
+    Config;
+
 end_per_group(with_verify_aud_false, Config) ->
     unset_env(verify_aud),
+    Config;
+
+end_per_group(with_require_exp_false, Config) ->
+    unset_env(require_exp),
     Config;
 
 end_per_group(with_two_resource_servers, Config) ->
@@ -336,6 +368,18 @@ rabbitmq_verify_aud_is_false(_) ->
 rabbitmq2_verify_aud_is_true(_) ->
     assert_verify_aud(true, ?RABBITMQ_RESOURCE_TWO).
 
+rabbitmq_require_exp_is_true(_) ->
+    assert_require_exp(true, ?RABBITMQ).
+
+rabbitmq_require_exp_is_false(_) ->
+    assert_require_exp(false, ?RABBITMQ).
+
+rabbitmq2_require_exp_is_true(_) ->
+    assert_require_exp(true, ?RABBITMQ_RESOURCE_TWO).
+
+rabbitmq2_require_exp_is_false(_) ->
+    assert_require_exp(false, ?RABBITMQ_RESOURCE_TWO).
+
 both_resources_oauth_provider_id_is_root(_) ->
     assert_oauth_provider_id(root, ?RABBITMQ_RESOURCE_ONE),
     assert_oauth_provider_id(root, ?RABBITMQ_RESOURCE_TWO).
@@ -412,6 +456,18 @@ rabbitmq_has_no_scope_aliases(_) ->
 rabbitmq_has_scope_aliases(Config) ->
     assert_scope_aliases(?config(scope_aliases, Config), ?RABBITMQ).
 
+rabbitmq_scope_pattern_syntax_default_wildcard(_) ->
+    assert_scope_pattern_syntax(wildcard, ?RABBITMQ).
+
+rabbitmq_scope_pattern_syntax_is_regex(_) ->
+    assert_scope_pattern_syntax(regex, ?RABBITMQ).
+
+rabbitmq2_scope_pattern_syntax_defaults_wildcard(_) ->
+    assert_scope_pattern_syntax(wildcard, ?RABBITMQ_RESOURCE_TWO).
+
+rabbitmq2_scope_pattern_syntax_inherits_regex(_) ->
+    assert_scope_pattern_syntax(regex, ?RABBITMQ_RESOURCE_TWO).
+
 verify_rabbitmq1_server_configuration(Config) ->
     ConfigRabbitMQ = ?config(?RABBITMQ_RESOURCE_ONE, Config),
     {ok, ActualRabbitMQ} = resolve_resource_server_from_audience(?RABBITMQ_RESOURCE_ONE),
@@ -423,7 +479,7 @@ verify_rabbitmq1_server_configuration(Config) ->
         ActualRabbitMQ#resource_server.verify_aud),
     ?assertEqual(proplists:get_value(scope_prefix, ConfigRabbitMQ),
         ActualRabbitMQ#resource_server.scope_prefix),
-    ?assertEqual(proplists:get_value(extract_scopes_source, ConfigRabbitMQ),
+    ?assertEqual(proplists:get_value(extra_scopes_source, ConfigRabbitMQ),
         ActualRabbitMQ#resource_server.additional_scopes_key),
     ?assertEqual(proplists:get_value(preferred_username_claims, ConfigRabbitMQ),
         ActualRabbitMQ#resource_server.preferred_username_claims),
@@ -443,6 +499,10 @@ assert_resource_server_id(Expected, Audience) ->
 assert_verify_aud(Expected, Audience) ->
     {ok, Actual} = resolve_resource_server_from_audience(Audience),
     ?assertEqual(Expected, Actual#resource_server.verify_aud).
+
+assert_require_exp(Expected, Audience) ->
+    {ok, Actual} = resolve_resource_server_from_audience(Audience),
+    ?assertEqual(Expected, Actual#resource_server.require_exp).
 
 assert_oauth_provider_id(Expected, Audience) ->
     {ok, Actual} = resolve_resource_server_from_audience(Audience),
@@ -464,6 +524,10 @@ assert_preferred_username_claims(Expected, Audience) ->
 assert_scope_aliases(Expected, Audience) ->
     {ok, Actual} = resolve_resource_server_from_audience(Audience),
     ?assertEqual(Expected, Actual#resource_server.scope_aliases).
+
+assert_scope_pattern_syntax(Expected, Audience) ->
+    {ok, Actual} = resolve_resource_server_from_audience(Audience),
+    ?assertEqual(Expected, Actual#resource_server.scope_pattern_syntax).
 
 get_env(Par) ->
     application:get_env(rabbitmq_auth_backend_oauth2, Par).

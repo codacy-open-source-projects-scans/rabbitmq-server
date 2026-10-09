@@ -21,6 +21,7 @@ const FORM_POPUP_INFO_CLOSE_BUTTON = By.css('div.form-popup-info span')
 
 const FORM_POPUP_OPTIONS = By.css('div.form-popup-options')
 const ADD_MINUS_BUTTON = By.css('div#main table.list thead tr th.plus-minus')
+const MAIN_HEADING = By.css('#main h1')
 const TABLE_COLUMNS_POPUP = By.css('div.form-popup-options table.form')
 const FORM_POPUP_OPTIONS_CLOSE_BUTTON = By.css('div.form-popup-options span#close')
 
@@ -36,18 +37,30 @@ module.exports = class BasePage {
     this.polling = parseInt(process.env.SELENIUM_POLLING) || 500 // how frequent selenium searches for an element
     this.interactionDelay = parseInt(process.env.SELENIUM_INTERACTION_DELAY) || 0 // slow down interactions (when rabbit is behind a http proxy)
   }
+  // The management UI toggles a section from a click handler bound to its h2,
+  // not to the section itself.
+  async toggleSection(section) {
+    if (this.interactionDelay) await this.driver.sleep(this.interactionDelay)
+    return this.retryOnStale(async () => {
+      const element = await this.waitForDisplayed(section)
+      const heading = await element.findElement(By.xpath('./h2'))
+      return heading.click()
+    })
+  }
   async ensureSectionIsVisible(section) {
-    let classes = await this.driver.findElement(section).getAttribute("class")
-    if (classes.search('section-visible') < 0) {
-      return this.click(section)
+    let element = await this.waitForLocated(section)
+    let classes = await element.getAttribute("class")
+    if (!classes || classes.search('section-visible') < 0) {
+      return this.toggleSection(section)
     } else {
       return Promise.resolve(true)
     }
   }
   async ensureSectionIsInvisible(section) {
-    let classes = await this.driver.findElement(section).getAttribute("class")
-    if (classes.search('section-visible') >= 0) {
-      return this.click(section)
+    let element = await this.waitForLocated(section)
+    let classes = await element.getAttribute("class")
+    if (classes && classes.search('section-visible') >= 0) {
+      return this.toggleSection(section)
     } else {
       return Promise.resolve(true)
     }
@@ -180,7 +193,35 @@ module.exports = class BasePage {
   }
   async getTableMini(tableLocator) {
     const table = await this.waitForDisplayed(tableLocator)
-    return this.getTableMiniUsingTableElement(table)    
+    return this.getTableMiniUsingTableElement(table)
+  }
+  // Reads every th/td fact row from all tables matched by locator (e.g. several
+  // sibling table.facts elements with no unique id), using plain getText() so it
+  // works whether a td's content is plain text (fmt_string) or a nested element.
+  async getFactsTables(locator) {
+    await this.waitForLocated(locator)
+    const tables = await this.driver.findElements(locator)
+    let facts = []
+    for (const table of tables) {
+      const rows = await table.findElements(By.css('tr'))
+      for (const row of rows) {
+        const th = await row.findElement(By.css('th'))
+        const td = await row.findElement(By.css('td'))
+        facts.push({ name: (await th.getText()).trim(), value: (await td.getText()).trim() })
+      }
+    }
+    return facts
+  }
+  async isSectionDisplayed(sectionName) {
+    return this.isDisplayed(By.xpath('//*[@id="main"]//h2[contains(text(), "' + sectionName + '")]'))
+  }
+
+  async isSubsectionDisplayed(subsectionName) {
+    return this.isDisplayed(By.xpath('//*[@id="main"]//h3[contains(text(), "' + subsectionName + '")]'))
+  }
+
+  async isSectionNotDisplayed(sectionName) {
+    return this.isElementNotVisible(By.xpath('//*[@id="main"]//h2[contains(text(), "' + sectionName + '")]'))
   }
   async getTableMiniUsingTableElement(table) {
     let tbody = await table.findElement(By.css('tbody'))
@@ -247,21 +288,24 @@ module.exports = class BasePage {
     }
     return table_model
   }
+  async getMainHeadingText() {
+    return this.getText(MAIN_HEADING)
+  }
+
   async isPopupWarningDisplayed() {
     try  {      
-      let element = await this.driver.findElement(FORM_POPUP_WARNING)
-      return element.isDisplayed()
+      let element = await this.waitForDisplayed(FORM_POPUP_WARNING)
+      return await element.isDisplayed()
     } catch(e) {
-      return Promise.resolve(false)
+      return false
     }  
   }
-   async isPopupInfoDisplayed() {
+  async isPopupInfoDisplayed() {
     try  {      
-      let element = await this.driver.findElement(FORM_POPUP_INFO)
-      return element.isDisplayed()
+      let element = await this.waitForDisplayed(FORM_POPUP_INFO)
+      return await element.isDisplayed()
     } catch(e) {
-      console.error("isPopupInfoDisplayed failed due to " + e)
-      return Promise.resolve(false)
+      return false
     }  
   }
   async isPopupWarningNotDisplayed() {
@@ -285,16 +329,16 @@ module.exports = class BasePage {
     }
   }
   async getPopupWarning() {
-    let element = await this.driver.findElement(FORM_POPUP_WARNING)
-    return this.driver.wait(until.elementIsVisible(element), this.timeout,
-      'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] awaiting till visible ' + element,
-      this.polling).getText().then((value) => value.substring(0, value.search('\n\nClose')))
+    let element = await this.waitForDisplayed(FORM_POPUP_WARNING)
+    let value = await element.getText()
+    const closeIdx = value.search('\n\nClose')
+    return closeIdx >= 0 ? value.substring(0, closeIdx) : value
   }
   async getPopupInfo() {
-    let element = await this.driver.findElement(FORM_POPUP_INFO)
-    return this.driver.wait(until.elementIsVisible(element), this.timeout,
-      'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] awaiting till visible ' + element,
-      this.polling).getText().then((value) => value.substring(0, value.search('\n\nClose')))
+    let element = await this.waitForDisplayed(FORM_POPUP_INFO)
+    let value = await element.getText()
+    const closeIdx = value.search('\n\nClose')
+    return closeIdx >= 0 ? value.substring(0, closeIdx) : value
   }
   async closePopupWarning() {
     return this.click(FORM_POPUP_WARNING_CLOSE_BUTTON)
@@ -335,7 +379,7 @@ module.exports = class BasePage {
 
   async isDisplayed(locator) {
       try {
-        let element = await this.driver.findElement(locator)
+        let element = await this.waitForLocated(locator)
 
         return this.driver.wait(until.elementIsVisible(element), this.timeout,
           'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] awaiting till visible ' + element,
@@ -447,10 +491,24 @@ module.exports = class BasePage {
 
   async click (locator) {
     if (this.interactionDelay) await this.driver.sleep(this.interactionDelay)
-    return this.retryOnStale(async () => {
-      const element = await this.waitForDisplayed(locator)
-      return element.click()
-    })
+    let attempts = 3
+    let lastError
+    do {
+      try {
+        return await this.retryOnStale(async () => {
+          const element = await this.waitForDisplayed(locator)
+          return element.click()
+        })
+      } catch (error) {
+        if (error.name && error.name.includes('ElementClickInterceptedError')) {
+          lastError = error
+          if (attempts > 1) await this.driver.sleep(this.polling)
+        } else {
+          throw error
+        }
+      }
+    } while (--attempts > 0)
+    throw lastError
   }
 
   async submit (locator) {
@@ -461,6 +519,7 @@ module.exports = class BasePage {
   async sendKeys (locator, keys) {
     return this.retryOnStale(async () => {
       const element = await this.waitForDisplayed(locator)
+      await this.scrollTo(element)
       await element.click()
       await element.clear()
       return element.sendKeys(keys)
@@ -479,6 +538,13 @@ module.exports = class BasePage {
     const alert = await this.driver.switchTo().alert();
     await this.driver.sleep(250)
     return alert.accept();
+  }
+  async dismissAlert () {
+    await this.driver.wait(until.alertIsPresent(), this.timeout);
+    await this.driver.sleep(250)
+    const alert = await this.driver.switchTo().alert();
+    await this.driver.sleep(250)
+    return alert.dismiss();
   }
 
   capture () {

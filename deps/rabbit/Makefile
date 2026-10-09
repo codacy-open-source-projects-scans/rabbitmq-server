@@ -8,6 +8,7 @@ PROJECT_REGISTERED = rabbit_amqqueue_sup \
 
 define PROJECT_ENV
 [
+	    {listeners_startup_delay, 0},
 	    {tcp_listeners, [5672]},
 	    {num_tcp_acceptors, 10},
 	    {ssl_listeners, []},
@@ -84,6 +85,7 @@ define PROJECT_ENV
 	    %% 30 minutes
 	    {consumer_timeout, 1800000},
 	    {consumer_disconnected_timeout, 60000},
+	    {consumer_timeout_response, notify_consumer},
 
 	    %% used by rabbit_peer_discovery_classic_config
 	    {cluster_nodes, {[], disc}},
@@ -126,7 +128,7 @@ LOCAL_DEPS = sasl os_mon inets compiler public_key crypto ssl syntax_tools
 
 BUILD_DEPS = rabbitmq_cli
 DEPS = ranch cowlib rabbit_common amqp10_common rabbitmq_prelaunch ra sysmon_handler stdout_formatter recon redbug observer_cli osiris syslog systemd seshat khepri khepri_mnesia_migration cuttlefish gen_batch_server
-TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers meck proper amqp_client rabbitmq_amqp_client rabbitmq_amqp1_0
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers meck proper amqp_client rabbitmq_amqp_client
 
 PLT_APPS += mnesia runtime_tools
 
@@ -236,39 +238,42 @@ define ct_master.erl
 	peer:call(Pid2, persistent_term, put, [rabbit_ct_tcp_port_base, 20000]),
 	peer:call(Pid3, persistent_term, put, [rabbit_ct_tcp_port_base, 24000]),
 	peer:call(Pid4, persistent_term, put, [rabbit_ct_tcp_port_base, 28000]),
-	[{[_], {ok, Results}}] = ct_master_fork:run("$1"),
+	[{[_], {ok, Results, EventFailed}}] = ct_master_fork:run("$1"),
 	peer:stop(Pid4),
 	peer:stop(Pid3),
 	peer:stop(Pid2),
 	peer:stop(Pid1),
-	lists:foldl(fun
-		({_, {_, 0, {_, 0}}}, Err) -> Err + 1;
-		(What, Peer) -> halt(Peer)
-	end, 1, Results),
-	halt(0)
+	NodeFailed = lists:any(fun
+		({_, {_, 0, {_, 0}}}) -> false;
+		(_) -> true
+	end, Results),
+	case NodeFailed orelse EventFailed =/= [] of
+		true -> halt(1);
+		false -> halt(0)
+	end
 endef
 
-PARALLEL_CT_SET_1_A = unit_rabbit_ssl unit_cluster_formation_locking_mocks unit_cluster_formation_sort_nodes unit_collections unit_config_value_encryption unit_connection_tracking
-PARALLEL_CT_SET_1_B = amqp_address amqp_auth amqp_filter_prop amqp_filter_sql amqp_filter_sql_unit amqp_dotnet signal_handling single_active_consumer unit_access_control_authn_authz_context_propagation unit_access_control_credential_validation unit_amqp091_content_framing unit_amqp091_server_properties unit_app_management
-PARALLEL_CT_SET_1_C = amqp_proxy_protocol amqpl_consumer_ack bindings rabbit_db_maintenance rabbit_db_msup rabbit_db_policy rabbit_db_queue rabbit_db_topic_exchange cluster_limit cluster_minority default_queue_type_prop term_to_binary_compat_prop topic_permission unicode unit_access_control user_tags_count_limit
-PARALLEL_CT_SET_1_D = amqqueue_backward_compatibility channel_interceptor channel_operation_timeout classic_queue_prop config_schema peer_discovery_dns peer_discovery_tmp_hidden_node per_node_limit per_user_connection_channel_limit
+PARALLEL_CT_SET_1_A = unit_definitions_import_https unit_rabbit_networking unit_rabbit_ssl unit_networking_ssl_options_overrides unit_cluster_formation_locking_mocks unit_cluster_formation_sort_nodes unit_collections unit_config_value_encryption unit_connection_tracking unit_amqp_reader unit_queue_decorator unit_stream_arg_validation unix_domain_socket vhost_tracing vhost_tracing_prop
+PARALLEL_CT_SET_1_B = amqp_address amqp_auth amqp_filter_prop amqp_filter_sql amqp_filter_sql_prop amqp_filter_sql_unit amqp_dotnet server_named_queue_prefix_prop signal_handling single_active_consumer unit_access_control_authn_authz_context_propagation unit_access_control_credential_validation unit_amqp091_content_framing unit_amqp091_server_properties unit_amqp_management unit_app_management rabbit_direct
+PARALLEL_CT_SET_1_C = amqp_proxy_protocol amqpl_consumer_ack bindings rabbit_db_maintenance rabbit_db_msup rabbit_db_policy rabbit_db_queue rabbit_db_topic_exchange cluster_limit cluster_minority default_queue_type_prop passive_declare_permission term_to_binary_compat_prop topic_binding_validation_prop topic_permission unit_topic_binding_validation unicode unit_access_control user_tags_count_limit
+PARALLEL_CT_SET_1_D = amqqueue_backward_compatibility channel channel_interceptor channel_operation_timeout classic_queue_prop config_schema peer_discovery_dns peer_discovery_tmp_hidden_node per_node_limit per_user_connection_channel_limit server_named_queue_prefix
 
-PARALLEL_CT_SET_2_A = cluster confirms_rejects consumer_timeout rabbit_access_control rabbit_confirms rabbit_core_metrics_gc rabbit_cuttlefish rabbit_db_binding rabbit_db_exchange
-PARALLEL_CT_SET_2_B = crashing_queues deprecated_features direct_exchange_routing_v2 disconnect_detected_during_alarm exchanges unit_gen_server2
+PARALLEL_CT_SET_2_A = cluster confirms_rejects consumer_timeout rabbit_access_control rabbit_confirms rabbit_core_metrics_gc rabbit_cuttlefish rabbit_db_binding rabbit_db_binding_prop rabbit_db_exchange
+PARALLEL_CT_SET_2_B = crashing_queues deprecated_features direct_exchange_routing_v2 disconnect_detected_during_alarm exchanges unit_fifo_client unit_gen_server2
 PARALLEL_CT_SET_2_C = disk_monitor dynamic_qq unit_disk_monitor unit_log_management unit_operator_policy prevent_startup_if_node_was_reset
 PARALLEL_CT_SET_2_D = queue_length_limits queue_parallel quorum_queue_member_reconciliation rabbit_fifo rabbit_fifo_dlx rabbit_stream_coordinator
 
-PARALLEL_CT_SET_3_A = unit_definitions definition_import per_user_connection_channel_limit_partitions per_vhost_connection_limit_partitions policy priority_queue_recovery rabbit_fifo_v0 rabbit_stream_sac_coordinator_v4 rabbit_stream_sac_coordinator unit_credit_flow unit_queue_consumers unit_queue_location unit_quorum_queue unit_rabbit_khepri_migrations
+PARALLEL_CT_SET_3_A = unit_definitions definition_import per_user_connection_channel_limit_partitions per_vhost_connection_limit_partitions policy priority_queue_recovery rabbit_fifo_v0 rabbit_stream_sac_coordinator_v4 rabbit_stream_sac_coordinator unit_credit_flow unit_queue_consumers unit_queue_location unit_quorum_queue unit_rabbit_khepri_migrations unit_server_named_queue
 PARALLEL_CT_SET_3_B = list_consumers_sanity_check list_queues_online_and_offline logging lqueue rabbit_fifo_q rabbit_fifo_pq
 PARALLEL_CT_SET_3_C = cli_forget_cluster_node mc_unit message_size_limit
 PARALLEL_CT_SET_3_D = metrics mirrored_supervisor proxy_protocol runtime_parameters unit_rabbit_vm unit_stats_and_metrics unit_supervisor2 unit_vm_memory_monitor
 
 PARALLEL_CT_SET_4_A = clustering_events rabbit_local_random_exchange rabbit_msg_interceptor rabbitmq_4_0_deprecations unit_pg_local unit_plugin_directories unit_plugin_versioning unit_policy_validators unit_priority_queue
-PARALLEL_CT_SET_4_B = per_user_connection_tracking per_vhost_connection_limit rabbit_fifo_int unit_default_queue_type
+PARALLEL_CT_SET_4_B = per_user_connection_tracking per_vhost_connection_limit rabbit_fifo_int unit_default_queue_type unit_queue_type_discover
 PARALLEL_CT_SET_4_C = msg_size_metrics unit_msg_size_metrics per_vhost_msg_store per_vhost_queue_limit priority_queue upgrade_preparation vhost
-PARALLEL_CT_SET_4_D = per_user_connection_channel_tracking product_info queue_type rabbitmq_queues_cli_integration rabbitmq_streams_cli_integration rabbitmqctl_integration rabbitmqctl_shutdown routing rabbit_amqqueue
+PARALLEL_CT_SET_4_D = consumers_cli_integration per_user_connection_channel_tracking product_info queue_type rabbitmq_queues_cli_integration rabbitmq_streams_cli_integration rabbitmqctl_integration rabbitmqctl_shutdown routing rabbit_amqqueue unix_domain_socket_cli_integration
 
-PARALLEL_CT_SET_5_A = consumer_recheck_prop rabbit_direct_reply_to_prop rabbit_quorum_queue_prop direct_reply_to_amqpl direct_reply_to_amqp classic_queue
+PARALLEL_CT_SET_5_A = amqp10_connection_max unit_amqp10_connection_max consumer_recheck_prop cuttlefish_datatype_migration pid_codec pid_codec_prop rabbit_direct_reply_to_prop rabbit_volatile_queue rabbit_quorum_queue_prop prop_stream_arg_validation prop_rabbit_cuttlefish direct_reply_to_amqpl direct_reply_to_amqp classic_queue rabbit_sole_conn rabbit_sole_conn_cluster
 PARALLEL_CT_SET_5_B = feature_flags_v2 backing_queue transactions
 PARALLEL_CT_SET_5_C = cluster_upgrade maintenance_mode
 PARALLEL_CT_SET_5_D = rabbit_fifo_dlx_integration publisher_confirms_parallel rabbit_exchange_type_modulus_hash
@@ -279,7 +284,7 @@ PARALLEL_CT_SET_3 = $(sort $(PARALLEL_CT_SET_3_A) $(PARALLEL_CT_SET_3_B) $(PARAL
 PARALLEL_CT_SET_4 = $(sort $(PARALLEL_CT_SET_4_A) $(PARALLEL_CT_SET_4_B) $(PARALLEL_CT_SET_4_C) $(PARALLEL_CT_SET_4_D))
 PARALLEL_CT_SET_5 = $(sort $(PARALLEL_CT_SET_5_A) $(PARALLEL_CT_SET_5_B) $(PARALLEL_CT_SET_5_C) $(PARALLEL_CT_SET_5_D))
 
-SEQUENTIAL_CT_SUITES = amqp_client clustering_management clustering_recovery dead_lettering feature_flags metadata_store_clustering quorum_queue rabbit_stream_queue rabbit_fifo_prop peer_discovery_classic_config
+SEQUENTIAL_CT_SUITES = amqp_client clustering_management clustering_recovery dead_lettering feature_flags metadata_store_clustering quorum_queue rabbit_stream_queue rabbit_fifo_prop peer_discovery_classic_config amqp_connection_uniqueness amqp_connection_uniqueness_partitions
 PARALLEL_CT_SUITES = $(PARALLEL_CT_SET_1) $(PARALLEL_CT_SET_2) $(PARALLEL_CT_SET_3) $(PARALLEL_CT_SET_4) $(PARALLEL_CT_SET_5)
 
 ifeq ($(filter-out $(SEQUENTIAL_CT_SUITES) $(PARALLEL_CT_SUITES),$(CT_SUITES)),)

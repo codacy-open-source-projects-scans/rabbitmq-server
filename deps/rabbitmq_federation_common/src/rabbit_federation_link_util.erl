@@ -23,7 +23,7 @@
          connection_close_timeout/0]).
 
 %% temp
--export([connection_error/6]).
+-export([connection_error/6, handle_connection_exit/5]).
 
 -import(rabbit_misc, [pget/2]).
 
@@ -52,11 +52,9 @@ start_conn_ch(Fun, OUpstream, OUParams,
             case open_monitor(UParams#upstream_params.params, ConnName) of
                 {ok, Conn, Ch} ->
                     %% Don't trap exits until we have established
-                    %% connections so that if we try to delete
-                    %% federation upstreams while waiting for a
-                    %% connection to be established then we don't
-                    %% block
-                    process_flag(trap_exit, true),
+                    %% connections and performed initial setup, so
+                    %% that supervisor shutdown can terminate this
+                    %% process immediately if it blocks during setup.
                     try
                         R = Fun(Conn, Ch, DConn, DCh),
                         ?LOG_INFO("Federation ~ts connected to ~ts",
@@ -65,6 +63,7 @@ start_conn_ch(Fun, OUpstream, OUParams,
                         Name = pget(name, amqp_connection:info(DConn, [name])),
                         rabbit_federation_status:report(
                           OUpstream, OUParams, XorQName, {running, Name}),
+                        process_flag(trap_exit, true),
                         R
                     catch exit:E ->
                             %% terminate/2 will not get this, as we
@@ -124,13 +123,14 @@ open(Params, Name) ->
         _:E -> E
     end.
 
-ensure_channel_closed(Ch) -> catch amqp_channel:close(Ch).
+ensure_channel_closed(Ch) ->
+    try amqp_channel:close(Ch) catch _:_ -> ok end.
 
 ensure_connection_closed(Conn) ->
     ensure_connection_closed(Conn, ?CONNECTION_OPEN_TIMEOUT).
 
 ensure_connection_closed(Conn, Timeout) ->
-    catch amqp_connection:close(Conn, Timeout).
+    try amqp_connection:close(Conn, Timeout) catch _:_ -> ok end.
 
 -spec ensure_connection_closed_async(pid() | undefined) -> ok.
 ensure_connection_closed_async(Conn) ->
@@ -196,6 +196,20 @@ connection_error(local_start, E, Upstream, UParams, XorQName, State) ->
     ?LOG_WARNING("Federation ~ts did not connect locally~n~tp", [rabbit_misc:rs(XorQName), E]),
     {stop, {shutdown, restart}, State}.
 
+%% The AMQP 0-9-1 client wraps expected connection failures such as
+%% `heartbeat_timeout` in 'shutdown' to avoid massive supervisor reports
+%% logged. `supervisor2` does not restart a transient child that stops
+%% with a `{shutdown, _}` reason, so request an explicit restart.
+handle_connection_exit({shutdown, Reason}, Upstream, UParams, XorQName, State)
+  when Reason =:= heartbeat_timeout;
+       Reason =:= socket_closed_unexpectedly ->
+    connection_error(remote, Reason, Upstream, UParams, XorQName, State);
+handle_connection_exit({shutdown, {socket_error, _} = Reason},
+                       Upstream, UParams, XorQName, State) ->
+    connection_error(remote, Reason, Upstream, UParams, XorQName, State);
+handle_connection_exit(Reason, _Upstream, _UParams, _XorQName, State) ->
+    {stop, Reason, State}.
+
 %% If we terminate due to a gen_server call exploding (almost
 %% certainly due to an amqp_channel:call() exploding) then we do not
 %% want to report the gen_server call in our status.
@@ -210,9 +224,16 @@ unacked_new() -> gb_trees:empty().
 
 ack(#'basic.ack'{delivery_tag = Seq,
                  multiple     = Multiple}, Ch, Unack) ->
-    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = gb_trees:get(Seq, Unack),
-                                       multiple     = Multiple}),
-    remove_delivery_tags(Seq, Multiple, Unack).
+    case gb_trees:lookup(Seq, Unack) of
+        {value, Tag} ->
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = Tag,
+                                               multiple     = Multiple}),
+            remove_delivery_tags(Seq, Multiple, Unack);
+        none ->
+            ?LOG_WARNING("Federation link received a confirm ack for an "
+                         "unknown delivery tag: ~tp", [Seq]),
+            Unack
+    end.
 
 
 %% Note: at time of writing the broker will never send requeue=false. And it's
@@ -220,10 +241,17 @@ ack(#'basic.ack'{delivery_tag = Seq,
 nack(#'basic.nack'{delivery_tag = Seq,
                    multiple     = Multiple,
                    requeue      = Requeue}, Ch, Unack) ->
-    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = gb_trees:get(Seq, Unack),
-                                        multiple     = Multiple,
-                                        requeue      = Requeue}),
-    remove_delivery_tags(Seq, Multiple, Unack).
+    case gb_trees:lookup(Seq, Unack) of
+        {value, Tag} ->
+            amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = Tag,
+                                                multiple     = Multiple,
+                                                requeue      = Requeue}),
+            remove_delivery_tags(Seq, Multiple, Unack);
+        none ->
+            ?LOG_WARNING("Federation link received a confirm nack for an "
+                         "unknown delivery tag: ~tp", [Seq]),
+            Unack
+    end.
 
 remove_delivery_tags(Seq, false, Unacked) ->
     gb_trees:delete(Seq, Unacked);
@@ -351,7 +379,8 @@ disposable_connection_call(Params, Method, ErrFun) ->
 
 disposable_connection_call(Params, Method, ErrFun, Timeout) ->
     try
-        ?LOG_DEBUG("Disposable connection parameters: ~tp", [Params]),
+        ?LOG_DEBUG("Disposable connection parameters: ~tp",
+                   [rabbit_federation_util:redact_params(Params)]),
         case open(Params, <<"Disposable exchange federation link connection">>) of
             {ok, Conn, Ch} ->
                 try

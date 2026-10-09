@@ -57,10 +57,14 @@ session_expiry_reconnect_non_zero(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 session_expiry_reconnect_zero(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 session_expiry_reconnect_infinity_to_zero(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 zero_session_expiry_disconnect_autodeletes_qos0_queue(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+stale_qos0_queue_delete_does_not_delete_reconnected_client_queue(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+stale_qos0_queue_deleted_after_metadata_store_timeout(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+stale_qos0_queue_deleted_after_plugin_restart(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 client_publish_qos2(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 client_rejects_publish(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 client_receive_maximum_min(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 client_receive_maximum_large(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+client_receive_maximum_invalid(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 unsubscribe_success(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 unsubscribe_topic_not_found(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 subscription_option_no_local(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
@@ -87,6 +91,7 @@ publish_property_content_type(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 publish_property_payload_format_indicator(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 publish_property_response_topic_correlation_data(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 publish_property_user_property(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+publish_property_not_applicable(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 disconnect_with_will(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 will_qos2(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 will_delay_greater_than_session_expiry(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
@@ -100,6 +105,7 @@ will_delay_message_expiry(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 will_delay_message_expiry_publish_properties(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 will_delay_properties(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 will_properties(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+will_property_not_applicable(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 retain_properties(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 topic_alias_client_to_server(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 topic_alias_server_to_client(Config) -> v5_SUITE:?FUNCTION_NAME(Config).

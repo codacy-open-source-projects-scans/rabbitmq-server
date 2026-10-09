@@ -41,6 +41,8 @@ all() ->
      {group, cluster_size_3_parallel_3},
      {group, cluster_size_3_parallel_4},
      {group, cluster_size_3_parallel_5},
+     {group, cluster_size_3_max_length_bytes},
+     {group, cluster_size_3_initial_offset},
      {group, unclustered_size_3_1},
      {group, unclustered_size_3_2},
      {group, unclustered_size_3_3},
@@ -55,7 +57,7 @@ groups() ->
        format]},
      {single_node_parallel_1, [parallel], all_tests_1()},
      {single_node_parallel_2, [parallel], all_tests_2()},
-     {single_node_parallel_3, [parallel], all_tests_3()},
+     {single_node_parallel_3, [parallel], all_tests_3() ++ [max_length_bytes]},
      {single_node_parallel_4, [parallel], all_tests_4()},
      {cluster_size_2, [], [recover]},
      {cluster_size_2_parallel_1, [parallel], all_tests_1()},
@@ -98,6 +100,9 @@ groups() ->
      {cluster_size_3_parallel_3, [parallel], all_tests_2()},
      {cluster_size_3_parallel_4, [parallel], all_tests_3()},
      {cluster_size_3_parallel_5, [parallel], all_tests_4()},
+     {cluster_size_3_max_length_bytes, [], [max_length_bytes]},
+     {cluster_size_3_initial_offset, [shuffle], [initial_offset,
+                                                 initial_offset_zero]},
      {unclustered_size_3_1, [], [add_replica]},
      {unclustered_size_3_2, [], [consume_without_local_replica]},
      {unclustered_size_3_3, [], [grow_coordinator_cluster]},
@@ -108,6 +113,7 @@ all_tests_1() ->
     [
      declare_args,
      declare_max_age,
+     declare_max_age_equivalence,
      declare_invalid_properties,
      declare_server_named,
      declare_invalid_arg,
@@ -147,7 +153,6 @@ all_tests_3() ->
      consume_cancel_should_create_events,
      receive_basic_cancel_on_queue_deletion,
      keep_consuming_on_leader_restart,
-     max_length_bytes,
      max_age,
      invalid_policy,
      max_age_policy
@@ -155,6 +160,7 @@ all_tests_3() ->
 
 all_tests_4() ->
     [
+     initial_offset_requires_feature_flag,
      max_segment_size_bytes_validation,
      max_segment_size_bytes_policy,
      max_segment_size_bytes_policy_validation,
@@ -189,6 +195,20 @@ init_per_group(cluster_size_3_parallel = Group, Config) ->
         _ ->
             init_per_group1(Group, Config)
     end;
+init_per_group(cluster_size_3_initial_offset = Group, Config) ->
+    case init_per_group1(Group, Config) of
+        {skip, _} = Skip ->
+            Skip;
+        Config1 ->
+            case rabbit_ct_broker_helpers:enable_feature_flag(
+                   Config1, 'rabbitmq_4.4.0') of
+                ok ->
+                    Config1;
+                {skip, _} = Skip ->
+                    _ = end_per_group(Group, Config1),
+                    Skip
+            end
+    end;
 init_per_group(Group, Config) ->
     init_per_group1(Group, Config).
 
@@ -210,6 +230,8 @@ init_per_group1(Group, Config) ->
                       cluster_size_3_parallel_3 -> 3;
                       cluster_size_3_parallel_4 -> 3;
                       cluster_size_3_parallel_5 -> 3;
+                      cluster_size_3_max_length_bytes -> 3;
+                      cluster_size_3_initial_offset -> 3;
                       cluster_size_3_1 -> 3;
                       cluster_size_3_2 -> 3;
                       cluster_size_3_3 -> 3;
@@ -237,16 +259,30 @@ init_per_group1(Group, Config) ->
                    _ ->
                        Config1
                end,
-    Config1c = rabbit_ct_helpers:merge_app_env(
-                 Config1b, {rabbit, [{forced_feature_flags_on_init, [
-                                                                     restart_streams,
-                                                                     stream_sac_coordinator_unblock_group,
-                                                                     stream_update_config_command,
-                                                                     stream_filtering,
-                                                                     message_containers,
-                                                                     quorum_queue_non_voters
-                                                                    ]}]}),
-    Ret = rabbit_ct_helpers:run_steps(Config1c,
+    Config1c = case Group of
+                   cluster_size_3_initial_offset ->
+                       Config1b;
+                   _ ->
+                       rabbit_ct_helpers:merge_app_env(
+                         Config1b, {rabbit, [{forced_feature_flags_on_init, [
+                                                                             restart_streams,
+                                                                             stream_sac_coordinator_unblock_group,
+                                                                             stream_update_config_command,
+                                                                             stream_filtering,
+                                                                             message_containers,
+                                                                             quorum_queue_non_voters
+                                                                            ]}]})
+               end,
+    Config1d = case Group of
+                   cluster_size_3_max_length_bytes ->
+                       %% In `max_length_bytes/1`, retention can delete a segment before
+                       %% the replica reader sends it. The replica exits and is restarted.
+                       rabbit_ct_helpers:set_config(
+                         Config1c, {ignored_crashes, ["accept_chunk_out_of_order"]});
+                   _ ->
+                       Config1c
+               end,
+    Ret = rabbit_ct_helpers:run_steps(Config1d,
                                       [fun merge_app_env/1 ] ++
                                       rabbit_ct_broker_helpers:setup_steps()),
     case Ret of
@@ -344,11 +380,56 @@ declare_max_age(Config) ->
                [{<<"x-queue-type">>, longstr, <<"stream">>},
                 {<<"x-max-age">>, longstr, <<"1A">>}])),
 
+    %% "D" has no leading digits; must return a clean error, not crash
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Config, Server, Q,
+               [{<<"x-queue-type">>, longstr, <<"stream">>},
+                {<<"x-max-age">>, longstr, <<"D">>}])),
+
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                              {<<"x-max-age">>, longstr, <<"1Y">>}])),
     assert_queue_type(Server, Q, rabbit_stream_queue),
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
+
+declare_max_age_equivalence(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Q = ?config(queue_name, Config),
+    %% Use a distinct name for the second scenario instead of deleting and
+    %% recreating Q: queue_coarse_metrics is keyed by queue name and refreshed
+    %% periodically (stream_tick_interval), so reusing a just-deleted name can
+    %% observe stale message counts from the previous incarnation.
+    Q2 = <<Q/binary, "_2">>,
+
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                             {<<"x-max-age">>, longstr, <<"1D">>}])),
+
+    %% "24h" is the same duration as "1D"; see rabbitmq/rabbitmq-server#8509
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                             {<<"x-max-age">>, longstr, <<"24h">>}])),
+
+    %% a genuinely different duration should still be rejected
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                   {<<"x-max-age">>, longstr, <<"2D">>}])),
+
+    assert_queue_type(Server, Q, rabbit_stream_queue),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]),
+
+    %% cover "1Y" and "365D" to introduce some assertion variation
+    ?assertEqual({'queue.declare_ok', Q2, 0, 0},
+                 declare(Config, Server, Q2, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                              {<<"x-max-age">>, longstr, <<"1Y">>}])),
+    ?assertEqual({'queue.declare_ok', Q2, 0, 0},
+                 declare(Config, Server, Q2, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                              {<<"x-max-age">>, longstr, <<"365D">>}])),
+
+    assert_queue_type(Server, Q2, rabbit_stream_queue),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q2]).
 
 declare_invalid_properties(Config) ->
     Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
@@ -402,11 +483,18 @@ declare_invalid_filter_size(Config) ->
     Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
     Q = ?config(queue_name, Config),
 
-    ExpectedError = <<"PRECONDITION_FAILED - Invalid value for  x-stream-filter-size-bytes">>,
+    ExpectedError = <<"PRECONDITION_FAILED - Invalid value for x-stream-filter-size-bytes">>,
     ?assertExit(
        {{shutdown, {server_initiated_close, 406, ExpectedError}}, _},
        declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
-                                   {<<"x-stream-filter-size-bytes">>, long, 256}])).
+                                   {<<"x-stream-filter-size-bytes">>, long, 256}])),
+
+    %% `x-stream-filter-size-bytes` is now in stream capabilities, so `check_non_neg_int_arg/2`
+    %% runs during declare argument validation and rejects non-integer types
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                   {<<"x-stream-filter-size-bytes">>, longstr, <<"128">>}])).
 
 consume_invalid_arg(Config) ->
     Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
@@ -502,12 +590,13 @@ add_replicas(Config) ->
 
     check_leader_and_replicas(Config, [Server0, Server1]),
 
-    %% it is almost impossible to reliably catch this situation.
-    %% increasing number of messages published and the data size could help
-    % ?assertMatch({error, {disallowed, out_of_sync_replica}} ,
-    ?assertMatch(ok ,
-                 rpc:call(Server0, rabbit_stream_queue, add_replica,
-                          [<<"/">>, Q, Server2])),
+    %% On a mixed-version or loaded CI, the new replica may briefly be
+    %% reported as out of sync. Poll until it catches up and
+    %% `rabbit_stream_queue:add_replica/3` succeeds.
+    ?awaitMatch(ok,
+                rpc:call(Server0, rabbit_stream_queue, add_replica,
+                         [<<"/">>, Q, Server2]),
+                30_000),
     check_leader_and_replicas(Config, [Server0, Server1, Server2]),
 
     %% validate we can read the last entry
@@ -883,7 +972,7 @@ restart_single_node(Config) ->
 
     queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]]),
     Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
-    publish(Ch1, Q),
+    publish_confirm(Ch1, Q, [<<"msg">>]),
     queue_utils:wait_for_messages(Config, [[Q, <<"2">>, <<"2">>, <<"0">>]]),
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
 
@@ -960,7 +1049,7 @@ recover(Config) ->
     queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]], 60),
 
     Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
-    publish(Ch1, Q),
+    publish_confirm(Ch1, Q, [<<"msg">>]),
     queue_utils:wait_for_messages(Config, [[Q, <<"2">>, <<"2">>, <<"0">>]]),
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
 
@@ -1948,10 +2037,11 @@ max_length_bytes(Config) ->
 
     Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
     Q = ?config(queue_name, Config),
+    %% Fewer segments means less churn that can make the test flaky.
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                              {<<"x-max-length-bytes">>, long, 10000},
-                                             {<<"x-stream-max-segment-size-bytes">>, long, 1000}])),
+                                             {<<"x-stream-max-segment-size-bytes">>, long, 5000}])),
 
     Payload = << <<"1">> || _ <- lists:seq(1, 100) >>,
 
@@ -1962,6 +2052,9 @@ max_length_bytes(Config) ->
     publish_confirm(Ch, Q, [Payload || _ <- lists:seq(1, 100)]),
     publish_confirm(Ch, Q, [Payload || _ <- lists:seq(1, 100)]),
     ensure_retention_applied(Config, Server),
+    ?awaitMatch([Offset] when is_integer(Offset),
+                lists:usort(member_offsets(Config, Server, Q)),
+                30_000),
 
     %% We don't yet have reliable metrics, as the committed offset doesn't work
     %% as a counter once we start applying retention policies.
@@ -1970,9 +2063,72 @@ max_length_bytes(Config) ->
     qos(Ch1, 100, false),
     subscribe(Ch1, Q, false, 0),
 
-    %% There should be ~100 messages in ~10 segments, but less check that the retention
-    %% cleared just a big bunch
+    %% Retention should leave roughly 100 of the 500 published messages.
     ?assert(length(receive_batch()) < 200),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
+
+initial_offset_requires_feature_flag(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Q = ?config(queue_name, Config),
+    %% this group pins an old feature flag baseline
+    ?assertNot(rabbit_ct_broker_helpers:is_feature_flag_enabled(
+                 Config, 'rabbitmq_4.4.0')),
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Config, Server, Q,
+               [{<<"x-queue-type">>, longstr, <<"stream">>},
+                {<<"x-stream-initial-offset">>, long, 1000}])),
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Config, Server, Q,
+               [{<<"x-queue-type">>, longstr, <<"stream">>},
+                {<<"x-stream-initial-offset">>, long, 0}])),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
+
+initial_offset(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Config, Server, Q,
+                         [{<<"x-queue-type">>, longstr, <<"stream">>},
+                          {<<"x-stream-initial-offset">>, long, 1000}])),
+    queue_utils:wait_for_messages(Config, [[Q, <<"0">>, <<"0">>, <<"0">>]]),
+
+    publish_confirm(Ch, Q, [<<"msg">> || _ <- lists:seq(1, 5)]),
+    queue_utils:wait_for_messages(Config, [[Q, <<"5">>, <<"5">>, <<"0">>]]),
+
+    %% offset 0 is below the first offset and clamps to it
+    Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    qos(Ch1, 10, false),
+    subscribe(Ch1, Q, false, 0),
+    receive_batch(Ch1, 1000, 1004),
+    amqp_channel:call(Ch1, #'basic.cancel'{consumer_tag = <<"ctag">>}),
+
+    Ch2 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    qos(Ch2, 10, false),
+    subscribe(Ch2, Q, false, 1002),
+    receive_batch(Ch2, 1002, 1004),
+    amqp_channel:call(Ch2, #'basic.cancel'{consumer_tag = <<"ctag">>}),
+
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
+
+initial_offset_zero(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    %% an explicit 0 behaves like no initial offset at all
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Config, Server, Q,
+                         [{<<"x-queue-type">>, longstr, <<"stream">>},
+                          {<<"x-stream-initial-offset">>, long, 0}])),
+    publish_confirm(Ch, Q, [<<"msg">> || _ <- lists:seq(1, 3)]),
+    queue_utils:wait_for_messages(Config, [[Q, <<"3">>, <<"3">>, <<"0">>]]),
+    Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    qos(Ch1, 10, false),
+    subscribe(Ch1, Q, false, 0),
+    receive_batch(Ch1, 0, 2),
+    amqp_channel:call(Ch1, #'basic.cancel'{consumer_tag = <<"ctag">>}),
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
 
 max_segment_size_bytes_validation(Config) ->
@@ -2975,8 +3131,13 @@ rebalance(Config) ->
                                                    (_) -> true end,
                                                 NodeData)
                               end, Summary)
-                end, 10000),
+                end, 30000),
     ok.
+
+member_offsets(Config, Server, Q) ->
+    Status = rabbit_ct_broker_helpers:rpc(Config, Server, rabbit_stream_queue, status,
+                                          [<<"/">>, Q]),
+    [proplists:get_value(offset, Member) || Member <- Status].
 
 committed_chunk_id(Config) ->
     %% committed_offset value changed between versions in queue_info

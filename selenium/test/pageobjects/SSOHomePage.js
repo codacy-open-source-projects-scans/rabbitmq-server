@@ -37,9 +37,9 @@ module.exports = class SSOHomePage extends BasePage {
   async getLoginButton () {
     return this.getText(OAUTH2_LOGIN_BUTTON)
   }
-  async getLoginButtonOnClick () {
+  async getLoginButtonResourceId () {
     const element = await this.waitForDisplayed(OAUTH2_LOGIN_BUTTON);
-    return element.getAttribute('onClick');    
+    return element.getAttribute('data-resource-id');
   }
   async getLogoutButton () {
     return this.getText(LOGOUT_BUTTON)
@@ -81,12 +81,14 @@ module.exports = class SSOHomePage extends BasePage {
   async isOAuth2SectionNotVisible() {
     return this.isElementNotVisible(SECTION_LOGIN_WITH_OAUTH)
   }
-  
   async getOAuth2Section() {
     return this.waitForDisplayed(SECTION_LOGIN_WITH_OAUTH)
   }
   async isBasicAuthSectionVisible() {
     return this.isDisplayed(SECTION_LOGIN_WITH_BASIC_AUTH)
+  }
+  async isBasicAuthSectionNotVisible() {
+    return this.isElementNotVisible(SECTION_LOGIN_WITH_BASIC_AUTH)
   }
   async getBasicAuthSection() {
     return this.waitForDisplayed(SECTION_LOGIN_WITH_BASIC_AUTH)
@@ -114,6 +116,9 @@ module.exports = class SSOHomePage extends BasePage {
     } catch (e) {
       return Promise.resolve(false)
     }
+  }
+  async isWarningNotVisible () {
+    return this.isElementNotVisible(WARNING)
   }
   async getWarnings() {
     try

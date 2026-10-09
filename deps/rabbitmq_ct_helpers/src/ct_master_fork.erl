@@ -44,6 +44,10 @@
 %-doc "Filename of test spec to be executed.".
 -type test_spec() :: file:name_all().
 
+%-doc "The per-node counters do not count a case whose `end_per_testcase`
+%failed, so `Failed` lists those as well.".
+-type run_result() :: {'ok', Finished :: [term()], Failed :: [term()]}.
+
 -record(state, {node_ctrl_pids=[],
 		logdirs=[],
 		results=[],
@@ -51,7 +55,7 @@
 		blocked=[]
 		}).
 
--export_type([test_spec/0]).
+-export_type([test_spec/0, run_result/0]).
 
 %-doc """
 %Tests are spawned on `Node` using `ct:run_test/1`
@@ -156,7 +160,7 @@ run_test(NodeOptsList) when is_list(NodeOptsList) ->
 %the nodes in `InclNodes`. Nodes in the `ExclNodes` list are excluded from the
 %test.
 %""".
--spec run(TestSpecs, AllowUserTerms, InclNodes, ExclNodes) -> [{Specs, 'ok'} | {'error', Reason}]
+-spec run(TestSpecs, AllowUserTerms, InclNodes, ExclNodes) -> [{Specs, run_result()} | {'error', Reason}]
               when TestSpecs :: TestSpec | [TestSpec] | [[TestSpec]],
                    TestSpec :: test_spec(),
                    AllowUserTerms :: boolean(),
@@ -170,8 +174,14 @@ run([TS|TestSpecs],AllowUserTerms,InclNodes,ExclNodes) when is_list(TS),
     %% Note: [Spec] means run one test with Spec
     %%       [Spec1,Spec2] means run two tests separately
     %%       [[Spec1,Spec2]] means run one test, with the two specs merged
-    case catch ct_testspec:collect_tests_from_file([TS],InclNodes,
-						   AllowUserTerms) of
+    case try
+             ct_testspec:collect_tests_from_file([TS],InclNodes,
+                                                  AllowUserTerms)
+         catch
+             throw:Thrown -> Thrown;
+             exit:Reason0 -> {'EXIT', Reason0};
+             error:Reason0:Stacktrace -> {'EXIT', {Reason0, Stacktrace}}
+         end of
 	{error,Reason} ->
 	    [{error,Reason} | run(TestSpecs,AllowUserTerms,InclNodes,ExclNodes)];
 	Tests ->
@@ -195,7 +205,7 @@ run(TS,AllowUserTerms,InclNodes,ExclNodes) when is_list(InclNodes),
     run([TS],AllowUserTerms,InclNodes,ExclNodes).
 
 %-doc(#{equiv => run(TestSpecs, false, InclNodes, ExclNodes)}).
--spec run(TestSpecs, InclNodes, ExclNodes) -> [{Specs, 'ok'} | {'error', Reason}]
+-spec run(TestSpecs, InclNodes, ExclNodes) -> [{Specs, run_result()} | {'error', Reason}]
               when TestSpecs :: TestSpec | [TestSpec] | [[TestSpec]],
                    TestSpec :: test_spec(),
                    InclNodes :: [node()],
@@ -214,7 +224,7 @@ run(TestSpecs,InclNodes,ExclNodes) ->
 %Equivalent to [`run([TS], false, [], [])`](`run/4`) if
 %called with TS being string.
 %""".
--spec run(TestSpecs) -> [{Specs, 'ok'} | {'error', Reason}]
+-spec run(TestSpecs) -> [{Specs, run_result()} | {'error', Reason}]
               when TestSpecs :: TestSpec | [TestSpec] | [[TestSpec]],
                    TestSpec :: test_spec(),
                    Specs :: [file:filename_all()],
@@ -242,8 +252,14 @@ exclude_nodes([],RunSkipPerNode) ->
                    Specs :: [file:filename_all()],
                    Reason :: term().
 run_on_node([TS|TestSpecs],AllowUserTerms,Node) when is_list(TS),is_atom(Node) ->
-    case catch ct_testspec:collect_tests_from_file([TS],[Node],
-						   AllowUserTerms) of
+    case try
+             ct_testspec:collect_tests_from_file([TS],[Node],
+                                                  AllowUserTerms)
+         catch
+             throw:Thrown -> Thrown;
+             exit:Reason0 -> {'EXIT', Reason0};
+             error:Reason0:Stacktrace -> {'EXIT', {Reason0, Stacktrace}}
+         end of
 	{error,Reason} ->
 	    [{error,Reason} | run_on_node(TestSpecs,AllowUserTerms,Node)];
 	Tests ->
@@ -591,11 +607,11 @@ master_loop(#state{node_ctrl_pids=[],
     log(all,"Info","Updating log files",[]),
 
     %% Print the failed and auto skipped tests.
-    master_print_summary(),
+    #{failed := Failed} = master_print_summary(),
 
     ct_master_event_fork:stop(),
     ct_master_logs_fork:stop(),
-    {ok, Finished};
+    {ok, Finished, Failed};
 
 master_loop(State=#state{node_ctrl_pids=NodeCtrlPids,
 			 results=Results,
@@ -711,13 +727,13 @@ master_loop(State=#state{node_ctrl_pids=NodeCtrlPids,
     end.
 
 master_print_summary() ->
-    #{
+    Results = #{
         auto_skipped := AutoSkipped,
         failed := Failed
     } = ct_master_event_fork:get_results(),
     master_print_summary_for("Auto skipped test cases", AutoSkipped),
     master_print_summary_for("Failed test cases", Failed),
-    ok.
+    Results.
 
 master_print_summary_for(Title,List) ->
     _ = case List of
@@ -852,7 +868,13 @@ init_node_ctrl(MasterPid,Cookie,Opts) ->
     ct_event:add_handler([{master,MasterPid}]),
 
     %% log("Running test with options: ~tp~n", [Opts]),
-    Result = case (catch ct:run_test(Opts)) of
+    Result = case (try
+                       ct:run_test(Opts)
+                   catch
+                       throw:Thrown -> Thrown;
+                       exit:Reason -> {'EXIT', Reason};
+                       error:Reason:Stacktrace -> {'EXIT', {Reason, Stacktrace}}
+                   end) of
 		 ok -> finished_ok;
 		 Other -> Other
 	     end,

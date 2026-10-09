@@ -68,7 +68,7 @@ to_json(ReqData, Context = #context{user = User}) ->
                         V
                 end,
             Queue = rabbit_mgmt_util:id(queue, ReqData),
-            Publishers =
+            Publishers0 =
                 case {VHost, Queue} of
                     {VHost, none} ->
                         rabbit_mgmt_format:strip_pids(
@@ -81,6 +81,8 @@ to_json(ReqData, Context = #context{user = User}) ->
                         rabbit_mgmt_format:strip_pids(
                             rabbit_stream_mgmt_db:get_stream_publishers(QueueResource))
                 end,
+            Publishers = [rabbit_mgmt_format:clean_connection_details(I)
+                          || I <- Publishers0],
             rabbit_mgmt_util:reply_list(filter_user(Publishers, User),
                                         [],
                                         ReqData,
@@ -92,7 +94,8 @@ to_json(ReqData, Context = #context{user = User}) ->
     end.
 
 is_authorized(ReqData, Context) ->
-    rabbit_mgmt_util:is_authorized(ReqData, Context).
+    rabbit_mgmt_util:is_authorized_vhost_visible_for_monitoring(ReqData,
+                                                               Context).
 
 filter_user(List, #user{username = Username, tags = Tags}) ->
     case rabbit_mgmt_util:is_monitor(Tags) of

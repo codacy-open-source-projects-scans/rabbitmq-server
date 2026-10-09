@@ -516,7 +516,8 @@ vhost_is_created_with_default_user(Config) ->
     VHost = <<"vhost1">>,
     Username = <<"banana">>,
     Perm = "apple",
-    Tags = [arbitrary],
+    %% `internal_user:get_tags/1` always normalizes to binaries on read.
+    Tags = [<<"arbitrary">>],
     Pwd = "SECRET",
     Env = [{Username, [{<<"configure">>, Perm}, {<<"tags">>, [arbitrary]}, {<<"password">>, Pwd}]}],
     WantUser = [{user, Username},{tags, Tags}],
@@ -576,7 +577,9 @@ open_connections(Config, NodesAndVHosts) ->
 close_connections(Conns) ->
     lists:foreach(fun
       (Conn) ->
-          rabbit_ct_client_helpers:close_connection(Conn)
+          try rabbit_ct_client_helpers:close_connection(Conn)
+          catch _:_ -> ok
+          end
       end, Conns).
 
 count_connections_in(Config, VHost) ->

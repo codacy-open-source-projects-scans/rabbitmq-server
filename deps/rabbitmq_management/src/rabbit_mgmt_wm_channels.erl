@@ -26,23 +26,28 @@ content_types_provided(ReqData, Context) ->
    {rabbit_mgmt_util:responder_map(to_json), ReqData, Context}.
 
 to_json(ReqData, Context) ->
-    case rabbit_mgmt_util:disable_stats(ReqData) of
-        false ->
-            try
-                rabbit_mgmt_util:reply_list_or_paginate(augmented(ReqData, Context),
-                                                        ReqData, Context)
-            catch
-                {error, invalid_range_parameters, Reason} ->
-                    rabbit_mgmt_util:bad_request(iolist_to_binary(Reason), ReqData, Context)
-            end;
-        true ->
-            rabbit_mgmt_util:bad_request(<<"Stats in management UI are disabled on this node">>, ReqData, Context)
+    try
+        Channels = do_channels_query(ReqData, Context),
+        rabbit_mgmt_util:reply_list_or_paginate(Channels, ReqData, Context)
+    catch
+        {error, invalid_range_parameters, Reason} ->
+            rabbit_mgmt_util:bad_request(iolist_to_binary(Reason), ReqData, Context)
     end.
 
 is_authorized(ReqData, Context) ->
     rabbit_mgmt_util:is_authorized(ReqData, Context).
 
 augmented(ReqData, Context) ->
-    rabbit_mgmt_util:filter_conn_ch_list(
-      rabbit_mgmt_db:get_all_channels(
-        rabbit_mgmt_util:range(ReqData)), ReqData, Context).
+    [rabbit_mgmt_format:clean_connection_details(Ch)
+     || Ch <- rabbit_mgmt_util:filter_conn_ch_list(
+                rabbit_mgmt_db:get_all_channels(
+                  rabbit_mgmt_util:range(ReqData)), ReqData, Context)].
+
+do_channels_query(ReqData, Context) ->
+    case rabbit_mgmt_util:disable_stats(ReqData) of
+        false ->
+            augmented(ReqData, Context);
+        true ->
+            rabbit_mgmt_util:filter_conn_ch_list(
+              rabbit_mgmt_db:get_all_channels(), ReqData, Context)
+    end.

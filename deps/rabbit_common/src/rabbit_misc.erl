@@ -79,6 +79,7 @@
 -export([raw_read_file/1]).
 -export([strip_bom/1]).
 -export([find_child/2]).
+-export([shutdown_supervisor/1]).
 -export([is_regular_file/1]).
 -export([safe_ets_update_counter/3, safe_ets_update_counter/4, safe_ets_update_counter/5,
          safe_ets_update_element/3, safe_ets_update_element/4, safe_ets_update_element/5]).
@@ -210,8 +211,8 @@
                  {bad_edge, [digraph:vertex()]}),
                 digraph:vertex(), digraph:vertex()}).
 -spec const(A) -> thunk(A).
--spec ntoa(inet:ip_address()) -> string().
--spec ntoab(inet:ip_address()) -> string().
+-spec ntoa(any()) -> string() | {error, einval}.
+-spec ntoab(any()) -> string() | binary().
 -spec is_process_alive(pid()) -> boolean().
 
 -spec pmerge(term(), term(), [term()]) -> [term()].
@@ -489,7 +490,7 @@ ensure_ok({error, Reason}, ErrorTag) -> throw({error, {ErrorTag, Reason}}).
 tcp_name(Prefix, IPAddress, Port)
   when is_atom(Prefix) andalso is_number(Port) ->
     list_to_atom(
-      format("~w_~ts:~w", [Prefix, inet_parse:ntoa(IPAddress), Port])).
+      format("~w_~ts:~w", [Prefix, ntoa(IPAddress), Port])).
 
 format_inet_error(E) -> format("~w (~ts)", [E, format_inet_error0(E)]).
 
@@ -761,6 +762,11 @@ module_attributes_from_apps(Name, Apps) ->
             [[{App, Module} || Module <- Modules] ||
                 App           <- Apps,
                 {ok, Modules} <- [application:get_key(App, modules)]])),
+    Unloaded = [M || {_, M} <- Targets, not erlang:module_loaded(M)],
+    _ = case Unloaded of
+            [] -> ok;
+            _ -> code:ensure_modules_loaded(Unloaded)
+        end,
     lists:foldl(
       fun ({App, Module}, Acc) ->
               case lists:append([Atts || {N, Atts} <- module_attributes(Module),
@@ -793,11 +799,15 @@ const(X) -> fun () -> X end.
 
 %% Format IPv4-mapped IPv6 addresses as IPv4, since they're what we see
 %% when IPv6 is enabled but not used (i.e. 99% of the time).
+ntoa({local, Path}) ->
+    rabbit_data_coercion:to_unicode_charlist(Path);
 ntoa({0,0,0,0,0,16#ffff,AB,CD}) ->
     inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256});
 ntoa(IP) ->
     inet_parse:ntoa(IP).
 
+ntoab({local, Path}) ->
+    rabbit_data_coercion:to_utf8_binary(Path);
 ntoab(IP) ->
     Str = ntoa(IP),
     case string:str(Str, ":") of
@@ -983,7 +993,7 @@ os_cmd(Command) ->
             os:cmd(" " ++ Command);
         _ ->
             %% Don't just return "/bin/sh: <cmd>: not found" if not found
-            Exec = hd(string:tokens(Command, " ")),
+            Exec = hd(string:lexemes(Command, " ")),
             case os:find_executable(Exec) of
                 false -> throw({command_not_found, Exec});
                 _     -> os:cmd(Command)
@@ -1050,11 +1060,9 @@ otp_release() ->
                           erlang:system_info(otp_release), "OTP_VERSION"]),
     case raw_read_file(File) of
         {ok, VerBin} ->
-            %% 17.0 or later, we need the file for the minor version
-            string:strip(binary_to_list(VerBin), both, $\n);
+            string:trim(binary_to_list(VerBin), both, "\n");
         {error, _} ->
-            %% R16B03 or earlier (no file, otp_release is correct)
-            %% or we couldn't read the file (so this is best we can do)
+            %% The file could not be read; fall back to the major-only string.
             erlang:system_info(otp_release)
     end.
 
@@ -1062,7 +1070,7 @@ platform_and_version() ->
     string:join(["Erlang/OTP", otp_release()], " ").
 
 otp_system_version() ->
-    string:strip(erlang:system_info(system_version), both, $\n).
+    string:trim(erlang:system_info(system_version), both, "\n").
 
 crypto_lib_version() ->
     rabbit_runtime:crypto_lib_version().
@@ -1157,7 +1165,6 @@ get_proc_name() ->
             {ok, Name}
     end.
 
-%% application:get_env/3 is available in R16B01 or later.
 get_env(Application, Key, Def) ->
     application:get_env(Application, Key, Def).
 
@@ -1430,6 +1437,22 @@ find_child(Supervisor, Name) ->
     [Pid || {Name1, Pid, _Type, _Modules} <- supervisor:which_children(Supervisor),
             Name1 =:= Name].
 
+%% Must be called by the process that holds the link to SupPid.
+-spec shutdown_supervisor(pid()) -> ok.
+shutdown_supervisor(SupPid) when is_pid(SupPid) ->
+    MRef = erlang:monitor(process, SupPid),
+    unlink(SupPid),
+    exit(SupPid, shutdown),
+    receive
+        {'DOWN', MRef, process, SupPid, _} -> ok
+    after ?FAIR_WAIT ->
+        erlang:demonitor(MRef, [flush]),
+        ?LOG_WARNING(
+            "rabbit_misc:shutdown_supervisor/1 timed out waiting for ~tp to terminate",
+            [SupPid]),
+        ok
+    end.
+
 %% -------------------------------------------------------------------------
 %% Begin copypasta from gen_server2.erl
 
@@ -1512,7 +1535,7 @@ win32_cmd_receive(Port, MonRef, Acc0) ->
     end.
 
 win32_cmd_receive_finish(Port, MonRef) ->
-    catch erlang:port_close(Port),
+    try erlang:port_close(Port) catch _:_ -> ok end,
     flush_until_down(Port, MonRef).
 
 flush_until_down(Port, MonRef) ->

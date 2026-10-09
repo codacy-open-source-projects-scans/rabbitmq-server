@@ -66,7 +66,7 @@ defmodule RabbitMQ.CLI.Ctl.Commands.DecryptConfValueCommand do
   end
 
   def run([value], %{cipher: cipher, hash: hash, iterations: iterations} = opts) do
-    case Input.consume_single_line_string_with_prompt("Passphrase: ", opts) do
+    case Input.infer_password("Passphrase: ", opts) do
       :eof ->
         {:error, :not_enough_args}
 
@@ -90,8 +90,6 @@ defmodule RabbitMQ.CLI.Ctl.Commands.DecryptConfValueCommand do
           {:ok, result}
         catch
           _, _ ->
-            IO.inspect(__STACKTRACE__)
-
             {:error,
              "Failed to decrypt the value. Things to check: is the passphrase correct? Are the cipher and hash algorithms the same as those used for encryption?"}
         end
@@ -118,8 +116,6 @@ defmodule RabbitMQ.CLI.Ctl.Commands.DecryptConfValueCommand do
       {:ok, result}
     catch
       _, _ ->
-        IO.inspect(__STACKTRACE__)
-
         {:error,
          "Failed to decrypt the value. Things to check: is the passphrase correct? Are the cipher and hash algorithms the same as those used for encryption?"}
     end
@@ -168,9 +164,5 @@ defmodule RabbitMQ.CLI.Ctl.Commands.DecryptConfValueCommand do
     untagged_val = String.replace_prefix(bin_val, @prefix, "")
 
     {:encrypted, untagged_val}
-  end
-
-  defp tag_input_value_with_encrypted(value) do
-    {:encrypted, value}
   end
 end

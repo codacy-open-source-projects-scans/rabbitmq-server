@@ -23,7 +23,9 @@ groups() ->
                                 query_static_resource_test,
                                 add_idempotence_test,
                                 log_source_address_test,
-                                parse_ip_test
+                                log_authenticated_username_test,
+                                parse_ip_test,
+                                remove_frees_the_port_test
                                ]}
     ].
 
@@ -35,7 +37,7 @@ init_per_suite(Config) ->
     rabbit_ct_helpers:log_environment(),
     Config1 = rabbit_ct_helpers:set_config(Config, [
         {rmq_nodename_suffix, ?MODULE},
-        {rmq_extra_tcp_ports, [tcp_port_http_extra]}
+        {rmq_extra_tcp_ports, [tcp_port_http_extra, tcp_port_http_extra2]}
       ]),
     rabbit_ct_helpers:run_setup_steps(Config1,
       rabbit_ct_broker_helpers:setup_steps()).
@@ -66,7 +68,6 @@ query_static_resource_test(Config) ->
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, query_static_resource_test1, [Host, Port]).
 query_static_resource_test1(Host, Port) ->
     inets:start(),
-    %% TODO this is a fairly rubbish test, but not as bad as it was
     rabbit_web_dispatch:register_static_context(test, [{port, Port}],
                                                 "rabbit_web_dispatch_test",
                                                 ?MODULE, "test/priv/www", "Test"),
@@ -88,6 +89,24 @@ add_idempotence_test1(Port) ->
                             rabbit_web_dispatch_registry:list_all()])),
     passed.
 
+remove_frees_the_port_test(Config) ->
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_http_extra2),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, remove_frees_the_port_test1, [Port]).
+remove_frees_the_port_test1(Port) ->
+    F = fun(_Req) -> ok end,
+    L = {"/remove_me", "RemoveMe"},
+    Listener = [{port, Port}],
+    rabbit_web_dispatch_registry:add(remove_me, Listener, F, F, L),
+    rabbit_web_dispatch_registry:remove(remove_me),
+    ?assertEqual(
+       0, length([ok || {"/remove_me", _, _} <-
+                            rabbit_web_dispatch_registry:list_all()])),
+    %% N.B. claiming the same port again only succeeds if every socket the first
+    %% registration opened was closed.
+    rabbit_web_dispatch_registry:add(remove_me, Listener, F, F, L),
+    rabbit_web_dispatch_registry:remove(remove_me),
+    passed.
+
 parse_ip_test(Config) ->
     Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_http_extra),
     %% I have to Port + 1 here to have a free port not used by a listener.
@@ -99,6 +118,7 @@ parse_ip_test1(Port) ->
     ?assertEqual(
        1, length([ok || {"/parse_ip", _, _} <-
                             rabbit_web_dispatch_registry:list_all()])),
+    rabbit_web_dispatch_registry:remove(parse_ip),
     passed.
 
 
@@ -144,10 +164,66 @@ log_source_address_test1(Port) ->
     logger:remove_handler(HandlerId),
     passed.
 
+log_authenticated_username_test(Config) ->
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_http_extra),
+    %% A dedicated port, so other test cases' registered contexts do not interfere.
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, log_authenticated_username_test1, [Port + 2]).
+
+log_authenticated_username_test1(Port) ->
+    inets:start(),
+    %% Given: a handler set up to capture access logs to a file.
+    LogFile = log_file(),
+    _ = file:delete(LogFile),
+    HandlerId = test_access_log_handler,
+    ok = logger:add_handler(HandlerId, logger_std_h, #{
+        level => all,
+        filter_default => stop,
+        filters => [
+            {domain_filter,
+             {fun logger_filters:domain/2,
+              {log, sub, [rabbitmq, http_api]}}}
+        ],
+        formatter => {rabbit_access_log_fmt, #{}},
+        config => #{
+            type => file,
+            file => LogFile
+        }
+    }),
+    %% And: a handler that records the authenticated username, as the
+    %% access control layer does.
+    Table = cowboy_router:compile(
+              [{source(), [{"/" ++ string(auth_path()), ?MODULE,
+                            [{auth_user, auth_user()}]}]}]),
+    {ok, _} = rabbit_web_dispatch:register_context_handler(
+                auth_user_log_test, [{port, Port}], auth_path(), Table,
+                description()),
+
+    %% When: a client makes a request.
+    {ok, {_Status, RespHeaders, _Body}} = httpc:request(get,
+        {"http://127.0.0.1:" ++ string(Port) ++ "/" ++ string(auth_path()), []},
+        [], [{ip, string(source())}]),
+
+    ok = logger_std_h:filesync(HandlerId),
+
+    %% Then: the resolved username is logged.
+    true = logged(auth_user()),
+    %% And: the internal header is not leaked to the client.
+    false = lists:keymember("x-rabbitmq-authenticated-user", 1, RespHeaders),
+
+    ok = rabbit_web_dispatch_registry:remove(auth_user_log_test),
+    logger:remove_handler(HandlerId),
+    passed.
+
 %% Ancillary procedures for log test
 
 %% Resource for testing with.
 path() -> <<"wonderland">>.
+
+%% Resource for the authenticated username test.
+auth_path() -> <<"whoami">>.
+
+%% Username recorded by the handler under test.
+auth_user() -> <<"rmq_admin">>.
 
 %% HTTP server port.
 port() -> 4096.
@@ -169,10 +245,16 @@ table() ->
     cowboy_router:compile([{source(), [{"/" ++ string(path()), ?MODULE, []}]}]).
 
 %% Cowboy handler callbacks.
-init(Req, State) ->
+init(Req0, State) ->
+    Req1 = case lists:keyfind(auth_user, 1, State) of
+               {auth_user, User} ->
+                   rabbit_cowboy_stream_h:set_authenticated_username(User, Req0);
+               false ->
+                   Req0
+           end,
     cowboy_req:reply(
-        status(), #{<<"content-type">> => <<"text/plain">>}, reason(), Req),
-    {ok, Req, State}.
+        status(), #{<<"content-type">> => <<"text/plain">>}, reason(), Req1),
+    {ok, Req1, State}.
 
 terminate(_, _, _) ->
     ok.

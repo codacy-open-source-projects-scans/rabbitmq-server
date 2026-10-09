@@ -29,7 +29,9 @@ dispatcher_add(function(sammy) {
     path('#/cluster-name', {'cluster_name': '/cluster-name'}, 'cluster-name');
     sammy.put('#/cluster-name', function() {
             if (sync_put(this, '/cluster-name')) {
-                setup_global_vars();
+                var new_name = this.params['name'];
+                window.app_settings.cluster_name = new_name;
+                update_cluster_name_ui(new_name);
                 update();
             }
             return false;
@@ -308,11 +310,13 @@ dispatcher_add(function(sammy) {
         });
       let datamodel = {
         'limits': '/vhost-limits',
-        'user_limits': '/user-limits',
         'vhosts': '/vhosts'
       }
       if (ac.isAdministratorUser()) {
+        datamodel['user_limits'] = '/user-limits'
         datamodel['users'] = '/users'
+      } else {
+        datamodel['user_limits'] = '/user-limits/' + esc(user_name)
       }
       path('#/limits', datamodel, 'limits');
 

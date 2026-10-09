@@ -39,7 +39,7 @@
          next_serial_in_khepri_tx/1,
          delete_in_khepri/3,
          get_in_khepri_tx/1,
-         update_in_khepri_tx/2,
+         update_in_khepri_tx/3,
          clear_exchanges_in_khepri/0,
          clear_exchange_serials_in_khepri/0,
          put_options/1
@@ -246,20 +246,24 @@ update(XName, Fun) ->
 %% update_in_khepri_tx().
 %% -------------------------------------------------------------------
 
--spec update_in_khepri_tx(ExchangeName, UpdateFun) -> Ret when
-      ExchangeName :: rabbit_exchange:name(),
+-spec update_in_khepri_tx(VHost, ExchangeName, UpdateFun) -> Ret when
+      VHost :: vhost:name(),
+      ExchangeName :: khepri_path:pattern_component(),
       Exchange :: rabbit_types:exchange(),
       UpdateFun :: fun((Exchange) -> Exchange),
       Ret :: not_found | Exchange.
 
-update_in_khepri_tx(Name, Fun) ->
-    Path = khepri_exchange_path(Name),
+update_in_khepri_tx(VHost, Pattern, Fun) ->
+    Path = khepri_exchange_path(VHost, Pattern),
     case khepri_tx:get(Path) of
         {ok, X} ->
             X1 = Fun(X),
             ok = khepri_tx:put(Path, X1),
             X1;
-        _ -> not_found
+        {error, ?khepri_error(mismatching_node, _)} ->
+            khepri_tx:abort(mismatching_node);
+        _ ->
+            not_found
     end.
 
 %% -------------------------------------------------------------------
@@ -448,8 +452,29 @@ unconditional_delete_in_khepri(X, OnlyDurable) ->
     delete_in_khepri(X, OnlyDurable, true).
 
 delete_in_khepri(X = #exchange{name = XName}, OnlyDurable, RemoveBindingsForSource) ->
-    ok = khepri_tx:delete(khepri_exchange_path(XName)),
-    rabbit_db_binding:delete_all_for_exchange_in_khepri(X, OnlyDurable, RemoveBindingsForSource).
+    UsesUniformWriteRet = try
+                              khepri_tx:does_api_comply_with(uniform_write_ret)
+                          catch
+                              error:undef ->
+                                  false
+                          end,
+    case UsesUniformWriteRet of
+        true ->
+            {ok, Deleted} = khepri_tx_adv:delete(khepri_exchange_path(XName)),
+            IndirectDeletions =
+                rabbit_db_binding:node_props_to_deletions_in_khepri_tx(
+                  Deleted, OnlyDurable),
+            {deleted, X, Bindings, Deletions} =
+                rabbit_db_binding:delete_all_for_exchange_in_khepri(
+                  X, OnlyDurable, RemoveBindingsForSource),
+            {deleted, X, Bindings,
+             rabbit_binding:combine_deletions(IndirectDeletions, Deletions)};
+        false ->
+            Ret = rabbit_db_binding:delete_all_for_exchange_in_khepri(
+                    X, OnlyDurable, RemoveBindingsForSource),
+            ok = khepri_tx:delete(khepri_exchange_path(XName)),
+            Ret
+    end.
 
 %% -------------------------------------------------------------------
 %% delete_all().
@@ -476,6 +501,9 @@ delete_all(VHostName) ->
 delete_all_in_khepri_tx(VHostName) ->
     Pattern = khepri_exchange_path(VHostName, ?KHEPRI_WILDCARD_STAR),
     {ok, NodeProps} = khepri_tx_adv:delete_many(Pattern),
+    %% See rabbitmq/rabbitmq-server#17255
+    Deletions0 = rabbit_db_binding:node_props_to_deletions_in_khepri_tx(
+                   NodeProps, false),
     Deletions =
     maps:fold(
       fun(Path, Props, Deletions) ->
@@ -492,7 +520,7 @@ delete_all_in_khepri_tx(VHostName) ->
                   {_, _} ->
                       Deletions
               end
-      end, rabbit_binding:new_deletions(), NodeProps),
+      end, Deletions0, NodeProps),
     {ok, Deletions}.
 
 %% -------------------------------------------------------------------

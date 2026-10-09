@@ -1,5 +1,4 @@
 const { By, Key, until, Builder } = require('selenium-webdriver')
-require('chromedriver')
 const assert = require('assert')
 const { buildDriver, goToHome, captureScreensFor, teardown, assertAllOptions, hasProfile } = require('../../utils')
 
@@ -45,8 +44,8 @@ describe('Given two oauth resources and basic auth enabled, an unauthenticated u
   })
 
   it('should not have a warning message', async function () {
-    const visible = await homePage.isWarningVisible()
-    assert.ok(!visible)
+    const notVisible = await homePage.isWarningNotVisible()
+    assert.ok(notVisible)
   })
 
 

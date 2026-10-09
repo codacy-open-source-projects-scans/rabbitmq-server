@@ -27,8 +27,9 @@
 %% unsubscribes
 -define(WAIT, 10000).
 
-%% How to long wait for a process to die after an expected failure
--define(PROCESS_EXIT_TIMEOUT, 5000).
+%% How long to wait for a process to die after an expected failure.
+%% Must be high enough to hande parallel `teardown_loop`, `bogus_rpc_loop groups` runs.
+-define(PROCESS_EXIT_TIMEOUT, 30000).
 
 all() ->
     [
@@ -101,6 +102,7 @@ groups() ->
               basic_get_ipv6_ssl,
               pub_and_close,
               channel_tune_negotiation,
+              frame_max_negotiation,
               shortstr_overflow_property,
               shortstr_overflow_field,
               command_invalid_over_channel0
@@ -667,6 +669,26 @@ large_content(Config) ->
 
 %% -------------------------------------------------------------------
 
+%% Checks that content larger than the negotiated frame_max still round
+%% trips, that is that the reader's frame_max enforcement does not reject
+%% the frames a real broker sends for it. Enforcement itself is covered by
+%% unit_SUITE.
+frame_max_negotiation(Config) ->
+    Params = ?config(amqp_client_conn_params, Config),
+    FrameMax = 8192,
+    {ok, Connection} = amqp_connection:start(
+                          Params#amqp_params_network{frame_max = FrameMax}),
+    {ok, Channel} = amqp_connection:open_channel(Connection),
+    #'queue.declare_ok'{queue = Q}
+        = amqp_channel:call(Channel, #'queue.declare'{exclusive = true}),
+    Payload = list_to_binary(lists:duplicate(FrameMax * 2, $a)),
+    Publish = #'basic.publish'{exchange = <<>>, routing_key = Q},
+    amqp_channel:call(Channel, Publish, #amqp_msg{payload = Payload}),
+    get_and_assert_equals(Channel, Q, Payload),
+    teardown(Connection, Channel).
+
+%% -------------------------------------------------------------------
+
 lifecycle(Config) ->
     {ok, Connection} = new_connection(Config),
     X = <<"lifecycle">>,
@@ -731,35 +753,36 @@ nowait_exchange_declare(Config) ->
 channel_repeat_open_close(Config) ->
     {ok, Connection} = new_connection(Config),
     lists:foreach(
-        fun(_) ->
-            {ok, Ch} = amqp_connection:open_channel(Connection),
-            ok = amqp_channel:close(Ch)
-        end, lists:seq(1, 50)),
+        fun(_) -> open_and_close_channel(Connection) end, lists:seq(1, 50)),
     amqp_connection:close(Connection),
     wait_for_death(Connection).
+
+%% Opening and closing a channel can race with the channel process exiting
+%% on its own (e.g. the connection closing concurrently), which is not a
+%% failure worth reporting.
+open_and_close_channel(Connection) ->
+    try amqp_connection:open_channel(Connection) of
+        {ok, Ch}           -> try amqp_channel:close(Ch) of
+                                  ok                 -> ok;
+                                  closing            -> ok
+                              catch
+                                  exit:{noproc, _}       -> ok;
+                                  exit:{normal, _}       -> ok;
+                                  exit:{{shutdown, _}, _} -> ok
+                              end;
+        closing            -> ok
+    catch
+        exit:{noproc, _}       -> ok;
+        exit:{normal, _}       -> ok;
+        exit:{{shutdown, _}, _} -> ok
+    end.
 
 %% -------------------------------------------------------------------
 
 channel_multi_open_close(Config) ->
     {ok, Connection} = new_connection(Config),
-    [spawn_link(
-        fun() ->
-            try amqp_connection:open_channel(Connection) of
-                {ok, Ch}           -> try amqp_channel:close(Ch) of
-                                          ok                 -> ok;
-                                          closing            -> ok
-                                      catch
-                                          exit:{noproc, _}       -> ok;
-                                          exit:{normal, _}       -> ok;
-                                          exit:{{shutdown, _}, _} -> ok
-                                      end;
-                closing            -> ok
-            catch
-                exit:{noproc, _}       -> ok;
-                exit:{normal, _}       -> ok;
-                exit:{{shutdown, _}, _} -> ok
-            end
-        end) || _ <- lists:seq(1, 50)],
+    [spawn_link(fun() -> open_and_close_channel(Connection) end)
+     || _ <- lists:seq(1, 50)],
     erlang:yield(),
     try amqp_connection:close(Connection)
     catch
@@ -988,8 +1011,15 @@ rpc_client(Config) ->
     [<<_/binary>> = DecodedId
      || DecodedId <- [unicode:characters_to_binary(Id, utf8)
                       || Id <- CorrelationIds]],
-    %% Cleanup.
+    %% Safer cleanup.
+    ServerRef = erlang:monitor(process, Server),
     Server ! stop,
+    receive
+        {'DOWN', ServerRef, process, Server, normal} ->
+            ok
+    after 30000 ->
+            exit(rpc_correlation_server_did_not_stop)
+    end,
     amqp_rpc_client:stop(Client),
     amqp_channel:call(Channel, #'queue.delete'{queue = Q}),
     teardown(Connection, Channel).

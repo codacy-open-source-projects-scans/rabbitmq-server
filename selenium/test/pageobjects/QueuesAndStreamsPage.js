@@ -1,6 +1,6 @@
 const { By, Key, until, Builder } = require('selenium-webdriver')
 
-const { delay } = require('../utils')
+const { doUntil } = require('../utils')
 
 const BasePage = require('./BasePage')
 
@@ -14,6 +14,11 @@ const TABLE_SECTION = By.css('div#queues-table-section table')
 const FORM_QUEUE_NAME = By.css('div#add-new-queue form input[name="name"]')
 const FORM_QUEUE_TYPE = By.css('div#add-new-queue form select[name="queuetype"]')
 const ADD_BUTTON = By.css('div#add-new-queue form input[type=submit]')
+
+const PAGE_SIZE_INPUT = By.css('input#queues-pagesize')
+const PAGE_SELECT = By.css('select#queues-page')
+
+const ARGUMENT_LINKS = By.css('div#add-new-queue table.argument-links')
 
 module.exports = class QueuesAndStreamsPage extends BasePage {
   async isLoaded () {
@@ -40,22 +45,64 @@ module.exports = class QueuesAndStreamsPage extends BasePage {
       return element.click()
     })
   }
-  async ensureAddQueueSectionIsVisible() {    
-    await this.click(ADD_NEW_QUEUE_SECTION)
-    return this.driver.findElement(ADD_NEW_QUEUE_SECTION).isDisplayed()
+  async ensureAddQueueSectionIsVisible() {
+    const button = await this.waitForLocated(ADD_BUTTON)
+    if (!(await button.isDisplayed())) {
+      await this.click(ADD_NEW_QUEUE_SECTION)
+    }
+    return this.waitForDisplayed(ADD_BUTTON)
   }
   async ensureAllQueuesSectionIsVisible() {    
     await this.click(PAGING_SECTION)
     return this.driver.findElement(PAGING_SECTION).isDisplayed()
   }  
   async fillInAddNewQueue(queueDetails) {
-    await this.selectOptionByValue(FORM_QUEUE_TYPE, queueDetails.type)
-    await delay(1000)
-    await this.sendKeys(FORM_QUEUE_NAME, queueDetails.name)
-    return this.click(ADD_BUTTON)    
+    await this.selectQueueType(queueDetails.type)
+
+    // Changing the queue type triggers an asynchronous page update that
+    // re-renders this form and drops the typed name. Type, verify, then
+    // submit, and retry if the form was replaced in between.
+    return doUntil(
+      async () => {
+        const input = await this.waitForDisplayed(FORM_QUEUE_NAME)
+        await input.clear()
+        await input.sendKeys(queueDetails.name)
+        if (await input.getAttribute('value') !== queueDetails.name) {
+          return false
+        }
+        await this.click(ADD_BUTTON)
+        return true
+      },
+      submitted => submitted === true,
+      250,
+      `Failed to submit new queue ${queueDetails.name}: the add-queue form kept being re-rendered while filling it in`
+    )
+  }
+  async selectQueueType(type) {
+    await this.selectOptionByValue(FORM_QUEUE_TYPE, type)
+    return doUntil(
+      async () => {
+        const sel = await this.driver.findElement(FORM_QUEUE_TYPE)
+        return sel.getAttribute('value')
+      },
+      val => val === type,
+      200,
+      `Failed to select queue type ${type}`
+    )
+  }
+  async getArgumentLinksText() {
+    return this.getText(ARGUMENT_LINKS)
   }
   async filterQueues(filterValue) {
     await this.waitForDisplayed(FILTER_BY_QUEUE_NAME)
     return this.sendKeys(FILTER_BY_QUEUE_NAME, filterValue + Key.RETURN)    
+  }
+  async setPageSize(size) {
+    const input = await this.waitForDisplayed(PAGE_SIZE_INPUT)
+    await input.clear()
+    await this.sendKeys(PAGE_SIZE_INPUT, size + Key.RETURN)
+  }
+  async selectPage(pageNumber) {
+    await this.selectOptionByValue(PAGE_SELECT, String(pageNumber))
   }
 }

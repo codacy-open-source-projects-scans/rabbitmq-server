@@ -40,19 +40,23 @@ function getConnectionOptions() {
   }  
 }
 module.exports = {  
+  generate_uuid: () => {
+    return container.generate_uuid()
+  },
   getAmqpConnectionOptions: () => { return connectionOptions },
+  setAmqpConnectionOptions: (options) => { connectionOptions = options },
   getAmqpUrl: () => {
     return connectionOptions.scheme + '://' +
         connectionOptions.username + ":" + connectionOptions.password + "@" +
         connectionOptions.host + ":" + connectionOptions.port
   },
-  open: (queueName = "/queues/my-queue") => {
+  open: (queueName = "/queues/my-queue", credentials = {}) => {
     let promise = new Promise((resolve, reject) => {
-      container.on('connection_open', function(context) {
+      container.once('connection_open', function(context) {
         resolve()
       })
     })
-    log("Opening amqp connection using " + JSON.stringify(connectionOptions,
+    log("Opening amqp connection using " + JSON.stringify({ ...connectionOptions, ...credentials },
        (key, value) => {
         // Omit the private key from the log output.
         if (key === "key") return undefined;
@@ -60,7 +64,7 @@ module.exports = {
         }
     ))
     
-    let connection = container.connect(connectionOptions)
+    let connection = container.connect({ ...connectionOptions, ...credentials })
     let receiver = connection.open_receiver({
       source: queueName,
       target: 'receiver-target',
@@ -95,5 +99,20 @@ module.exports = {
   },
   on: (event, callback) => {
     container.on(event, callback)
+  },
+  data_section: (data) => {
+    return container.message.data_section(data)
+  },
+  data_sections: (array) => {
+    return container.message.data_sections(array)
+  },
+  sequence_section: (array) => {
+    return container.message.sequence_section(array)
+  },
+  sequence_sections: (array) => {
+    return container.message.sequence_sections(array)
+  },
+  send: (handler, msg) => {
+    handler.sender.send(msg)
   }
 }

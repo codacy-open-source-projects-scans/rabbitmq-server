@@ -18,9 +18,9 @@
          is_authorized_vhost_visible_for_monitoring/2,
          is_authorized_global_parameters/2]).
 -export([user/1]).
--export([bad_request/3, service_unavailable/3, bad_request_exception/4,
+-export([bad_request/3, bad_request/4, service_unavailable/3, bad_request_exception/4,
          internal_server_error/3, internal_server_error/4, precondition_failed/3,
-         id/2, parse_bool/1, parse_int/1, redirect_to_home/3]).
+         id/2, parse_bool/1, parse_int/1, redirect_to_home/3, timeout/2]).
 -export([with_decode/4, with_ids/4, not_found/3]).
 -export([with_channel/4, with_channel/5]).
 -export([props_to_method/2, props_to_method/4]).
@@ -29,7 +29,7 @@
 -export([filter_conn_ch_list/3, filter_user/2, list_login_vhosts/2,
          list_login_vhosts_names/2]).
 -export([filter_tracked_conn_list/3]).
--export([with_decode/5, decode/1, decode/2, set_resp_header/3,
+-export([with_decode/5, decode/1, decode/2,
          args/1, read_complete_body/1, read_complete_body_with_limit/2]).
 -export([reply_list/3, reply_list/5, reply_list/4,
          sort_list/2, destination_type/1, reply_list_or_paginate/3
@@ -46,6 +46,7 @@
 -export([direct_request/6]).
 -export([qs_val/2]).
 -export([get_path_prefix/0]).
+-export([prefixed_path/1]).
 -export([catch_no_such_user_or_vhost/2]).
 -export([method_not_allowed/3]).
 
@@ -68,6 +69,9 @@
 
 -define(MAX_RANGE, 500).
 -define(MAX_FILTER_LENGTH, 1024).
+
+%% Erlang's own ceiling for a receive/gen_server/gen_event/rpc timeout value.
+-define(MAX_HTTP_TIMEOUT, 4294967295).
 
 -record(pagination, {page = undefined, page_size = undefined,
                      name = undefined, use_regex = undefined}).
@@ -98,8 +102,7 @@ is_authorized_admin(ReqData, Context, Token) ->
     AuthConfig = auth_config(),
     rabbit_web_dispatch_access_control:is_authorized(
       ReqData, Context,
-      AuthConfig#auth_settings.oauth_client_id,
-      Token, <<"Not administrator user">>,
+      <<"">>, Token, <<"Not administrator user">>,
       fun(#user{tags = Tags}) ->
               rabbit_web_dispatch_access_control:is_admin(Tags)
       end, AuthConfig).
@@ -133,13 +136,29 @@ is_authorized_vhost_visible_for_monitoring(ReqData, Context) ->
 
 auth_config() ->
     BasicAuthEnabled = not get_bool_env(rabbitmq_management, disable_basic_auth, false),
-    OauthEnabled = get_bool_env(rabbitmq_management, oauth_enabled, false),
-    OauthClientId = rabbit_data_coercion:to_binary(
-                        application:get_env(rabbitmq_management, oauth_client_id, "")),
-    #auth_settings{auth_realm = ?AUTH_REALM,
-                   basic_auth_enabled = BasicAuthEnabled,
-                   oauth2_enabled = OauthEnabled,
-                   oauth_client_id = OauthClientId}.
+    BearerTokenParser =
+        case application:get_env(rabbitmq_management, credential_encryption_secret, undefined) of
+            undefined -> undefined;
+            Secret ->
+                Key = rabbit_mgmt_basic_credentials_token:derive_key(Secret),
+                fun(Token) ->
+                    case rabbit_mgmt_basic_credentials_token:verify(Token, Key) of
+                        {ok, U, P, ExpiresAt} ->
+                            Now = erlang:system_time(second),
+                            if
+                                Now >= ExpiresAt ->
+                                    {error, <<"Invalid token: expired">>};
+                                true ->
+                                    {basic, U, P}
+                            end;
+                        {error, not_an_encrypted_token} -> {bearer, Token};
+                        {error, _Reason}                -> {error, <<"Invalid token">>}
+                    end
+                end
+        end,
+    #auth_settings{auth_realm          = ?AUTH_REALM,
+                   basic_auth_enabled  = BasicAuthEnabled,
+                   bearer_token_parser = BearerTokenParser}.
 
 disable_stats() ->
     not rabbit_mgmt_agent_config:is_metrics_collector_enabled() orelse
@@ -264,21 +283,13 @@ reply(Facts, ReqData, Context) ->
     reply0(extract_columns(Facts, ReqData), ReqData, Context).
 
 reply0(Facts, ReqData, Context) ->
-    ReqData1 = set_resp_header(<<"cache-control">>, "no-cache", ReqData),
-    try
-        case maps:get(media_type, ReqData1, undefined) of
-            {<<"application">>, <<"bert">>, _} ->
-                {term_to_binary(Facts), ReqData1, Context};
-            _ ->
-                {rabbit_json:encode(rabbit_mgmt_format:prepare_for_encoding(Facts)),
-                 ReqData1, Context}
-        end
-    catch exit:{json_encode, E} ->
-            Error = iolist_to_binary(
-                      io_lib:format("JSON encode error: ~tp", [E])),
-            Reason = iolist_to_binary(
-                       io_lib:format("While encoding: ~n~tp", [Facts])),
-            internal_server_error(Error, Reason, ReqData1, Context)
+    ReqData1 = cowboy_req:set_resp_header(<<"cache-control">>, "no-cache", ReqData),
+    case maps:get(media_type, ReqData1, undefined) of
+        {<<"application">>, <<"bert">>, _} ->
+            {term_to_binary(Facts), ReqData1, Context};
+        _ ->
+            {rabbit_json:encode(rabbit_mgmt_format:prepare_for_encoding(Facts)),
+             ReqData1, Context}
     end.
 
 reply_list(Facts, ReqData, Context) ->
@@ -466,6 +477,12 @@ fixup_prefix(EnvPrefix) when is_list(EnvPrefix) ->
 fixup_prefix(EnvPrefix) when is_binary(EnvPrefix) ->
     fixup_prefix(rabbit_data_coercion:to_list(EnvPrefix)).
 
+%% Prepends the configured path prefix to Path, returning a binary.
+%% Used wherever a cookie or redirect path must reflect the management
+%% plugin's configured path_prefix.
+prefixed_path(Path) ->
+    iolist_to_binary([get_path_prefix(), Path]).
+
 %% XXX sort_list_and_paginate/2 is a more proper name for this function, keeping it
 %% with this name for backwards compatibility
 -spec sort_list([Fact], [string()]) -> [Fact] when
@@ -510,16 +527,14 @@ maybe_filter_context(List, _) ->
 
 
 match_value({_, Value}, ValueTag, UseRegex) when UseRegex =:= "true" ->
-    case re:run(Value, ValueTag, [caseless,
-                                  {match_limit, 50_000},
-                                  {match_limit_recursion, 50_000}]) of
+    case rabbit_re:run(Value, ValueTag, [caseless]) of
         {match, _} -> true;
         {error, _} -> false;
         nomatch -> false
     end;
 match_value({_, Value}, ValueTag, _) ->
-    Pos = string:str(string:to_lower(binary_to_list(Value)),
-        string:to_lower(ValueTag)),
+    Pos = string:str(string:lowercase(binary_to_list(Value)),
+        string:lowercase(ValueTag)),
     case Pos of
         Pos  when Pos > 0 -> true;
         _ -> false
@@ -627,7 +642,7 @@ sort_key(Item, [Sort | Sorts]) ->
     [get_dotted_value(Sort, Item) | sort_key(Item, Sorts)].
 
 get_dotted_value(Key, Item) ->
-    Keys = string:tokens(Key, "."),
+    Keys = string:lexemes(Key, "."),
     get_dotted_value0(Keys, Item).
 
 get_dotted_value0([Key], Item) ->
@@ -640,10 +655,14 @@ get_dotted_value0([Key | Keys], Item) ->
 pget_bin(Key, Map, Default) when is_map(Map) ->
     maps:get(Key, Map, Default);
 pget_bin(Key, List, Default) when is_list(List) ->
-    case lists:partition(fun ({K, _V}) -> a2b(K) =:= Key end, List) of
-        {[{_K, V}], _} -> V;
-        {[],        _} -> Default
-    end.
+    case lists:search(fun ({K, _V}) -> a2b(K) =:= Key;
+                          (_)       -> false
+                      end, List) of
+        {value, {_K, V}} -> V;
+        false            -> Default
+    end;
+pget_bin(_Key, _Other, Default) ->
+    Default.
 maybe_pagination(Item, false, ReqData) ->
     extract_column_items(Item, columns(ReqData));
 maybe_pagination([{items, Item} | T], true, ReqData) ->
@@ -665,8 +684,8 @@ extract_columns_list(Items, ReqData) ->
 columns(ReqData) ->
     case qs_val(<<"columns">>, ReqData) of
         undefined -> all;
-        Bin       -> [[list_to_binary(T) || T <- string:tokens(C, ".")]
-                      || C <- string:tokens(binary_to_list(Bin), ",")]
+        Bin       -> [[list_to_binary(T) || T <- string:lexemes(C, ".")]
+                      || C <- string:lexemes(binary_to_list(Bin), ",")]
     end.
 
 extract_column_items(Item, all) ->
@@ -692,6 +711,16 @@ a2b(B)                 -> B.
 
 bad_request(Reason, ReqData, Context) ->
     halt_response(400, bad_request, Reason, ReqData, Context).
+
+%% Like bad_request/3 but merges ExtraFields into the JSON response body.
+%% Reason must be a binary or string.
+bad_request(Reason, ExtraFields, ReqData, Context) ->
+    ReasonBin = rabbit_data_coercion:to_binary(Reason),
+    Json = maps:merge(#{error => bad_request, reason => ReasonBin}, ExtraFields),
+    ReqData1 = cowboy_req:reply(400,
+        #{<<"content-type">> => <<"application/json">>},
+        rabbit_json:encode(Json), ReqData),
+    {stop, ReqData1, Context}.
 
 service_unavailable(Reason, ReqData, Context) ->
     halt_response(503, service_unavailable, Reason, ReqData, Context).
@@ -943,8 +972,7 @@ direct_request(MethodName, Transformers, Extra, ErrorMsg, ReqData,
 with_vhost_and_props(Fun, ReqData, Context) ->
     case vhost(ReqData) of
         not_found ->
-            not_found(rabbit_data_coercion:to_binary("vhost_not_found"),
-                      ReqData, Context);
+            not_found(<<"Not Found">>, ReqData, Context);
         VHost ->
             case read_complete_body(ReqData) of
                 {error, http_body_limit_exceeded, LimitApplied, BytesRead} ->
@@ -1037,8 +1065,8 @@ with_channel(VHost, ReqData,
                     bad_request_exception(Code, Reason, ReqData, Context)
             after
             erlang:unlink(Conn),
-            catch amqp_channel:close(Ch),
-            catch amqp_connection:close(Conn)
+            _ = try amqp_channel:close(Ch) catch _:_ -> ok end,
+            _ = try amqp_connection:close(Conn) catch _:_ -> ok end
             end;
         {error, {auth_failure, Msg}} ->
             not_authorised(Msg, ReqData, Context);
@@ -1076,7 +1104,10 @@ filter_vhost({vhost, _VHost}, _IsAdmin=true, List, _ReqData, _Context) ->
     [I || I <- List, lists:member(pget(vhost, I), rabbit_vhost:list())];
 filter_vhost({vhost, VHost}, _IsAdmin=false, List, ReqData, #context{user = User}) ->
     AuthzData = get_authz_data(ReqData),
-    case catch rabbit_access_control:check_vhost_access(User, VHost, AuthzData, #{}) of
+    Res = try rabbit_access_control:check_vhost_access(User, VHost, AuthzData, #{})
+          catch _:E -> {error, E}
+          end,
+    case Res of
         ok ->
             [I || I <- List, pget(vhost, I) =:= VHost];
         NotOK ->
@@ -1135,11 +1166,6 @@ filter_tracked_conn_list(List, ReqData, #context{user = #user{username = FilterU
               {node, Node}] || #tracked_connection{name = Name, vhost = VHost, username = Username, node = Node} <- List, VHost == FilterVHost, Username == FilterUsername]
     end.
 
-set_resp_header(K, V, ReqData) ->
-    cowboy_req:set_resp_header(K, strip_crlf(V), ReqData).
-
-strip_crlf(Str) -> lists:append(string:tokens(Str, "\r\n")).
-
 args([]) -> args(#{});
 args(L)  -> rabbit_mgmt_format:to_amqp_table(L).
 
@@ -1175,24 +1201,35 @@ list_visible_vhosts(User = #user{tags = Tags}, AuthzData) ->
 
 list_login_vhosts_names(User, AuthzData) ->
     [V || V <- rabbit_vhost:list_names(),
-          case catch rabbit_access_control:check_vhost_access(User, V, AuthzData, #{}) of
-              ok -> true;
-              NotOK ->
-                  log_access_control_result(NotOK),
-                  false
+          begin
+              Res = try rabbit_access_control:check_vhost_access(User, V, AuthzData, #{})
+                    catch _:E -> {error, E}
+                    end,
+              case Res of
+                  ok -> true;
+                  NotOK ->
+                      log_access_control_result(NotOK),
+                      false
+              end
           end].
 
 list_login_vhosts(User, AuthzData) ->
     [V || V <- rabbit_vhost:all(),
-          case catch rabbit_access_control:check_vhost_access(User, vhost:get_name(V), AuthzData, #{}) of
-              ok -> true;
-              NotOK ->
-                  log_access_control_result(NotOK),
-                  false
+          begin
+              Res = try rabbit_access_control:check_vhost_access(
+                            User, vhost:get_name(V), AuthzData, #{})
+                    catch _:E -> {error, E}
+                    end,
+              case Res of
+                  ok -> true;
+                  NotOK ->
+                      log_access_control_result(NotOK),
+                      false
+              end
           end].
 
 % rabbitmq/rabbitmq-auth-backend-http#100
-log_access_control_result({'EXIT', #amqp_error{name = Name, explanation = Msg}}) ->
+log_access_control_result({error, #amqp_error{name = Name, explanation = Msg}}) ->
     ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: '~tp', ~ts", [Name, Msg]);
 log_access_control_result(NotOK) ->
     ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: ~tp", [NotOK]).
@@ -1271,10 +1308,27 @@ ceil(X) ->
 int(Name, ReqData) ->
     case qs_val(list_to_binary(Name), ReqData) of
         undefined -> undefined;
-        Bin       -> case catch list_to_integer(binary_to_list(Bin)) of
-                         {'EXIT', _} -> undefined;
-                         Integer     -> Integer
+        Bin       -> try list_to_integer(binary_to_list(Bin)) of
+                         Integer -> Integer
+                     catch
+                         _:_ -> undefined
                      end
+    end.
+
+%% Parses the "timeout" request header, used by the various health check
+%% endpoints. Throws {error, {not_integer, Val}} for a value that isn't a
+%% valid receive/gen_server/gen_event/rpc timeout, same as parse_int/1 does
+%% for a non-numeric one, so callers only need a single catch clause.
+timeout(ReqData, Default) ->
+    case cowboy_req:header(<<"timeout">>, ReqData) of
+        undefined -> Default;
+        Val ->
+            case parse_int(Val) of
+                Timeout when Timeout >= 0, Timeout =< ?MAX_HTTP_TIMEOUT ->
+                    Timeout;
+                _ ->
+                    throw({error, {not_integer, Val}})
+            end
     end.
 
 -spec qs_val(binary(), cowboy_req:req()) -> any() | undefined.
@@ -1299,7 +1353,7 @@ sublist(List, S, L) when is_integer(L), L >= 0 ->
 set_resp_not_found(NotFoundBin, ReqData) ->
     ErrorMessage = case rabbit_mgmt_util:vhost(ReqData) of
         not_found ->
-            <<"vhost_not_found">>;
+            <<"Not Found">>;
         _ ->
             NotFoundBin
     end,

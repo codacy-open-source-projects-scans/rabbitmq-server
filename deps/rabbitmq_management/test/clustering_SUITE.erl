@@ -75,6 +75,8 @@ merge_app_env(Config) ->
     rabbit_ct_helpers:merge_app_env(Config1,
                                     {rabbitmq_management_agent, [
                                      {rates_mode, detailed},
+                                     %% keep it frequent so tests don't have to wait
+                                     {metrics_gc_interval, 500},
                                      {sample_retention_policies,
                                           %% List of {MaxAgeInSeconds, SampleEveryNSeconds}
                                           [{global,   [{605, 5}, {3660, 60}, {29400, 600}, {86400, 1800}]},
@@ -330,13 +332,15 @@ queue_consumer_channel_closed(Config) ->
     force_stats(Config), % ensure channel stats have been written
 
     amqp_channel:close(Chan),
-    force_stats(Config),
 
     ?awaitMatch([],
                 %% assert there are no consumer details
-                maps:get(consumer_details,
-                         http_get(Config, "/queues/%2F/some-queue")),
-                30000),
+                begin
+                    force_stats(Config),
+                    maps:get(consumer_details,
+                             http_get(Config, "/queues/%2F/some-queue"))
+                end,
+                60000),
     ?awaitMatch(<<"some-queue">>,
                 maps:get(name,
                          http_get(Config, "/queues/%2F/some-queue")),
@@ -346,7 +350,7 @@ queue_consumer_channel_closed(Config) ->
     ok.
 
 queue(Config) ->
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     _ = wait_for_queue(Config, "/queues/%2F/some-queue"),
 
     {ok, Chan}  = amqp_connection:open_channel(?config(conn, Config)),
@@ -371,7 +375,7 @@ queue(Config) ->
     ok.
 
 queues_single(Config) ->
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     _ = wait_for_queue(Config, "/queues/%2F/some-queue"),
 
     eventually(?_assertMatch(
@@ -419,7 +423,7 @@ queues_multiple(Config) ->
     ok.
 
 queues_removed(Config) ->
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     force_stats(Config),
     N = length(http_get(Config, "/queues/%2F")),
     http_delete(Config, "/queues/%2F/some-queue", ?NO_CONTENT),
@@ -504,7 +508,7 @@ channel(Config) ->
 
 channel_other_node(Config) ->
     Q = <<"some-queue">>,
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     Conn = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 1),
     {ok, Chan} = amqp_connection:open_channel(Conn),
     [{_, ChData}] = rabbit_ct_broker_helpers:rpc(Config, 1, ets, tab2list,
@@ -823,7 +827,9 @@ disable_plugin(Config) ->
 %%
 
 clear_all_table_data() ->
-    [ets:delete_all_objects(T) || {T, _} <- ?CORE_TABLES],
+    %% Forward-compat: skip tables a mixed-version secondary may lack.
+    [ets:delete_all_objects(T) || {T, _} <- ?CORE_TABLES,
+                                  ets:info(T) =/= undefined],
     rabbit_mgmt_storage:reset(),
     [gen_server:call(P, purge_cache)
      || {_, P, _, _} <- supervisor:which_children(rabbit_mgmt_db_cache_sup)],

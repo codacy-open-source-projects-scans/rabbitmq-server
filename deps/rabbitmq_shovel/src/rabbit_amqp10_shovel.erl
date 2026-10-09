@@ -54,7 +54,8 @@
 -import(rabbit_misc, [pget/2, pget/3]).
 -import(rabbit_data_coercion, [to_binary/1]).
 -import(rabbit_shovel_util, [validate_uri_fun/1,
-                             deobfuscated_uris/2]).
+                             obfuscated_uris/2,
+                             deobfuscate_uris/1]).
 
 -include_lib("kernel/include/logger.hrl").
 
@@ -98,53 +99,42 @@ parse(_Name, {source, Conf}) ->
       uris => Uris,
       prefetch_count => pget(prefetch_count, Conf, 1000),
       delete_after => pget(delete_after, Conf, never),
+      delete_after_duration => pget(delete_after_duration, Conf, undefined),
       predeclared => true,
       source_address => pget(source_address, Conf),
       consumer_args => pget(consumer_args, Conf, []),
       consumer_name => pget(consumer_name, Conf, <<>>)}.
 
 parse_source(Def) ->
-    Uris = deobfuscated_uris(<<"src-uri">>, Def),
+    Uris = obfuscated_uris(<<"src-uri">>, Def),
     Address = pget(<<"src-address">>, Def),
     DeleteAfter = pget(<<"src-delete-after">>, Def, <<"never">>),
+    DeleteAfterDuration = pget(<<"src-delete-after-duration">>, Def, undefined),
     PrefetchCount = pget(<<"src-prefetch-count">>, Def, 1000),
     Headers = [],
     SrcCName = pget(<<"src-consumer-name">>, Def, <<>>),
     GlobalPredeclared = proplists:get_value(predeclared, application:get_env(?APP, topology, []), false),
     Predeclared = pget(<<"src-predeclared">>, Def, GlobalPredeclared),
+    SrcCArgs = pget(<<"src-consumer-args">>, Def, []),
     {#{module => rabbit_amqp10_shovel,
        uris => Uris,
        source_address => Address,
-       delete_after => opt_b2a(DeleteAfter),
+       delete_after => rabbit_shovel_util:parse_delete_after(DeleteAfter),
+       delete_after_duration => DeleteAfterDuration,
        prefetch_count => PrefetchCount,
        predeclared => Predeclared,
-       consumer_args => [],
+       consumer_args => SrcCArgs,
        consumer_name => SrcCName}, Headers}.
 
-parse_dest({_VHost, _Name}, _ClusterName, Def, SourceHeaders) ->
-    Uris = deobfuscated_uris(<<"dest-uri">>, Def),
+parse_dest({_VHost, _Name}, _ClusterName, Def, _SourceHeaders) ->
+    Uris = obfuscated_uris(<<"dest-uri">>, Def),
     Address = pget(<<"dest-address">>, Def),
-    Properties =
-        rabbit_data_coercion:to_proplist(
-            pget(<<"dest-properties">>, Def, [])),
-    AppProperties =
-        rabbit_data_coercion:to_proplist(
-            pget(<<"dest-application-properties">>, Def, [])),
-    MessageAnns =
-        rabbit_data_coercion:to_proplist(
-            pget(<<"dest-message-annotations">>, Def, [])),
     GlobalPredeclared = proplists:get_value(predeclared, application:get_env(?APP, topology, []), false),
     Predeclared = pget(<<"dest-predeclared">>, Def, GlobalPredeclared),
     #{module => rabbit_amqp10_shovel,
       uris => Uris,
       target_address => Address,
       predeclared => Predeclared,
-      message_annotations => maps:from_list(MessageAnns),
-      application_properties => maps:from_list(AppProperties ++ SourceHeaders),
-      properties => maps:from_list(
-                      lists:map(fun({K, V}) ->
-                                        {rabbit_data_coercion:to_atom(K), V}
-                                end, Properties)),
       add_timestamp_header => pget(<<"dest-add-timestamp-header">>, Def, false),
       add_forward_headers => pget(<<"dest-add-forward-headers">>, Def, false),
       unacked => #{}
@@ -168,7 +158,9 @@ validate_src_funs(_Def, User) ->
      {<<"src-prefetch-count">>, fun rabbit_parameter_validation:number/2, optional},
      {<<"src-consumer-name">>, fun rabbit_parameter_validation:binary/2, optional},
      {<<"src-delete-after">>, fun validate_amqp10_delete_after/2, optional},
-     {<<"src-predeclared">>,  fun rabbit_parameter_validation:boolean/2, optional}
+     {<<"src-delete-after-duration">>, fun rabbit_shovel_util:validate_delete_after_duration/2, optional},
+     {<<"src-predeclared">>,  fun rabbit_parameter_validation:boolean/2, optional},
+     {<<"src-consumer-args">>, fun rabbit_shovel_util:validate_consumer_args/2, optional}
     ].
 
 validate_dest_funs(_Def, User) ->
@@ -193,17 +185,20 @@ validate_dest_funs(_Def, User) ->
 -spec connect_source(state()) -> state().
 connect_source(State = #{name := Name,
                          ack_mode := AckMode,
-                         source := #{uris := [Uri | _],
+                         source := #{uris := ObfuscatedUris,
                                      source_address := Addr,
                                      predeclared := Predeclared,
+                                     consumer_args := CArgs,
                                      consumer_name := CName} = Src}) ->
+    [Uri | _] = deobfuscate_uris(ObfuscatedUris),
     SndSettleMode = case AckMode of
                         no_ack -> settled;
                         on_publish -> unsettled;
                         on_confirm -> unsettled
                     end,
     AttachFun = fun(S, L, A, SSM, D) ->
-                        amqp10_client:attach_receiver_link(S, L, A, SSM, D, #{}, #{}, true)
+                        Filter = translate_consumer_args_to_filter(CArgs),
+                        amqp10_client:attach_receiver_link(S, L, A, SSM, D, Filter, #{}, true)
                 end,
     LinkNameOverride = case CName of
                            <<>> -> undefined;
@@ -220,9 +215,10 @@ connect_source(State = #{name := Name,
 -spec connect_dest(state()) -> state().
 connect_dest(State = #{name := Name,
                        ack_mode := AckMode,
-                       dest := #{uris := [Uri | _],
+                       dest := #{uris := ObfuscatedUris,
                                  target_address := Addr,
                                  predeclared := Predeclared} = Dst}) ->
+    [Uri | _] = deobfuscate_uris(ObfuscatedUris),
     SndSettleMode = case AckMode of
                         no_ack -> settled;
                         on_publish -> settled;
@@ -248,7 +244,13 @@ connect(Name, SndSettleMode, Uri, Postfix, Addr, Map, AttachFun, LinkNameOverrid
     %% A better solution would be that the shovel plugin subscribes to event
     %% maintenance_connections_closed to gracefully transfer shovels over to other live nodes.
     Config = Config0#{properties => #{<<"ignore-maintenance">> => {boolean, true}}},
-    {ok, Conn} = amqp10_client:open_connection(Config),
+    Conn = case amqp10_client:open_connection(Config) of
+               {ok, C} ->
+                   C;
+               {error, Reason} ->
+                   rabbit_shovel_util:log_connection_failure(Reason, Uri, Name),
+                   exit({shutdown, {connection_failed, Reason}})
+           end,
     {ok, Sess} = amqp10_client:begin_session(Conn),
     link(Conn),
     LinkName = case LinkNameOverride of
@@ -269,7 +271,8 @@ connect(Name, SndSettleMode, Uri, Postfix, Addr, Map, AttachFun, LinkNameOverrid
     {Conn, Sess, LinkRef}.
 
 -spec init_source(state()) -> state().
-init_source(State = #{source := #{current := #{link := Link},
+init_source(State = #{name := Name,
+                      source := #{current := #{link := Link},
                                   prefetch_count := Prefetch} = Src}) ->
     {Credit, RenewWhenBelow} = {Prefetch, max(1, round(Prefetch/10))},
     ok = amqp10_client:flow_link_credit(Link, Credit, RenewWhenBelow),
@@ -282,9 +285,10 @@ init_source(State = #{source := #{current := #{link := Link},
         0 -> exit({shutdown, autodelete});
         _ -> ok
     end,
-    State#{source => Src#{remaining => Remaining,
-                          remaining_unacked => Remaining,
-                          last_acked_tag => -1}}.
+    Src1 = Src#{remaining => Remaining,
+                remaining_unacked => Remaining,
+                last_acked_tag => -1},
+    State#{source => rabbit_shovel_util:sched_expire_after_duration(Name, Src1)}.
 
 -spec init_dest(state()) -> state().
 init_dest(#{name := Name,
@@ -352,6 +356,9 @@ handle_source({'EXIT', Conn, Reason},
 handle_source({'EXIT', _Pid, {shutdown, {server_initiated_close, _, Reason}}}, _State) ->
     {stop, {inbound_link_or_channel_closure, Reason}};
 
+handle_source({internal, delete_after_duration_expired}, _State) ->
+    {stop, {shutdown, autodelete}};
+
 handle_source(_Msg, _State) ->
     not_handled.
 
@@ -415,13 +422,14 @@ handle_dest(_Msg, _State) ->
 
 close_source(#{source := #{current := #{conn := Conn,
                                         session := Sess,
-                                        link := LinkRef}}}) ->
+                                        link := LinkRef}} = Src}) ->
+    _ = rabbit_shovel_util:cancel_expire_after_duration(Src),
     connection_close(Conn, Sess, LinkRef),
     ok;
 close_source(_Config) -> ok.
 
 connection_close(Conn, Sess, LinkRef) ->
-    catch amqp10_client:detach_link(LinkRef),
+    _ = try amqp10_client:detach_link(LinkRef) catch _:_ -> ok end,
     _ = amqp10_client:end_session(Sess),
     _ = amqp10_client:close_connection(Conn).
 
@@ -544,9 +552,6 @@ validate_amqp10_map(Name, Terms0) ->
     Validation = [{K, Str, optional} || {K, _} <- Terms],
     rabbit_parameter_validation:proplist(Name, Validation, Terms).
 
-opt_b2a(B) when is_binary(B) -> list_to_atom(binary_to_list(B));
-opt_b2a(N)                   -> N.
-
 decl_queue(_, _, true) ->
     ok;
 decl_queue(Sess, Addr, false) ->
@@ -561,3 +566,12 @@ decl_queue(Sess, Addr, false) ->
         _ ->
             ok
     end.
+
+translate_consumer_args_to_filter(CArgs) ->
+    List = rabbit_data_coercion:to_proplist(CArgs),
+    lists:foldl(
+      fun({<<"x-stream-offset">>, Val}, Acc) ->
+              Acc#{<<"rabbitmq:stream-offset-spec">> => Val};
+         ({Key, Val}, Acc) ->
+              Acc#{Key => Val}
+      end, #{}, List).

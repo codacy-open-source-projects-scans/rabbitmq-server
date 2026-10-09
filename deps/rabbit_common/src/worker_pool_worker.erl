@@ -85,7 +85,7 @@ handle_call({submit, Fun, CPid, ProcessModel}, From, undefined) ->
 
 handle_call({submit, Fun, CPid, ProcessModel}, From, {from, CPid, MRef}) ->
     erlang:demonitor(MRef),
-    gen_server2:reply(From, run(Fun, ProcessModel)),
+    _ = gen_server2:reply(From, run(Fun, ProcessModel)),
     ok = worker_pool:idle(get(worker_pool_name), self()),
     {noreply, undefined, hibernate};
 
@@ -97,7 +97,7 @@ handle_cast({next_job_from, CPid}, undefined) ->
     {noreply, {from, CPid, MRef}, hibernate};
 
 handle_cast({next_job_from, CPid}, {job, CPid, From, Fun, ProcessModel}) ->
-    gen_server2:reply(From, run(Fun, ProcessModel)),
+    _ = gen_server2:reply(From, run(Fun, ProcessModel)),
     ok = worker_pool:idle(get(worker_pool_name), self()),
     {noreply, undefined, hibernate};
 
@@ -113,7 +113,9 @@ handle_cast({submit_async, Fun, CPid}, {from, CPid, MRef}) ->
     {noreply, undefined, hibernate};
 
 handle_cast(Msg, State) ->
-    {stop, {unexpected_cast, Msg}, State}.
+    rabbit_log:warning("worker_pool_worker (~ts) received unexpected cast: ~256P",
+                       [get(worker_pool_name), Msg, 7]),
+    {noreply, State, hibernate}.
 
 handle_info({'DOWN', MRef, process, CPid, _Reason}, {from, CPid, MRef}) ->
     ok = worker_pool:idle(get(worker_pool_name), self()),
@@ -128,7 +130,9 @@ handle_info({timeout, Key, Fun}, State) ->
     {noreply, State, hibernate};
 
 handle_info(Msg, State) ->
-    {stop, {unexpected_info, Msg}, State}.
+    rabbit_log:warning("worker_pool_worker (~ts) received unexpected info message: ~256P",
+                       [get(worker_pool_name), Msg, 7]),
+    {noreply, State, hibernate}.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.

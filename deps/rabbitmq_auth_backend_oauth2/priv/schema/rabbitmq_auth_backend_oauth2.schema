@@ -101,7 +101,54 @@
 {mapping,
  "auth_oauth2.verify_aud",
  "rabbitmq_auth_backend_oauth2.verify_aud",
- [{datatype, {enum, [true, false]}}]}.
+ [{datatype, boolean}]}.
+
+%% Require the exp (expiration time) claim in JWT tokens. When true (the
+%% default), a token without an exp claim is rejected. RFC 7519 makes exp
+%% optional, but a token without it never expires, so a stolen or leaked token
+%% stays valid forever. Set to false only when your identity provider cannot
+%% issue tokens with an exp claim.
+%%
+%% {require_exp, true},
+
+{mapping,
+ "auth_oauth2.require_exp",
+ "rabbitmq_auth_backend_oauth2.require_exp",
+ [{datatype, boolean}]}.
+
+%% Require the jwks_uri, token_endpoint, authorization_endpoint and
+%% end_session_endpoint of a discovered OpenID configuration to use the https
+%% scheme. Set to false only when your identity provider's discovery document
+%% uses http, for example in a development or test environment.
+%%
+%% {verify_https_endpoints, true},
+
+{mapping,
+ "auth_oauth2.discovery.verify_https_endpoints",
+ "rabbitmq_auth_backend_oauth2.discovery.verify_https_endpoints",
+ [{datatype, boolean}]}.
+
+%% Verify that the issuer discovered in an OpenID configuration document is
+%% present, uses the https scheme, and matches the discovery endpoint used to
+%% retrieve it, per OpenID Connect Discovery 1.0, Section 4.3. Set to false
+%% only when your identity provider's issuer does not follow this
+%% convention.
+%%
+%% {verify_issuer, true},
+
+{mapping,
+ "auth_oauth2.discovery.verify_issuer",
+ "rabbitmq_auth_backend_oauth2.discovery.verify_issuer",
+ [{datatype, boolean}]}.
+
+%% How scope patterns match vhost names, resource names, and topic routing keys.
+%% wildcard uses RabbitMQ's legacy *-segment wildcard rules; regex treats each pattern
+%% as a Perl-compatible regular expression matched against the entire string.
+
+{mapping,
+ "auth_oauth2.scope_pattern_syntax",
+ "rabbitmq_auth_backend_oauth2.scope_pattern_syntax",
+ [{datatype, {enum, [wildcard, regex]}}]}.
 
 %% Configure the preferred username's JWT claim(s). These are the JWT claims or attributes
 %% used to determine the user's identity, a.k.a username.
@@ -254,10 +301,16 @@
 {mapping,
  "auth_oauth2.https.fail_if_no_peer_cert",
  "rabbitmq_auth_backend_oauth2.key_config.fail_if_no_peer_cert",
- [{datatype, {enum, [true, false]}}]}.
+ [{datatype, boolean}]}.
 
 {validator, "https_uri", "According to the JWT Specification, Key Server URL must be https.",
  fun(Uri) -> string:nth_lexeme(Uri, 1, "://") == "https" end}.
+
+%% No-op stub: pre-3.8.0 cuttlefish silently ignored unknown validator names,
+%% so call sites referencing "uri" performed no check. 3.8.0 rejects undefined
+%% names; this preserves the original accept-all behaviour.
+{validator, "uri", "URI string (no additional validation)",
+ fun(_Uri) -> true end}.
 
 {mapping,
  "auth_oauth2.algorithms.$algorithm",
@@ -352,6 +405,17 @@
  "rabbitmq_auth_backend_oauth2.oauth_providers",
  [{datatype, string}]}.
 
+{mapping,
+ "auth_oauth2.oauth_providers.$name.discovery.verify_https_endpoints",
+ "rabbitmq_auth_backend_oauth2.oauth_providers",
+ [{datatype, boolean}]}.
+
+{mapping,
+ "auth_oauth2.oauth_providers.$name.discovery.verify_issuer",
+ "rabbitmq_auth_backend_oauth2.oauth_providers",
+ [{datatype, boolean}]}.
+
+
 {translation, "rabbitmq_auth_backend_oauth2.oauth_providers",
  fun(Conf) ->
     rabbit_oauth2_schema:translate_oauth_providers(Conf)
@@ -383,6 +447,12 @@
 }.
 
 {mapping,
+  "auth_oauth2.resource_servers.$name.scope_pattern_syntax",
+  "rabbitmq_auth_backend_oauth2.resource_servers",
+  [{datatype, {enum, [wildcard, regex]}}]
+}.
+
+{mapping,
  "auth_oauth2.resource_servers.$name.scope_aliases.$alias",
  "rabbitmq_auth_backend_oauth2.resource_servers",
  [{datatype, string}]}.
@@ -396,6 +466,16 @@
  "auth_oauth2.resource_servers.$name.scope_aliases.$index.scope",
  "rabbitmq_auth_backend_oauth2.resource_servers",
  [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.verify_aud",
+ "rabbitmq_auth_backend_oauth2.verify_aud",
+ [{datatype, boolean}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.require_exp",
+ "rabbitmq_auth_backend_oauth2.require_exp",
+ [{datatype, boolean}]}.
 
 {mapping,
   "auth_oauth2.resource_servers.$name.oauth_provider_id",
