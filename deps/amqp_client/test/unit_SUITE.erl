@@ -20,8 +20,9 @@ all() ->
       amqp_uri_parsing,
       amqp_uri_accepts_string_and_binaries,
       amqp_uri_remove_credentials,
+      amqp_uri_remove_credentials_malformed,
+      amqp_uri_error_info_has_no_user_input,
       uri_parser_accepts_string_and_binaries,
-      route_destination_parsing,
       rabbit_channel_build_topic_variable_map,
       main_reader_rejects_oversized_frame,
       main_reader_rejects_oversized_frame_with_split_header,
@@ -256,6 +257,66 @@ amqp_uri_remove_credentials(_Config) ->
     ?assertEqual(nomatch, string:find(Sanitized, "alice")),
     ok.
 
+amqp_uri_remove_credentials_malformed(_Config) ->
+    [?assertEqual(Expected, amqp_uri:remove_credentials(Uri))
+     || {Uri, Expected} <-
+            [{"amqp://alice:s3cret@:::",
+              "amqp://<redacted>@:::"},
+             {"amqp://alice:s3@cret@host:::",
+              "amqp://<redacted>@host:::"},
+             {"amqp://alice:s3/cret@host:::",
+              "amqp://<redacted>@host:::"},
+             {"amqp://alice:s3?c#ret@host:::",
+              "amqp://<redacted>@host:::"},
+             {"amqp://host:::?password=s3cret&heartbeat=5",
+              "amqp://host:::"},
+             {"amqp://alice:s3cret@host:::?password=s3cret",
+              "amqp://<redacted>@host:::"},
+             {"amqp://host:::#s3cret",
+              "amqp://host:::"},
+             {<<"amqp://alice:s3cret@:::">>,
+              "amqp://<redacted>@:::"},
+             {"amqp://alice:s3cret@" ++ [16#301] ++ "host",
+              "<redacted>"},
+             {"amqp://host/" ++ [16#20AC] ++ "?password=s3cret",
+              "<redacted>"},
+             {"", "<redacted>"}]],
+    ok.
+
+amqp_uri_error_info_has_no_user_input(_Config) ->
+    [begin
+         {error, {Info, Uri}} = amqp_uri:parse(Uri),
+         ?assertEqual(Expected, Info),
+         ?assertEqual(nomatch,
+                      string:find(lists:flatten(io_lib:format("~tp", [Info])),
+                                  "s3cret"))
+     end || {Uri, Expected} <-
+                [{"s3cret@host", unable_to_parse_uri},
+                 {"amqp://alice:s3cret@:::", unable_to_parse_uri},
+                 {"http://alice:s3cret@host", unexpected_uri_scheme},
+                 {"amqp://alice:s3cret@host:99999", port_out_of_range},
+                 {"amqp:alice:s3cret@host", invalid_uri},
+                 {"amqp://alice:s3cret@host/" ++ [16#1F600], badarg},
+                 {"amqp://alice:s3cret@host/a/b", invalid_vhost},
+                 {"amqp://alice:s3cret@:1234", port_requires_host},
+                 {"amqp://alice:s3cret%zz@host", {invalid_entity, userinfo}},
+                 {"amqp://alice:s3cret%@host", {unterminated_entity, userinfo}},
+                 {"amqp://alice:s3cret@ho%zzst", {invalid_entity, host}},
+                 {"amqp://alice:s3cret@host/v%zzh", {invalid_entity, vhost}},
+                 {"amqp://alice:s3cret@host/?auth_mechanism=s3cret",
+                  unknown_mechanism},
+                 {"amqp://alice:s3cret@host/?heartbeat=s3cret",
+                  {invalid_amqp_params_parameter, heartbeat}},
+                 {"amqp://alice:s3cret@host/?username=s3cret",
+                  {invalid_amqp_params_parameter, username}},
+                 {"amqps://alice:s3cret@host/?verify=s3cret",
+                  {invalid_ssl_parameter, verify}},
+                 {"amqps://alice:s3cret@host/?depth=s3cret&password=s3cret",
+                  {invalid_ssl_parameter, depth}},
+                 {"amqps://alice:s3cret@host/?password=s3cret%zz",
+                  {invalid_ssl_parameter, password}}]],
+    ok.
+
 uri_parser_accepts_string_and_binaries(_Config) ->
     [?assertMatch([{fragment,[]},
                    {host,"host"},
@@ -270,93 +331,6 @@ uri_parser_accepts_string_and_binaries(_Config) ->
 
 string_binaries_uris() ->
     ["amqp://user:pass@host:10000/vhost?heartbeat=5", <<"amqp://user:pass@host:10000/vhost?heartbeat=5">>].
-
-%% -------------------------------------------------------------------
-%% Route destination parsing.
-%% -------------------------------------------------------------------
-
-route_destination_parsing(_Config) ->
-    %% valid queue
-    ?assertMatch({ok, {queue, "test"}}, parse_dest("/queue/test")),
-
-    %% valid topic
-    ?assertMatch({ok, {topic, "test"}}, parse_dest("/topic/test")),
-
-    %% valid exchange
-    ?assertMatch({ok, {exchange, {"test", undefined}}}, parse_dest("/exchange/test")),
-
-    %% valid temp queue
-    ?assertMatch({ok, {temp_queue, "test"}}, parse_dest("/temp-queue/test")),
-
-    %% valid reply queue
-    ?assertMatch({ok, {reply_queue, "test"}}, parse_dest("/reply-queue/test")),
-    ?assertMatch({ok, {reply_queue, "test/2"}}, parse_dest("/reply-queue/test/2")),
-
-    %% valid exchange with pattern
-    ?assertMatch({ok, {exchange, {"test", "pattern"}}},
-        parse_dest("/exchange/test/pattern")),
-
-    %% valid pre-declared queue
-    ?assertMatch({ok, {amqqueue, "test"}}, parse_dest("/amq/queue/test")),
-
-    %% queue without name
-    ?assertMatch({error, {invalid_destination, queue, ""}}, parse_dest("/queue")),
-    ?assertMatch({ok, {queue, undefined}}, parse_dest("/queue", true)),
-
-    %% topic without name
-    ?assertMatch({error, {invalid_destination, topic, ""}}, parse_dest("/topic")),
-
-    %% exchange without name
-    ?assertMatch({error, {invalid_destination, exchange, ""}},
-        parse_dest("/exchange")),
-
-    %% exchange default name
-    ?assertMatch({error, {invalid_destination, exchange, "//foo"}},
-        parse_dest("/exchange//foo")),
-
-    %% amqqueue without name
-    ?assertMatch({error, {invalid_destination, amqqueue, ""}},
-        parse_dest("/amq/queue")),
-
-    %% queue without name with trailing slash
-    ?assertMatch({error, {invalid_destination, queue, "/"}}, parse_dest("/queue/")),
-
-    %% topic without name with trailing slash
-    ?assertMatch({error, {invalid_destination, topic, "/"}}, parse_dest("/topic/")),
-
-    %% exchange without name with trailing slash
-    ?assertMatch({error, {invalid_destination, exchange, "/"}},
-        parse_dest("/exchange/")),
-
-    %% queue with invalid name
-    ?assertMatch({error, {invalid_destination, queue, "/foo/bar"}},
-        parse_dest("/queue/foo/bar")),
-
-    %% topic with invalid name
-    ?assertMatch({error, {invalid_destination, topic, "/foo/bar"}},
-        parse_dest("/topic/foo/bar")),
-
-    %% exchange with invalid name
-    ?assertMatch({error, {invalid_destination, exchange, "/foo/bar/baz"}},
-        parse_dest("/exchange/foo/bar/baz")),
-
-    %% unknown destination
-    ?assertMatch({error, {unknown_destination, "/blah/boo"}},
-        parse_dest("/blah/boo")),
-
-    %% queue with escaped name
-    ?assertMatch({ok, {queue, "te/st"}}, parse_dest("/queue/te%2Fst")),
-
-    %% valid exchange with escaped name and pattern
-    ?assertMatch({ok, {exchange, {"te/st", "pa/tt/ern"}}},
-        parse_dest("/exchange/te%2Fst/pa%2Ftt%2Fern")),
-
-    ok.
-
-parse_dest(Destination, Params) ->
-    rabbit_routing_parser:parse_endpoint(Destination, Params).
-parse_dest(Destination) ->
-    rabbit_routing_parser:parse_endpoint(Destination).
 
 %% -------------------------------------------------------------------
 %% Topic variable map

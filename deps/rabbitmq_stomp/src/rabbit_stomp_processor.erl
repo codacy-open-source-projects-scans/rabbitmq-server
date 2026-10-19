@@ -1775,7 +1775,19 @@ send_error_frame(Message, ExtraHeaders, Detail, State) ->
                     <<"content-type">> => <<"text/plain">>,
                     <<"version">> => iolist_to_binary(string:join(?SUPPORTED_VERSIONS, ","))},
     Headers = maps:merge(BaseHeaders, maps:from_list(ExtraHeaders)),
-    send_frame('ERROR', Headers, unicode:characters_to_binary(Detail), State).
+    send_frame('ERROR', Headers, error_text(Detail), State).
+
+%% A text formatted with `~s` holds UTF-8 as bytes, one formatted with `~ts` holds code points.
+error_text(Detail) ->
+    try iolist_to_binary(Detail) of
+        Bin ->
+            case unicode:characters_to_binary(Bin) of
+                Bin -> Bin;
+                _   -> unicode:characters_to_binary(Detail)
+            end
+    catch error:badarg ->
+            unicode:characters_to_binary(Detail)
+    end.
 
 send_error(Message, Detail, State) ->
     send_error_frame(Message, [], Detail, State).
@@ -1981,7 +1993,7 @@ parse_endpoint(undefined) ->
 parse_endpoint(Destination) when is_binary(Destination) ->
     case binary:split(Destination, <<"/">>, [global]) of
         [Name] ->
-            {ok, {queue, unescape(Name)}};
+            {ok, {queue, rabbit_stomp_util:strip_cr_lf(unescape(Name))}};
         [<<>>, <<"exchange">> | Rest] ->
             parse_endpoint0(exchange, Rest);
         [<<>>, <<"queue">> | Rest] ->
@@ -2010,6 +2022,8 @@ parse_endpoint0(exchange, [Name, Pattern]) ->
     {ok, {exchange, {unescape(Name), unescape(Pattern)}}};
 parse_endpoint0(queue,    []) ->
     {error, {invalid_destination, queue, []}};
+parse_endpoint0(queue,    [Name]) when Name =/= <<>> ->
+    {ok, {queue, rabbit_stomp_util:strip_cr_lf(unescape(Name))}};
 parse_endpoint0(Type,     [Name]) when Name =/= <<>> ->
     {ok, {Type, unescape(Name)}};
 parse_endpoint0(Type,     Rest) ->
@@ -2132,8 +2146,9 @@ new_amqqueue(QNameBin0, Type, Params0, _State = #state{user = #user{username = U
             true ->
                 {true, false};
             false ->
-                {proplists:get_value(durable, Params, false),
-                 proplists:get_value(exclusive, Params, false)}
+                Exclusive0 = proplists:get_value(exclusive, Params, false),
+                {proplists:get_value(durable, Params, false) andalso not Exclusive0,
+                 Exclusive0}
         end,
     AutoDelete = proplists:get_value(auto_delete, Params, false),
     Args = rabbit_amqqueue:augment_declare_args(
